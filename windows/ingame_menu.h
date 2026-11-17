@@ -28,6 +28,7 @@
 #include <SDL3/SDL.h>
 
 #include "gpu/backend/vulkan_access.h"
+#include "addr_parse.h"
 #include "menu_gui.h"
 #include "menu_text.h"
 #include "mh4n/rooms.h"
@@ -821,6 +822,7 @@ private:
             {"fullscreen", "Borderless fullscreen on the display the window is on. F11 or Alt+Enter does the same."},
             {"vsync", "Shows each frame when your display refreshes. Off lets the game run above your display's rate, and the picture may tear."},
             {"mode", "Popup: the top screen fills the window and the touch screen pops up over it when the game needs it. The others show both screens all the time."},
+            {"aspect", "Default keeps the 3DS's own 5:3 shape (black bars at the sides on a wide screen). Stretch fills the whole window. The ratios draw the picture in that shape."},
             {"touch_show", "When the touch screen's popup appears: when the game needs it (auto), always, or never. F2 shows or hides it by hand."},
             {"popup_size", "The height of the touch screen's popup, as a percentage of the window's height."},
             {"popup_corner", "The corner of the window where the touch screen's popup sits."},
@@ -839,7 +841,9 @@ private:
             {"Join this address", "Joins the room at that address. Then, in the game, go to the Gathering Hall and choose Local Play."},
             {"Host port (UDP)", "The UDP port your room listens on. Open it on your router so others can join."},
             {"Host password", "An optional password for the room you host. It is not saved."},
-            {"host", "Opens a room on your PC and joins it. Others join your public IP address and this port."},
+            {"host", "Opens a room on your PC and copies the address to send to your friends: a Radmin VPN, Hamachi, ZeroTier or Tailscale address if you have one (no router to open), else your local network's."},
+            {"paste_join", "Joins the room whose address you copied (Ctrl+C on your friend's message)."},
+            {"copy_address", "Copies the address to send to your friends again."},
             {"Leave the room", "Leaves the room you are in."},
             {"Resume the game", "Closes the menu and goes back to the game."},
             {"Quit the game", "Closes the game."},
@@ -866,7 +870,8 @@ private:
                 items.push_back(Choice("Touch popup size", "popup_size", Numbers(20, 70, 5)));
                 items.push_back(Choice("Touch popup corner", "popup_corner", {"bottom-right", "bottom-left", "top-right", "top-left"}));
             }
-            items.push_back(Choice("Internal resolution", "scale", {"auto", "1", "2", "3", "4", "5", "6", "7"}, true));
+            items.push_back(Choice("Picture shape", "aspect", {"default", "stretch", "16:9", "16:10", "21:9", "4:3"}));
+            items.push_back(Choice("Internal resolution", "scale", {"auto", "1", "2", "3", "4", "5", "6", "7", "8"}, true));
             items.push_back(Choice("FPS counter", "fps_counter", {"off", "on"}));
             items.push_back(Action("Open the HD textures folder", [this] {
                 const std::string said = host_.action ? host_.action("open_textures") : "Not available";
@@ -875,7 +880,7 @@ private:
             }, "Open"));
             break;
         case Page::Game:
-            items.push_back(Choice("Frame rate limit", "fps", {"default", "display", "30", "60", "90", "120", "144", "165", "180", "240", "unlimited"}));
+            items.push_back(Choice("Frame rate limit", "fps", {"default", "display", "30", "60", "120", "180", "240", "300", "360", "unlimited"}));
             items.push_back(Choice("Steady frame rate", "steady", {"default", "on", "off"}, false, true));
             items.push_back(Choice("Particle effects", "effects", {"default", "on", "off"}, false, true));
             break;
@@ -928,34 +933,20 @@ private:
         } else {
             items.push_back(Info("Not in a room."));
         }
-        if (st.hosting) items.push_back(Info(Tr("Hosting on UDP port ") + std::to_string(st.hosted_port) + Tr(" (open it on your router)"), 3));
-        items.push_back(TextField("Nickname", &nick_, 20, false, [this] { host_.apply("nick", nick_); }));
-        {
-            Item i = Action("Public rooms >", [this] {
-                SetPage(Page::Rooms);
-                StartFetch(false);
-            }, "Open");
-            items.push_back(i);
+        if (st.hosting) {
+            const auto shared = ShareAddresses();
+            items.push_back(Info(Tr("Hosting. Send one of these addresses to your friends:"), 3));
+            for (const auto& [ip, where, vpn] : shared) {
+                (void)vpn;
+                items.push_back(Info("  " + ip + ":" + std::to_string(st.hosted_port) + "  (" + Tr(where) + ")", 3));
+            }
+            if (shared.empty()) items.push_back(Info(Tr("No VPN or local network found: friends need your public IP and the port open on your router."), 4));
+            Item copy = Action("Copy the address", [this, port = st.hosted_port] { CopyAddress(port); }, "Copy");
+            copy.id = "copy_address";
+            items.push_back(copy);
         }
-        items.push_back(TextField("Address HOST:PORT", &addr_, 64, false, [this] { host_.apply("join_address", addr_); }));
-        items.push_back(TextField("Room password", &password_, 32, true));
-        items.push_back(Action("Join this address", [this] {
-            std::string host = addr_;
-            unsigned port = mh4n::rooms::kDefaultPort;
-            const auto colon = host.rfind(':');
-            if (colon != std::string::npos) {
-                port = static_cast<unsigned>(std::atoi(host.c_str() + colon + 1));
-                host.resize(colon);
-            }
-            if (host.empty() || port == 0 || port > 65535) {
-                Say("Type the address as HOST:PORT.");
-                return;
-            }
-            JoinRoom(host, static_cast<std::uint16_t>(port), password_);
-        }, "Join"));
-        items.push_back(TextField("Host port (UDP)", &host_port_, 5, false, [this] { host_.apply("host_port", host_port_); }));
-        items.push_back(TextField("Host password", &host_password_, 32, true));
-        {
+        items.push_back(TextField("Nickname", &nick_, 20, false, [this] { host_.apply("nick", nick_); }));
+        {   // the easy way: one click to host (the address to send is copied), one click to join with a pasted address
             Item host = Action(st.hosting ? "Close the room I host" : "Host a room", [this, hosting = st.hosting] {
                 if (hosting) {
                     mh4n::rooms::Leave();
@@ -980,16 +971,93 @@ private:
                     return;
                 }
                 JoinRoom("127.0.0.1", room.port, host_password_);
-                Say(Tr("Hosting: others join your public IP address, port ") + std::to_string(port) + ".");
+                share_at_ = {};  // look at the adapters again
+                CopyAddress(static_cast<unsigned>(port));
             }, st.hosting ? "Close" : "Host");
             host.id = "host";
             items.push_back(host);
         }
+        {
+            Item paste = Action("Join with the copied address", [this] {
+                const std::string text = host_.action ? host_.action("paste") : std::string();
+                std::string host;
+                unsigned port = 0;
+                if (!netaddr::ParseHostPort(text, host, port, mh4n::rooms::kDefaultPort)) {
+                    Say("Copy the address your friend sent (like 26.1.2.3:24872) and try again.");
+                    return;
+                }
+                addr_ = host + ":" + std::to_string(port);
+                host_.apply("join_address", addr_);
+                JoinRoom(host, static_cast<std::uint16_t>(port), password_);
+            }, "Join");
+            paste.id = "paste_join";
+            items.push_back(paste);
+        }
+        {
+            Item i = Action("Public rooms >", [this] {
+                SetPage(Page::Rooms);
+                StartFetch(false);
+            }, "Open");
+            items.push_back(i);
+        }
+        // by hand: an address typed, a port, passwords
+        items.push_back(TextField("Address HOST:PORT", &addr_, 64, false, [this] { host_.apply("join_address", addr_); }));
+        items.push_back(TextField("Room password", &password_, 32, true));
+        items.push_back(Action("Join this address", [this] {
+            std::string host;
+            unsigned port = 0;
+            if (!netaddr::ParseHostPort(addr_, host, port, mh4n::rooms::kDefaultPort)) {
+                Say("Type the address as HOST:PORT.");
+                return;
+            }
+            JoinRoom(host, static_cast<std::uint16_t>(port), password_);
+        }, "Join"));
+        items.push_back(TextField("Host port (UDP)", &host_port_, 5, false, [this] { host_.apply("host_port", host_port_); }));
+        items.push_back(TextField("Host password", &host_password_, 32, true));
         items.push_back(Action("Leave the room", [this] {
             mh4n::rooms::Leave();
             Say("Left the room.");
         }, "Leave"));
         items.push_back(Info("Then, in the game: Gathering Hall, Local Play."));
+    }
+
+    // The addresses a friend can reach this PC on (ip, where, virtual network), asked of the shell and kept a few seconds.
+    struct Shared {
+        std::string ip, where;
+        bool vpn = false;
+    };
+    std::vector<Shared> shared_;
+    std::chrono::steady_clock::time_point share_at_{};
+    std::vector<Shared> ShareAddresses() {
+        const auto now = std::chrono::steady_clock::now();
+        if (share_at_ == std::chrono::steady_clock::time_point{} || now - share_at_ > std::chrono::seconds(4)) {
+            share_at_ = now;
+            shared_.clear();
+            const std::string text = host_.action ? host_.action("addresses") : std::string();
+            std::size_t from = 0;
+            while (from < text.size()) {
+                std::size_t end = text.find('\n', from);
+                if (end == std::string::npos) end = text.size();
+                const std::string line = text.substr(from, end - from);
+                from = end + 1;
+                const auto p1 = line.find('|'), p2 = line.rfind('|');
+                if (p1 == std::string::npos || p2 == p1) continue;
+                shared_.push_back({line.substr(0, p1), line.substr(p1 + 1, p2 - p1 - 1), line.substr(p2 + 1) == "1"});
+            }
+        }
+        return shared_;
+    }
+
+    // Copies the best address (a virtual network's, else the local network's) with the port, and says so.
+    void CopyAddress(unsigned port) {
+        const auto shared = ShareAddresses();
+        if (shared.empty()) {
+            Say(Tr("Hosting. No VPN or local network found: friends need your public IP and the port open on your router."));
+            return;
+        }
+        const std::string text = shared.front().ip + ":" + std::to_string(port);
+        if (host_.action) host_.action("copy:" + text);
+        Say(Tr("Hosting. Address copied: ") + text + " (" + Tr(shared.front().where) + "). " + Tr("Send it to your friends."));
     }
 
     void StartFetch(bool force) {
@@ -1023,12 +1091,12 @@ private:
             items.push_back(Info(Plain(fetch->list.error), 4));
             return;
         }
-        items.push_back(Info("Rooms for MH4U come first. You need MH4U USA 1.3.0."));
+        items.push_back(Info("* marks the rooms set up for MH4U, and they come first. You need MH4U USA 1.3.0."));
         for (const mh4n::rooms::LobbyRoom& room : fetch->list.rooms) {
             Item i;
             i.kind = Item::Action;
             i.room = true;
-            i.label = Plain(room.name);
+            i.label = (room.preferred ? "* " : "") + Plain(room.name);  // * = a room set up for MH4U
             i.value = std::to_string(room.players.size()) + "/" + std::to_string(room.max_players);
             i.locked = room.password;
             i.color = room.preferred ? 0 : 2;

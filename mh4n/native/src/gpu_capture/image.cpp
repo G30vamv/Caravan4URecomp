@@ -441,7 +441,10 @@ bool DisplayShadow::BuildScreen(u32 screen, const PhysicalPointerFn& memory, Ima
     static const u8 kZero[4] = {0, 0, 0, 0};
     for (u32 y = 0; y < height; ++y) {
         for (u32 x = 0; x < pixel_stride; ++x) {
-            const u64 index = static_cast<u64>(y) * pixel_stride + pixel_stride - x;
+            // MODIFIED for the Windows port: Azahar's software renderer reads index (y * stride + stride - x), one pixel
+            // too far (x = 0 shows the next column's first pixel: a wrong line along the top of the picture). The display
+            // reads y * stride + stride - 1 - x.
+            const u64 index = static_cast<u64>(y) * pixel_stride + pixel_stride - 1 - x;
             const u8* pixel = index * bpp < stored ? data + index * bpp : (extra ? extra : kZero);
             const Rgb c = DecodeDisplayPixel(format, pixel);
             u8* out = &image.rgb[(static_cast<size_t>(x) * height + y) * 3];

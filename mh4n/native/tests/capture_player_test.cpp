@@ -539,7 +539,7 @@ Image ModelScreen(const Bytes& fb, u32 cols) {
     image.rgb.assign(static_cast<size_t>(cols) * kRows * 3, 0);
     for (u32 x = 0; x < kRows; ++x) {
         for (u32 y = 0; y < cols; ++y) {
-            const size_t index = static_cast<size_t>(y) * kRows + kRows - x; // Azahar's quirk
+            const size_t index = static_cast<size_t>(y) * kRows + kRows - 1 - x; // (no one-pixel shift: MODIFIED for the Windows port)
             if ((index + 1) * 4 > fb.size()) continue;                       // past the buffer: black
             const u8* px = &fb[index * 4];
             u8* out = &image.rgb[(static_cast<size_t>(x) * cols + y) * 3];
@@ -1046,8 +1046,8 @@ TEST_CASE("the displayed screen: orientation, Azahar's off-by-one column, colour
     REQUIRE_MESSAGE(shadow.BuildScreen(0, fn, image, &error), error);
     CHECK(image.width == 3);  // the columns stored
     CHECK(image.height == 2); // the pixels per column
-    // output (row x, column y) is memory pixel y * 2 + 2 - x
-    const int expect[2][3] = {{2, 4, 6}, {1, 3, 5}};
+    // output (row x, column y) is memory pixel y * 2 + 1 - x (no one-pixel shift: MODIFIED for the Windows port)
+    const int expect[2][3] = {{1, 3, 5}, {0, 2, 4}};
     for (u32 x = 0; x < 2; ++x) {
         for (u32 y = 0; y < 3; ++y) {
             const u8* p = &image.rgb[(static_cast<size_t>(x) * 3 + y) * 3];
@@ -1056,11 +1056,11 @@ TEST_CASE("the displayed screen: orientation, Azahar's off-by-one column, colour
             CHECK(p[2] == 30 + expect[x][y]);
         }
     }
-    // Memory that ends at the last column: the pixel past it is black.
+    // Memory that ends at the last column: nothing is read past it any more.
     memory.resize(6 * 4);
     REQUIRE(shadow.BuildScreen(0, fn, image, &error));
-    CHECK(image.rgb[(0 * 3 + 2) * 3] == 0);
-    CHECK(image.rgb[(1 * 3 + 2) * 3] == 15);
+    CHECK(image.rgb[(0 * 3 + 2) * 3] == 15);
+    CHECK(image.rgb[(1 * 3 + 2) * 3] == 14);
 
     // A screen with its colour fill on is that colour, whatever the memory holds.
     shadow.ApplyFill((1u << 24) | (0x30u << 16) | (0x20u << 8) | 0x10u);

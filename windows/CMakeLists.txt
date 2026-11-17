@@ -33,7 +33,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CINZEL_TTF}")
 
 add_executable(mh4u-win WIN32 win_main.cpp menu_gui.cpp imgui_vulkan_backend.cpp "${CINZEL_CPP}")
 set_target_properties(mh4u-win PROPERTIES OUTPUT_NAME Caravan4URecomp)  # Caravan4URecomp.exe
-target_link_libraries(mh4u-win PRIVATE mh4n::app mh4n_warnings SDL3::SDL3 mh4n_imgui)
+target_link_libraries(mh4u-win PRIVATE mh4n::app mh4n_warnings SDL3::SDL3 mh4n_imgui iphlpapi ws2_32)
 # the swapchain, present and screen_layout headers are included as "swapchain/..."; screen_layout.h includes the port's platform.h
 target_include_directories(mh4u-win PRIVATE ${MH4N_DIR}/native/src ${MH4N_DIR}/native/app ${MH4N_DIR}/port/src)
 

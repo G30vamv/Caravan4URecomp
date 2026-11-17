@@ -701,9 +701,10 @@ void main() {
     int n = p.map.x, w = p.map.y, h = p.map.z;
     // index = (o.x + 1) * w - o.y + n - 1, fy = index / w, fx = index % w, without the divide (a long sequence on a
     // Mali): 0 <= o.y < w, so index / w is o.x, or o.x + 1 for the first n columns (o.y < n)
-    int k = o.y < n ? 1 : 0;
-    int fy = o.x + k;
-    int fx = w + n - 1 - o.y - k * w;
+    // MODIFIED for the Windows port: without Azahar's software renderer's one-pixel shift (a wrong line along the top of
+    // the picture): index = o.x * w + w - 1 - o.y
+    int fy = o.x;
+    int fx = w - 1 - o.y;
     if (fy >= h) {
         color = vec4(0.0, 0.0, 0.0, 1.0);
         return;
@@ -1122,9 +1123,7 @@ public:
                     std::memcpy(rgba.data() + y * out_width * 4, data + y * image_width * 4, out_width * 4);
                 }
             }
-            if (rows == s.height) {
-                PutExtraPixel(paddr + stride * rows, format, rows, rgba);
-            }
+            // (no extra pixel: the one-pixel shift of Azahar's software renderer is not reproduced)
             return ScreenRead::Ready;
         }
         return ScreenRead::None;

@@ -20,7 +20,8 @@ inline std::string Tr(const std::string& en) {
         {"Graphics", "Gráficos"}, {"Game", "Juego"}, {"Audio", "Audio"}, {"Online", "En línea"}, {"System", "Sistema"},
         {"Public rooms", "Salas públicas"}, {"Room password", "Contraseña de la sala"},
         // rows
-        {"Fullscreen", "Pantalla completa"}, {"VSync", "VSync"}, {"Screen layout", "Disposición de pantallas"},
+        {"Fullscreen", "Pantalla completa"}, {"VSync", "VSync"}, {"Screen layout", "Disposición de pantallas"}, {"Picture shape", "Forma de la imagen"},
+        {"Default keeps the 3DS's own 5:3 shape (black bars at the sides on a wide screen). Stretch fills the whole window. The ratios draw the picture in that shape.", "Default mantiene la forma 5:3 de la 3DS (barras negras a los lados en una pantalla ancha). Stretch llena toda la ventana. Las proporciones dibujan la imagen con esa forma."},
         {"Touch screen shows", "Pantalla táctil"}, {"Touch popup size", "Tamaño del recuadro táctil"},
         {"Touch popup corner", "Esquina del recuadro táctil"}, {"Internal resolution", "Resolución interna"},
         {"FPS counter", "Contador de FPS"}, {"Open the HD textures folder", "Abrir la carpeta de texturas HD"},
@@ -109,6 +110,17 @@ inline std::string Tr(const std::string& en) {
         {"Closes the menu and goes back to the game.", "Cierra el menú y vuelve al juego."}, {"Closes the game.", "Cierra el juego."},
         {"Gets the list of rooms again.", "Vuelve a pedir la lista de salas."}, {"The password of this room.", "La contraseña de esta sala."},
         {"Joins the room with that password.", "Entra a la sala con esa contraseña."},
+        {"Host a room", "Alojar una sala"}, {"Join with the copied address", "Unirse con la dirección copiada"},
+        {"Copy the address", "Copiar la dirección"}, {"Copy", "Copiar"}, {"local network", "red local"},
+        {"Hosting. Send one of these addresses to your friends:", "Alojando. Envía una de estas direcciones a tus amigos:"},
+        {"No VPN or local network found: friends need your public IP and the port open on your router.", "No encontré VPN ni red local: tus amigos necesitan tu IP pública y el puerto abierto en tu router."},
+        {"Hosting. No VPN or local network found: friends need your public IP and the port open on your router.", "Alojando. No encontré VPN ni red local: tus amigos necesitan tu IP pública y el puerto abierto en tu router."},
+        {"Hosting. Address copied: ", "Alojando. Dirección copiada: "}, {"Send it to your friends.", "Envíala a tus amigos."},
+        {"Copy the address your friend sent (like 26.1.2.3:24872) and try again.", "Copia la dirección que te mandó tu amigo (como 26.1.2.3:24872) y vuelve a intentarlo."},
+        {"* marks the rooms set up for MH4U, and they come first. You need MH4U USA 1.3.0.", "El * marca las salas preparadas para MH4U, y van primero. Necesitas MH4U USA 1.3.0."},
+        {"Opens a room on your PC and copies the address to send to your friends: a Radmin VPN, Hamachi, ZeroTier or Tailscale address if you have one (no router to open), else your local network's.", "Abre una sala en tu PC y copia la dirección que debes mandar a tus amigos: la de Radmin VPN, Hamachi, ZeroTier o Tailscale si tienes (sin abrir el router), o si no la de tu red local."},
+        {"Joins the room whose address you copied (Ctrl+C on your friend's message).", "Entra a la sala cuya dirección copiaste (Ctrl+C en el mensaje de tu amigo)."},
+        {"Copies the address to send to your friends again.", "Vuelve a copiar la dirección para mandar a tus amigos."},
         {"Joins this room. Rooms with a password ask for it first.", "Entra a esta sala. Las salas con contraseña la piden antes."},
     };
     const auto it = kEs.find(en);

@@ -395,12 +395,12 @@ void DecodeFramebuffer(const u8* data, const u8* extra, u32 stride, u32 columns,
     static const u8 kZero[4] = {0, 0, 0, 0};
     const u64 stored = static_cast<u64>(columns) * stride;
     for (u32 y = 0; y < columns; ++y) {
-        const u64 first = static_cast<u64>(y) * stride + stride;  // x = 0
-        const u8* p0 = first < stored ? data + first * Bpp : (extra ? extra : kZero);
-        PutPixel<Format>(p0, out + static_cast<size_t>(y) * 4);
+        // MODIFIED for the Windows port: pixel x of a column is at stride - 1 - x (Azahar's software renderer read
+        // stride - x, one pixel too far: a wrong line along the top of the picture)
+        (void)extra, (void)kZero, (void)stored;
         const u8* column = data + static_cast<u64>(y) * stride * Bpp;
-        for (u32 x = 1; x < stride; ++x) {
-            PutPixel<Format>(column + static_cast<size_t>(stride - x) * Bpp,
+        for (u32 x = 0; x < stride; ++x) {
+            PutPixel<Format>(column + static_cast<size_t>(stride - 1 - x) * Bpp,
                              out + (static_cast<size_t>(x) * columns + y) * 4);
         }
     }

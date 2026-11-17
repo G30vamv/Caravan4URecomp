@@ -15,7 +15,7 @@ param(
     [ValidateSet("release", "test")][string]$Mode = "release",
     [string]$OutDir = "",
     [string]$BuildDir = "",
-    [string]$Version = "0.1.0"   # semantic versioning (semver.org); the zip and the tag of a release are named after it
+    [string]$Version = "0.2.0"   # semantic versioning (semver.org); the zip and the tag of a release are named after it
 )
 $ErrorActionPreference = "Stop"
 $source = $PSScriptRoot

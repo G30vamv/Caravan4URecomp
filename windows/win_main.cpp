@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "net_addresses.h"  // (winsock2.h before windows.h)
 #include "config.h"
 #include "gpu/backend/rhi.h"
 #include "gpu/backend/vulkan_access.h"
@@ -114,6 +115,9 @@ std::atomic<int> g_layout_mode{static_cast<int>(sl::Mode::Stacked)};  // the scr
 // waits for something on it (the layout is then Overlay, else Single). The mouse works on the popup as on the touch screen.
 std::atomic<bool> g_popup{true};
 std::atomic<bool> g_touch_visible{false};
+// the picture's shape: default (the 3DS's 5:3, bars at the sides on a wide screen), stretch (fills the window) or a fixed ratio
+constexpr const char* kAspects[] = {"default", "stretch", "16:9", "16:10", "21:9", "4:3"};
+std::atomic<int> g_aspect{0};
 std::atomic<int> g_popup_size{38};    // the popup's height, % of the window's
 std::atomic<int> g_popup_corner{3};   // Port::ScreenOverlay::Corner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
 
@@ -852,6 +856,9 @@ int main(int argc, char** argv) {
     sl::Mode mode = popup ? sl::Mode::Stacked : sl::ParseMode(ini.Get("mode"));
     std::string touch_show = ini.Get("touch_show", "auto");  // auto | always | hidden: when the popup shows
     g_popup_size.store(std::clamp(std::atoi(ini.Get("popup_size", "38").c_str()), 15, 80));
+    for (int i = 0; i < 6; ++i) {
+        if (ini.Get("aspect") == kAspects[i]) g_aspect.store(i);
+    }
     {
         const std::string corner = ini.Get("popup_corner", "bottom-right");
         g_popup_corner.store(corner == "top-left" ? 0 : corner == "top-right" ? 1 : corner == "bottom-left" ? 2 : 3);
@@ -963,6 +970,10 @@ int main(int argc, char** argv) {
                 game_args.push_back(std::string("0:") + key + "=" + v);
             }
         }
+        // pace: frames start on the emulated VBlank (the game's own limiter alone drifts against the VBlank and the
+        // display's vsync: now and then a picture is shown twice or never, which feels like stutter at any counter value)
+        // (a start-up option: the environment variable the hooks read; ini `pace = limiter` turns it off)
+        if (!std::getenv("MH4U_PACE")) _putenv_s("MH4U_PACE", ini.Get("pace").empty() ? "vblank" : ini.Get("pace").c_str());
         if (popup) {  // the touch screen's menus go to the top screen (the game's own single-screen mode)
             game_args.push_back("--set");
             game_args.push_back("0:single_screen=on");
@@ -1047,6 +1058,9 @@ int main(int argc, char** argv) {
     if (!SDL_Vulkan_CreateSurface(window, rhi::NativeInstance(**instance), nullptr, &vk_surface)) {
         return Fail("SDL_Vulkan_CreateSurface", SDL_GetError());
     }
+    // The 32 MiB allocator blocks are for phones: at 8x and above the screens' images outgrow them and the picture stays
+    // black. A desktop card uses the allocator's own (256 MiB) blocks.
+    if (!std::getenv("MH4N_VMA_BLOCK_MB")) _putenv_s("MH4N_VMA_BLOCK_MB", "0");
     rhi::BackendOptions backend_options;
     backend_options.surface = rhi::SurfaceFrom(vk_surface);
     auto backend = rhi::CreateBackend(*instance, backend_options);
@@ -1061,6 +1075,7 @@ int main(int argc, char** argv) {
     sc::LayoutSource layout = [] {
         sc::LayoutRequest request;
         request.inputs.mode = static_cast<sl::Mode>(g_layout_mode.load());
+        request.inputs.aspect_ratio = kAspects[std::clamp(g_aspect.load(), 0, 5)];
         if (g_popup.load()) {  // a full top screen; the touch screen over it in a corner while it is wanted
             request.inputs.mode = g_touch_visible.load() ? sl::Mode::Overlay : sl::Mode::Single;
             Port::ScreenOverlay overlay;
@@ -1093,9 +1108,13 @@ int main(int argc, char** argv) {
     mh4n::app::InputMapper mapper(pads.get());
     // The mouse is the stylus (the touch screen) by default. The Azahar app's "auto" mode turns it into the camera as soon
     // as the keyboard is used, and then a click does nothing on the touch screen: --mouse-camera asks for that mode.
+    // mouse_camera = on: the mouse is the camera (captured by the window; Left Alt held = the stylus, F3 toggles).
     App::Config input_config = App::Defaults();
-    input_config.input_mode = mouse_camera ? "auto" : "controller";
-    mapper.Configure(input_config);
+    const auto apply_mouse_mode = [&] {
+        input_config.input_mode = mouse_camera ? "keyboard_mouse" : "controller";
+        mapper.Configure(input_config);
+    };
+    apply_mouse_mode();
     mapper.on_state = [log_input](const mh4n::InputState& state) {
         if (log_input) {
             std::fprintf(stderr, "mh4u-win: input buttons 0x%08x\n", static_cast<unsigned>(state.buttons));
@@ -1129,9 +1148,8 @@ int main(int argc, char** argv) {
         give("--input-source", "live");
         give("--input-latch", "none");
         // "auto": a whole number of times the 3DS's 240 rows that is nearest to the window's height (3 at 720, 5 at 1080)
-        // (8x and above draw a black screen on the card I tested: the most it takes is 7x)
-        const std::string scale_arg = scale_value == "auto" ? std::to_string(std::clamp((pixel_h + 120) / 240, 1, 7))
-                                                           : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 7));
+        const std::string scale_arg = scale_value == "auto" ? std::to_string(std::clamp((pixel_h + 120) / 240, 1, 8))
+                                                           : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 8));
         give("--scale", scale_arg.c_str());
         give("--volume", volume_value.c_str());  // the runner's own option of the SDL audio device (app/audio)  // internal resolution: the runner's default is the 3DS's own (1), which looks soft on a PC
         // the runner stops after 10 s of game time unless told otherwise; --frames alone means no time limit
@@ -1198,13 +1216,14 @@ int main(int argc, char** argv) {
         if (key == "vsync") return vsync ? "on" : "off";
         if (key == "mode") return g_popup.load() ? "popup" : sl::ModeName(static_cast<sl::Mode>(g_layout_mode.load()));
         if (key == "touch_show") return touch_show;
+        if (key == "aspect") return kAspects[std::clamp(g_aspect.load(), 0, 5)];
         if (key == "popup_size") return std::to_string(g_popup_size.load());
         if (key == "popup_corner") {
             static const char* const kCorners[] = {"top-left", "top-right", "bottom-left", "bottom-right"};
             return kCorners[std::clamp(g_popup_corner.load(), 0, 3)];
         }
         if (key == "fps_counter") return show_fps ? "on" : "off";
-        if (key == "scale") return scale_value == "auto" ? scale_value : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 7));  // (8 and 10 of an older settings file read as 7)
+        if (key == "scale") return scale_value == "auto" ? scale_value : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 8));  // (9 and 10 of an older settings file read as 8)
         if (key == "volume") return volume_value;
         if (key == "system_language") {  // the language of Windows: "es" or "en"
             wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
@@ -1215,7 +1234,7 @@ int main(int argc, char** argv) {
         if (key == "scale_auto") {  // the multiple "auto" picks for this window
             int w = 0, h = 0;
             SDL_GetWindowSizeInPixels(window, &w, &h);
-            return std::to_string(std::clamp((h + 120) / 240, 1, 7));
+            return std::to_string(std::clamp((h + 120) / 240, 1, 8));
         }
         if (key == "lobby") return ini.Get("lobby").empty() ? "http://88.198.47.46:5000" : ini.Get("lobby");
         return ini.Get(key, key == "fps" || key == "steady" || key == "effects" ? "default" : "");
@@ -1236,6 +1255,11 @@ int main(int argc, char** argv) {
                     const std::string v = g_popup.load() ? "on" : "off";
                     rt->GetKernel().Post([v] { Port::Hooks::SetOption("single_screen", v); });
                 }
+            }
+            (*presenter)->RequestRedraw();
+        } else if (key == "aspect") {
+            for (int i = 0; i < 6; ++i) {
+                if (value == kAspects[i]) g_aspect.store(i);
             }
             (*presenter)->RequestRedraw();
         } else if (key == "touch_show") {
@@ -1271,6 +1295,21 @@ int main(int argc, char** argv) {
     };
     menu_host.quit = [&] { running = false; };
     menu_host.action = [&](const std::string& name) -> std::string {
+        if (name == "addresses") {  // the addresses a friend can use: "ip|where|vpn" a line, the virtual networks first
+            std::string out;
+            for (const netaddr::Address& a : netaddr::Find()) out += a.ip + "|" + a.where + "|" + (a.vpn ? "1" : "0") + '\n';
+            return out;
+        }
+        if (name.rfind("copy:", 0) == 0) {
+            SDL_SetClipboardText(name.c_str() + 5);
+            return "Copied";
+        }
+        if (name == "paste") {
+            char* text = SDL_GetClipboardText();
+            std::string out = text ? text : "";
+            SDL_free(text);
+            return out;
+        }
         if (name == "open_textures") {  // <user>\load\textures, where the runtime reads HD texture packs from at start
             std::string user;
             for (std::size_t i = 0; i + 1 < game_args.size(); ++i) {
@@ -1318,6 +1357,8 @@ int main(int argc, char** argv) {
     auto size_changed_at = std::chrono::steady_clock::now();
     bool touch_forced = false;  // F2: the popup shows whatever the game does
     auto touch_needed_at = std::chrono::steady_clock::now();
+    auto room_checked_at = std::chrono::steady_clock::now();
+    bool in_room = false;  // connected to a room (Joined or Moderator), looked at twice a second
     const bool log_state = std::getenv("MH4U_LOG_STATE") != nullptr;  // prints the game's state when it changes (tuning)
     Port::Hooks::GameState last_state;
     int last_objects = -1;
@@ -1494,6 +1535,12 @@ int main(int argc, char** argv) {
                 ini.Set("fullscreen", fullscreen ? "on" : "off");
                 ini.Save();
             }
+            if (game && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && !typing.active && !menu_open && event.key.key == SDLK_F3) {
+                mouse_camera = !mouse_camera;  // the mouse: stylus <-> camera
+                apply_mouse_mode();
+                ini.Set("mouse_camera", mouse_camera ? "on" : "off");
+                ini.Save();
+            }
             if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && !typing.active && !menu_open && event.key.key == SDLK_F2 &&
                 g_popup.load()) {
                 touch_forced = !touch_forced;  // show or let go of the touch popup by hand
@@ -1529,6 +1576,10 @@ int main(int argc, char** argv) {
             }
         }
         if (game) typing.Update(window, mapper);
+        {   // the camera takes the mouse (relative mode) only while the game has it: not under the menu or the game's keyboard
+            const bool want = game && mouse_camera && !menu.open && !typing.active && !setup_active && mapper.WantsRelativeMouse();
+            if (want != SDL_GetWindowRelativeMouseMode(window)) SDL_SetWindowRelativeMouseMode(window, want);
+        }
         if (menu.open != menu_was_open) {  // while the menu is up the game reads no button, stick or touch
             menu_was_open = menu.open;
             mapper.SetMuted(menu.open);
@@ -1558,7 +1609,20 @@ int main(int argc, char** argv) {
             // is gone (so that it doesn't flicker) and while the mouse holds it.
             const auto now = std::chrono::steady_clock::now();
             bool need = touch_show == "always" || touch_forced || touching || typing.active;
-            if (touch_show == "auto" && game) need = need || TouchWanted(Port::Hooks::CurrentGameState());
+            if (touch_show == "auto" && game) {
+                const Port::Hooks::GameState gs = Port::Hooks::CurrentGameState();
+                need = need || TouchWanted(gs);
+                // connected to a room in a town (the Gathering Hall included): the touch screen stays up, it is how the
+                // hall is used (chat, gestures, guild card, friends). ini online_touch = off turns this off.
+                if (ini.Get("online_touch") != "off" && gs.place == Port::Hooks::GameState::PLACE_TOWN) {
+                    if (now - room_checked_at > std::chrono::milliseconds(500)) {
+                        room_checked_at = now;
+                        const auto room_state = mh4n::rooms::GetStatus().state;
+                        in_room = room_state == mh4n::rooms::State::Joined || room_state == mh4n::rooms::State::Moderator;
+                    }
+                    need = need || in_room;
+                }
+            }
             if (touch_show == "hidden" && !touch_forced && !typing.active) need = false;
             if (need) touch_needed_at = now;
             const bool show = need || (now - touch_needed_at < std::chrono::milliseconds(1200) && g_touch_visible.load());
@@ -1582,9 +1646,9 @@ int main(int argc, char** argv) {
         if (show_fps && std::chrono::steady_clock::now() - counter_at >= std::chrono::seconds(1)) {
             const sc::Stats counter_stats = (*presenter)->GetStats();
             const double counter_dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - counter_at).count();
-            g_cursor.fps.store(static_cast<int>(std::lround(static_cast<double>(counter_stats.published - counter_published) / counter_dt)));
+            g_cursor.fps.store(static_cast<int>(std::lround(static_cast<double>(counter_stats.presented - counter_published) / counter_dt)));  // what is shown, not what the game made
             counter_at = std::chrono::steady_clock::now();
-            counter_published = counter_stats.published;
+            counter_published = counter_stats.presented;
             (*presenter)->RequestRedraw();  // the counter changed while the game may show nothing new
         }
         if (game && !typing.active && std::chrono::steady_clock::now() >= rate_at + std::chrono::seconds(1)) {

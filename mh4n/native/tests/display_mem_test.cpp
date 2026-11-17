@@ -70,7 +70,7 @@ struct Fixture {
         at[2] = p.r;
     }
     // The pixel at displayed (column, row) of a 240-row screen is stored at c * 240 + 240 - r.
-    static u32 IndexOf(u32 column, u32 row) { return column * 240 + 240 - row; }
+    static u32 IndexOf(u32 column, u32 row) { return column * 240 + 239 - row; }  // (no one-pixel shift: MODIFIED for the Windows port)
 
     // One VBlank(0) with a sink attached; the frame it published.
     present::DisplayFrame Frame() {

@@ -453,7 +453,7 @@ constexpr Name kNames[] = {
     {0xF24BC1DAu, 273},  // ui001_pop1
     {0xF2F513BDu, 225},  // ui060_caravan
     {0xF3361950u, 52},  // ui419_l_tab2
-    {0xF5D23813u, 41},  // ui500_PL_list
+    {0xF5D23813u, 65535},  // ui500_PL_list (MODIFIED for the Windows port: the hall's player list stays on the touch screen; on the top screen it covered the whole picture)
     {0xF7CA4E05u, 65535},  // ui209_tougi_waku
     {0xF8507729u, 221},  // ui511_otomo_set
     {0xF87DCF5Cu, 42},  // ui419_l_bg

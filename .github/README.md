@@ -23,16 +23,19 @@ I'd rather be upfront about what I have actually tested.
 - The top screen fills the window; the touch screen appears as a small popup over it only when the game is waiting for you
   there (the save selection and character creation, the game's keyboard, a few town pages), and the mouse works on it.
 - An in-game settings menu (see below).
-- Network rooms that speak the same protocol as Azahar's: I joined a real public room from the in-game menu while the game was running.
+- Network rooms that speak the same protocol as Azahar's: I joined a real public room from the in-game menu while the game was running, and I played Local Play in a Gathering Hall with another player.
+- Scales up to 8x the 3DS's resolution, and a frame counter that shows the frames you actually see.
 
 **Not tested yet:**
-- Local Play (the Gathering Hall) with other players over the internet, from Windows.
+- The one-click **Host a room** and **Join with the copied address** buttons of the Online page (new in 0.2.0), and the touch screen staying up while you are in a room.
+- The mouse as the camera (**F3**, or `mouse_camera = on` in the ini).
+- Resolutions of 9x and 10x: the picture still comes out black there.
 - Other GPUs and drivers, Windows 10, and building with MSVC (I build with clang from llvm-mingw).
 - Windows and Android crossplay.
 
 ## Getting it
 
-The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.1.0**, tagged `windows-v0.1.0`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.2.0**, tagged `windows-v0.2.0`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
@@ -63,12 +66,12 @@ Press **F1** or **L3 + R3** on a controller. It works with the keyboard, the mou
 right click to go back) and the controller (D-pad or left stick, A and B; LB and RB, or Q and E, change the page). The
 design comes from the menu of my MH3U port, with this game's colours, in the Cinzel font (SIL Open Font License).
 
-- **Graphics:** fullscreen, VSync, screen layout, internal resolution (auto, or 1x to 7x the 3DS's; needs a restart), FPS counter.
-- **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 90, 120, 144, 165, 180, 240 or unlimited), steady
+- **Graphics:** fullscreen, VSync, screen layout, picture shape (the 3DS's own 5:3 with bars on a wide screen, stretched to fill the window, or a fixed ratio), internal resolution (auto, or 1x to 8x the 3DS's; needs a restart), FPS counter.
+- **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 120, 180, 240, 300, 360 or unlimited), steady
   frame rate, particle effects.
 - **Audio:** volume.
 - **System:** the language of the menu (English or Spanish; "auto" follows Windows), resume and quit.
-- **Online:** nickname, public rooms, join by address, host a room, leave.
+- **Online:** nickname, host a room, join with the copied address, public rooms, join by address, leave.
 
 The default screen layout is the **popup** one described above: **F2** shows or hides the touch screen by hand, and the
 menu lets you choose when it shows (auto, always, hidden), its size and its corner. The classic layouts (stacked, overlay,
@@ -79,14 +82,17 @@ restarts anything by itself. **Graphics > Open the HD textures folder** opens th
 
 ## Frame rate and resolution
 
-- **Frame rate:** the limit goes up to 240 fps. In my tests the menus and the town ran at about 119 fps with the limit at 120
-  and about 237 fps at 240, with VSync off. With VSync on you get at most your display's refresh rate, so "display" in
-  the limit setting is the natural choice. I haven't measured a hunt at high frame rates yet.
-- **Internal resolution (1x to 7x for now):** at 8x and above the picture comes out black on my card, so the menu stops at 7x while I look into why and try to bring it back up to 10x. Everything the GPU draws (the 3D scene, the HUD and the text) is rendered at the chosen multiple
+- **Frame rate:** the limit goes up to 360 fps. The counter shows the frames that reach your screen, not the ones the game
+  makes: with a heavy internal resolution the two can differ, and then it feels choppy even if the game runs fast. With VSync
+  on you get at most your display's refresh rate, so "display" in the limit setting is the natural choice. If it feels
+  uneven at a high refresh rate, lower the internal resolution (on my screen 3x and 5x showed almost no lost frames at 144 fps, and 7x lost about 15 %).
+- **Internal resolution (1x to 8x):** everything the GPU draws (the 3D scene, the HUD and the text) is rendered at that multiple
   of the 3DS's resolution; "auto" picks the one closest to your window. The game's own textures stay at their original
   resolution, so edges get sharper but not more detailed. HD texture packs made for Azahar and Citra (PNG, their folder
-  layout and hashes) are supported by the runtime: put them under `game\user\load\textures`. I haven't tested a pack on
-  Windows yet.
+  layout and hashes) are supported by the runtime: put them under `game\user\load\textures`. At 9x and 10x the picture
+  is still black on my card (8x works since 0.2.0), so the menu stops at 8x.
+- **Picture shape:** the 3DS's top screen is 5:3, so on a 16:9 screen there are black bars at the sides. **Graphics > Picture
+  shape > stretch** fills the whole window (the picture is stretched a little); the fixed ratios are there too.
 
 ## Playing online
 
@@ -94,12 +100,17 @@ The rooms are the same kind Azahar uses, so players on this port, on Azahar and 
 room. Everyone needs MH4U USA v1.3.0.
 
 1. Open the menu, **Online**, and choose a nickname.
-2. **Public rooms** lists the rooms of the community lobby; or type a `HOST:PORT` address; or host your own (open the UDP
-   port on your router, 24872 by default).
-3. Being in the room is not enough: in the game, go to the **Gathering Hall** and choose **Local Play**.
+2. To **host**: choose **Host a room**. The program looks for a Radmin VPN, Hamachi, ZeroTier or Tailscale address on your PC
+   (with one of those there is no router to open) and otherwise for your local network's, and **copies the address with
+   its port** (for example `26.1.2.3:24872`) to the clipboard. Send it to your friends. Without a VPN you need the UDP port (24872 by default) open on your router.
+3. To **join** a friend: copy the address they sent and choose **Join with the copied address**. Or **Public rooms** lists the
+   rooms of the community lobby (a `*` marks the ones set up for MH4U), or type a `HOST:PORT` address by hand. If you write no port, 24872 is used.
+4. Being in the room is not enough: in the game, go to the **Gathering Hall** and choose **Local Play**. While you are in a
+   room the touch screen stays up in towns (`online_touch = off` in the ini turns that off).
 
 From the command line: `--list-rooms [URL]`, `--join HOST:PORT`, `--host PORT`, `--nick NAME`, `--room-password TEXT`.
-The lobby is read over plain HTTP, like Azahar does. Hosted rooms are not announced to the lobby yet.
+The lobby is read over plain HTTP, like Azahar does. Hosted rooms are not announced to the lobby, so people find your room
+by its address, not in Azahar's list.
 
 ## Building
 
@@ -121,7 +132,12 @@ player's PC from their own files, and it is never part of this repository.
   settings doesn't close the game.
 - Changed: `mh4n/port/src/hooks.cpp` and `hooks.h` (one counter, `TouchScreenObjects`, of the layout objects the game draws on
   the touch screen, which the shell uses to know when the touch screen has something on it).
-- Changed: `mh4n/native/src/gpu/native/native_gpu.cpp` (the renderer uses the Vulkan device the window shell already has),
+- Changed: `mh4n/native/src/gpu/native/native_gpu.cpp` (the renderer uses the Vulkan device the window shell already has, and the
+  screen is read out without a one-pixel shift that Azahar's software renderer has and that drew a wrong line along the top
+  of the picture; the same fix is in `gpu_capture/image.cpp` and `display_mem/display_mem.cpp`, and in the two tests that
+  expected the old index),
+- Changed: `mh4n/port/src/onescreen_table.h` (a generated table, edited by hand: the Gathering Hall's player list stays on
+  the touch screen instead of covering the top one),
   `mh4n/native/src/services/apt/applet_manager.cpp` and `mh4n/native/src/applets/CMakeLists.txt`.
 
 Every changed file says so in its header. The Android app is untouched.
@@ -163,10 +179,10 @@ alrededor de ese runtime.
 funciona con teclado, ratón y mando, y entré a una sala pública real de Azahar desde el menú del juego. Todavía no he
 probado Local Play con otras personas, otras GPU, Windows 10 ni MSVC.
 
-**Cómo se usa:** todavía no hay releases (cuando los haya, irán con su suma SHA-256). Abre `Caravan4URecomp.exe`: la
+**Cómo se usa:** la última versión es la 0.2.0, en la página de Releases (con su suma SHA-256). Abre `Caravan4URecomp.exe`: la
 primera vez pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con
 **F1** o **L3 + R3**, y tiene gráficos, juego, audio y online. Online usa las mismas salas que Azahar: menú → Online →
-salas públicas (o una dirección `HOST:PORT`), y luego, en el juego, Gathering Hall → Local Play.
+**Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
 
 Para compilarlo: `windows\build.ps1` y `windows\package.ps1` (CMake, Ninja, llvm-mingw y Python). Los créditos y la licencia
 están arriba; los términos adicionales de khorne-hub siguen aplicando.
