@@ -600,8 +600,8 @@ LONG CALLBACK StackWords(PEXCEPTION_POINTERS info) {
 // The settings of the Windows shell: Caravan4URecomp.ini beside the executable (portable: nothing goes to the registry or to
 // %APPDATA%). "key = value" lines, "#" starts a comment; the command line overrides it. Keys: game, code, user (the game
 // folder, the code library and the user folder), options (more runner options, e.g. "--room-host 24872 --nick Hunter"; "%EXEDIR%" is the program's folder),
-// scale, volume (0 to 100, 50 by default), vsync (on|off), fullscreen (on|off), width, height, display (-1: the first
-// display that is not the primary),
+// scale, volume (0 to 100, 50 by default), vsync (on|off), fullscreen (on|off), width, height, display (-1: the primary display; the first
+// one that is not the primary in a test run),
 // skip_key, circle_pad_pro (on|off), mouse_camera (on|off), fps_counter (on|off: the frame rate over the game, off by default). The shell writes fullscreen, width and height back when it
 // closes.
 struct Ini {
@@ -990,18 +990,20 @@ int main(int argc, char** argv) {
         const bool configured = PathExists(ini.Get("game")) && PathExists(ini.Get("code"));
         need_setup = !args_from_command_line && have_setup && (force_setup || !configured);
     }
-    // The window opens on the secondary display (the first one that is not the primary), centred there; a machine
-    // with one display uses it. --display N picks display N (0 is the first SDL lists) instead.
+    // The window opens on the primary display, centred there. A test run (MH4U_TEST_SCRIPT or MH4U_SECONDARY set) opens on the
+    // first display that is not the primary instead; a machine with one display uses it. --display N picks display N (0 is the
+    // first SDL lists) instead.
+    const bool on_secondary = std::getenv("MH4U_TEST_SCRIPT") || std::getenv("MH4U_SECONDARY");
     SDL_DisplayID display = 0;
     {
         int count = 0;
         SDL_DisplayID* displays = SDL_GetDisplays(&count);
         const SDL_DisplayID primary = SDL_GetPrimaryDisplay();
         if (displays && count > 0) {
-            display = displays[0];
+            display = primary ? primary : displays[0];
             if (display_index >= 0 && display_index < count) {
                 display = displays[display_index];
-            } else {
+            } else if (on_secondary) {
                 for (int i = 0; i < count; ++i) {
                     if (displays[i] != primary) {
                         display = displays[i];
@@ -1504,6 +1506,12 @@ int main(int argc, char** argv) {
                 size_dirty = true;
                 (*presenter)->Resize(static_cast<std::uint32_t>(event.window.data1),
                                      static_cast<std::uint32_t>(event.window.data2));
+            } else if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED && ini.Get("fps") == "display") {
+                // fps = display follows the window to the screen it is on (a 144 Hz cap on a 165 Hz screen is uneven)
+                if (mh4n::Runtime* rt = g_runtime.load()) {
+                    const std::string hz = std::to_string(DisplayHz(window));
+                    rt->GetKernel().Post([hz] { Port::Hooks::SetOption("fps", hz); });
+                }
             }
         }
         if (setup_active) {
