@@ -14,7 +14,7 @@ Como se usa (no hay nada que instalar)
 1) Descomprime todo el zip en una carpeta donde puedas escribir (por ejemplo, el Escritorio; no en "Archivos de programa").
 2) Abre Caravan4URecomp.exe. La primera vez te pide los dos archivos del juego (base y update v1.3.0) y abre una ventana
    que muestra el progreso: construye la "libreria" del juego para TU PC. Tarda unos minutos, y la primera vez descarga un
-   compilador de unos 150 MB (hace falta Internet; se comprueba su firma SHA-256). Se hace una sola vez.
+   compilador (solo la parte necesaria, unos 50 MB; hace falta Internet y se comprueba cada archivo con su SHA-256). Se hace una sola vez.
 3) Despues el juego arranca solo. Las siguientes veces solo abres Caravan4URecomp.exe.
 
 Si cambias de update o algo sale mal: ejecuta  Caravan4URecomp.exe --setup  (vuelve a pedir los archivos).
@@ -24,7 +24,7 @@ protegio su PC": pulsa "Mas informacion" y luego "Ejecutar de todas formas". Pue
 comparando su SHA-256 con el archivo .sha256 publicado junto a la descarga.
 
 Requisitos: Windows 10 u 11 de 64 bits, una GPU con Vulkan 1.2 o mas (casi cualquiera de 2016 en adelante) y unos
-1,5 GB libres junto al programa (la libreria del juego y el compilador que se descarga).
+1 GB libres junto al programa mientras se prepara el juego (despues ocupa unos 350 MB: la libreria del juego y el compilador).
 
 Controles (teclado)
 -------------------
@@ -39,14 +39,15 @@ funciona sobre el recuadro. F2 la muestra u oculta a mano; el menu (F1) deja ele
 
 Menu en el juego: F1 (o L3 + R3 a la vez en el mando). Se maneja con teclado, raton (clic, rueda, clic derecho = atras) y mando
 (cruceta o stick izquierdo, A, B; LB y RB o Q y E cambian de pagina). Tiene: Graficos (pantalla completa, VSync, disposicion de pantallas, resolucion interna,
-contador de fps), Juego (limite de fps, fps estables, efectos), Audio (volumen) y Online.
+contador de fps), Juego (limite de fps, fps estables, efectos), Audio (volumen), Online y Sistema (idioma del menu:
+ingles o espanol, "auto" sigue el de Windows).
 Online (salas de Azahar, compatibles con Azahar/Citra; todos deben usar MH4U USA v1.3.0): en el menu, Online > Public rooms
 lista las salas publicas; o escribe una direccion HOST:PORT; o aloja tu propia sala (abre el puerto UDP en tu router).
 Despues, en el juego: Gathering Hall > Local Play.
 Por linea de comandos: --list-rooms [URL], --join HOST:PORT, --host PORT, --nick NOMBRE, --room-password TEXTO.
 
 FPS y resolucion: el limite de fps tiene los escalones 30, 60, 90, 120, 144, 165, 180, 240 y sin limite (menu F1 > Game; "display" = la frecuencia de tu pantalla; con VSync solo
-llegas a la frecuencia de tu pantalla). La resolucion interna (menu F1 > Graphics, pide reiniciar) va de 1x a 10x la de la
+llegas a la frecuencia de tu pantalla). La resolucion interna (menu F1 > Graphics, pide reiniciar) va de 1x a 7x la de la
 3DS, o "auto" (la mas cercana a tu ventana): afecta a todo lo que dibuja la GPU (3D, HUD y texto); las texturas del juego
 siguen siendo las originales, salvo que uses un pack de texturas HD (formato Azahar/Citra, en game\user\load\textures).
 
@@ -68,5 +69,5 @@ La GPL exige entregarte el codigo fuente: esta en SOURCE\ (ver OFERTA-DE-CODIGO-
 English summary: Caravan4URecomp is a MODIFIED version of 4u-native by khorne-hub (not the official version). It does
 not include the game: bring your own decrypted copy (USA base game + v1.3.0 update). Unzip everywhere you can write, open
 Caravan4URecomp.exe, choose the two files on the first start, and wait for the window that builds the game's code for
-your PC (a compiler of about 150 MB is downloaded once). Nothing needs to be installed. Licenses: LICENSES\. Source code:
+your PC (the part of a compiler that it needs, about 50 MB, is downloaded once). Nothing needs to be installed. Licenses: LICENSES\. Source code:
 SOURCE\.

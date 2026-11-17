@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "gpu/backend/rhi.h"
@@ -44,6 +45,7 @@ struct View {
     int hover_tab = -1, hover_row = -1;
     std::string notice;              // settings that wait for a restart
     std::string message;             // the last thing the menu said
+    std::vector<std::pair<std::string, std::string>> keys;  // the bottom line: a key cap and what it does
     bool operator==(const View&) const = default;
 };
 
@@ -63,10 +65,34 @@ Layout LayoutOf(float width, float height);
 // How many rows fit, and the first one shown so that the marked one is in view.
 void WindowOf(const Layout& layout, std::size_t total, int sel, int* first, int* fit);
 
+// The first start's screen: choosing the two files of the game, then the progress of building the code library for this PC.
+// Every text is already in the language.
+struct SetupView {
+    bool open = false;
+    int stage = 0;                     // 0 choose the files, 1 working, 2 failed, 3 done
+    std::string title, intro, base_label, update_label, base_path, update_path, placeholder, hint;
+    std::string browse, primary, secondary;  // the words of the buttons ("" = no such button)
+    bool primary_enabled = false;
+    int focus = -1, hover = -1;        // the button with the keyboard's focus and under the mouse: 0, 1 browse, 2 primary, 3 secondary
+    float progress = -1.0f;            // 0 to 1 (-1: not known)
+    std::string step, eta, error;
+    std::vector<std::string> log;      // the last lines of what the tool says
+    bool operator==(const SetupView&) const = default;
+};
+
+struct SetupLayout {
+    Layout l;
+    Rect intro, base_field, update_field, base_browse, update_browse, hint, primary, secondary, bar, log;
+    float base_label_y = 0, update_label_y = 0, step_y = 0, eta_y = 0;
+};
+SetupLayout SetupLayoutOf(float width, float height);
+
 // The renderer: Dear ImGui over the process's Vulkan device. It draws on the present thread only.
 class GuiRenderer {
 public:
     virtual ~GuiRenderer() = default;
+    // The first start's screen, drawn over everything.
+    virtual bool DrawSetup(void* recorder, const SetupView& view, std::uint32_t width, std::uint32_t height) = 0;
     // Records the menu into the target's open pass. False when it can't (the caller falls back to plain rectangles).
     virtual bool Draw(void* recorder, const View& view, std::uint32_t width, std::uint32_t height) = 0;
 };

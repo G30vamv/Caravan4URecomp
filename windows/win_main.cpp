@@ -48,6 +48,7 @@
 #include "audio/app_audio.h"
 #include "hooks.h"
 #include "ingame_menu.h"
+#include "setup_ui.h"
 
 namespace rhi = ::mh4n::gpu::rhi;
 namespace pr = ::mh4n::present;
@@ -952,6 +953,7 @@ int main(int argc, char** argv) {
         return game_args;
     };
     if (game_args.empty()) game_args = build_game_args();
+    const auto add_extras = [&] {
     if (!game_args.empty()) {
         // the settings the menu keeps in the settings file and the game reads as it runs: applied from the first frame
         for (const char* key : {"fps", "steady", "effects"}) {
@@ -974,20 +976,19 @@ int main(int argc, char** argv) {
             }
         }
     }
+    };
+    add_extras();
     AddVectoredExceptionHandler(0, StackWords);
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         return Fail("SDL_Init", SDL_GetError());
     }
-    // The first start: no game set up yet (or --setup): ask for the files and build the player's own code library.
+    // The first start: no game set up yet (or --setup): the window asks for the files and shows the building of the player's
+    // own code library (below, once it exists).
+    bool need_setup = false;
     {
         const bool have_setup = PathExists(ini.exedir + "\\PrepareGame.ps1");
         const bool configured = PathExists(ini.Get("game")) && PathExists(ini.Get("code"));
-        if (!args_from_command_line && have_setup && (force_setup || !configured)) {
-            if (!RunSetup(ini.exedir, base_game, update_game)) return 0;
-            ini.lines.clear();
-            ini.Load(ini.path);
-            game_args = build_game_args();
-        }
+        need_setup = !args_from_command_line && have_setup && (force_setup || !configured);
     }
     // The window opens on the secondary display (the first one that is not the primary), centred there; a machine
     // with one display uses it. --display N picks display N (0 is the first SDL lists) instead.
@@ -1085,7 +1086,7 @@ int main(int argc, char** argv) {
 
     // The input: the keyboard, the mouse and every controller as one 3DS pad (the app's InputMapper), which feeds the
     // runtime's live input source. Audio is the runtime's own SDL sink (--audio sdl).
-    const bool game = !game_args.empty();
+    bool game = !game_args.empty() && !need_setup;
     auto pads = mh4n::app::MakeSdlGamepads();
     mh4n::app::InputMapper mapper(pads.get());
     // The mouse is the stylus (the touch screen) by default. The Azahar app's "auto" mode turns it into the camera as soon
@@ -1101,7 +1102,7 @@ int main(int argc, char** argv) {
     };
 
     std::thread game_thread;
-    if (game) {
+    const auto start_game = [&] {
         // crash files in <user>/log/crash-<pid>.txt (installed before Boot, so that the memory module's fault handler
         // chains to it)
         for (std::size_t i = 0; i + 1 < game_args.size(); ++i) {
@@ -1126,7 +1127,9 @@ int main(int argc, char** argv) {
         give("--input-source", "live");
         give("--input-latch", "none");
         // "auto": a whole number of times the 3DS's 240 rows that is nearest to the window's height (3 at 720, 5 at 1080)
-        const std::string scale_arg = scale_value == "auto" ? std::to_string(std::clamp((pixel_h + 120) / 240, 1, 10)) : scale_value;
+        // (8x and above draw a black screen on the card I tested: the most it takes is 7x)
+        const std::string scale_arg = scale_value == "auto" ? std::to_string(std::clamp((pixel_h + 120) / 240, 1, 7))
+                                                           : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 7));
         give("--scale", scale_arg.c_str());
         give("--volume", volume_value.c_str());  // the runner's own option of the SDL audio device (app/audio)  // internal resolution: the runner's default is the 3DS's own (1), which looks soft on a PC
         // the runner stops after 10 s of game time unless told otherwise; --frames alone means no time limit
@@ -1146,7 +1149,8 @@ int main(int argc, char** argv) {
             g_runtime.store(nullptr);
             g_game_done.store(true);
         });
-    }
+    };
+    if (game) start_game();
 
     KeyboardTyping typing;
     const SDL_Keycode skip_key = skip_key_name == "none" ? SDLK_UNKNOWN : SDL_GetKeyFromName(skip_key_name.c_str());
@@ -1198,8 +1202,19 @@ int main(int argc, char** argv) {
             return kCorners[std::clamp(g_popup_corner.load(), 0, 3)];
         }
         if (key == "fps_counter") return show_fps ? "on" : "off";
-        if (key == "scale") return scale_value;
+        if (key == "scale") return scale_value == "auto" ? scale_value : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 7));  // (8 and 10 of an older settings file read as 7)
         if (key == "volume") return volume_value;
+        if (key == "system_language") {  // the language of Windows: "es" or "en"
+            wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+            GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
+            return name[0] == L'e' && name[1] == L's' ? "es" : "en";
+        }
+        if (key == "language") return ini.Get("language", "auto");
+        if (key == "scale_auto") {  // the multiple "auto" picks for this window
+            int w = 0, h = 0;
+            SDL_GetWindowSizeInPixels(window, &w, &h);
+            return std::to_string(std::clamp((h + 120) / 240, 1, 7));
+        }
         if (key == "lobby") return ini.Get("lobby").empty() ? "http://88.198.47.46:5000" : ini.Get("lobby");
         return ini.Get(key, key == "fps" || key == "steady" || key == "effects" ? "default" : "");
     };
@@ -1259,14 +1274,14 @@ int main(int argc, char** argv) {
             for (std::size_t i = 0; i + 1 < game_args.size(); ++i) {
                 if (game_args[i] == "--user") user = game_args[i + 1];
             }
-            if (user.empty()) return "NO USER FOLDER IS SET";
+            if (user.empty()) return "No user folder is set";
             const std::string dir = user + "\\load\\textures";
             std::error_code ec;
             std::filesystem::create_directories(std::filesystem::path(WideFromUtf8(dir)), ec);
             if (!std::getenv("MH4U_TEST_SCRIPT")) {  // (a test doesn't open a window of Explorer)
                 ShellExecuteW(nullptr, L"open", WideFromUtf8(dir).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             }
-            return "THE TEXTURES FOLDER IS OPEN";
+            return "The textures folder is open";
         }
         return "";
     };
@@ -1274,6 +1289,29 @@ int main(int argc, char** argv) {
     g_cursor.menu = &menu_overlay;
     if (std::getenv("MH4U_TEST_MENU")) menu.Toggle(window);  // draws the menu without a keyboard (a check)
     bool menu_was_open = false;
+
+    // The first start in the window: the files, then the progress. When the look can't be drawn, the console's version.
+    ingame::Setup setup(ini.exedir);
+    bool setup_active = need_setup;
+    if (setup_active) {
+        setup.Begin(base_game, update_game, !base_game.empty() && !update_game.empty());
+        SDL_SetWindowTitle(window, "Caravan4URecomp - first start");
+    }
+    const auto finish_setup = [&] {  // the game is ready: its settings are read again and it starts
+        setup_active = false;
+        menu_overlay.SetSetup(false, {});
+        ini.lines.clear();
+        ini.Load(ini.path);
+        game_args = build_game_args();
+        add_extras();
+        if (game_args.empty()) {
+            running = false;
+            return;
+        }
+        game = true;
+        SDL_SetWindowTitle(window, kCreditsTitle);
+        start_game();
+    };
     bool size_dirty = false;  // the window was resized: its size is saved when it has been still for a second
     auto size_changed_at = std::chrono::steady_clock::now();
     bool touch_forced = false;  // F2: the popup shows whatever the game does
@@ -1343,6 +1381,12 @@ int main(int argc, char** argv) {
                         e.button.y = static_cast<float>(std::atof(a2));
                         step.events.push_back(e);
                     }
+                } else if (c == "drop") {  // a file dropped on the window
+                    SDL_Event e = {};
+                    e.type = SDL_EVENT_DROP_FILE;
+                    e.drop.windowID = window_id;
+                    e.drop.data = SDL_strdup(a1);
+                    step.events.push_back(e);
                 } else if (c == "wheel") {
                     SDL_Event e = {};
                     e.type = SDL_EVENT_MOUSE_WHEEL;
@@ -1394,7 +1438,8 @@ int main(int argc, char** argv) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             const bool menu_open = menu.open;  // as the event found it
-            if (!typing.active || menu.open) menu.OnEvent(event, window);
+            if (setup_active) setup.OnEvent(event, window);
+            else if (!typing.active || menu.open) menu.OnEvent(event, window);
             App::InputEvent input;
             if (ToInputEvent(event, input)) {
                 // While the game's keyboard is open the physical keyboard types (KeyboardTyping) and its keys press no
@@ -1459,6 +1504,20 @@ int main(int argc, char** argv) {
                 size_dirty = true;
                 (*presenter)->Resize(static_cast<std::uint32_t>(event.window.data1),
                                      static_cast<std::uint32_t>(event.window.data2));
+            }
+        }
+        if (setup_active) {
+            if (menu_overlay.GuiFailed()) {  // no look to show it with: the console version asks and shows the progress
+                setup.Stop();
+                menu_overlay.SetSetup(false, {});
+                if (RunSetup(ini.exedir, setup.Base(), setup.UpdateFile())) finish_setup(); else running = false;
+            } else {
+                if (setup.Update()) {
+                    menu_overlay.SetSetup(true, setup.MakeView());
+                    (*presenter)->RequestRedraw();
+                }
+                if (setup.QuitRequested()) running = false;
+                else if (setup.Finished()) finish_setup();
             }
         }
         if (game) typing.Update(window, mapper);

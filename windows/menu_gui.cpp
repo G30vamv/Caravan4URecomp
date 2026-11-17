@@ -45,6 +45,31 @@ Layout LayoutOf(float sw, float sh) {
     return l;
 }
 
+SetupLayout SetupLayoutOf(float sw, float sh) {
+    SetupLayout s;
+    s.l = LayoutOf(sw, sh);
+    const Layout& l = s.l;
+    const float u = l.u;
+    const float x0 = l.header.x0, x1 = l.header.x1;
+    const float c0 = l.header.y1 + 22.0f * u;
+    s.intro = {x0, c0, x1, c0 + 118.0f * u};
+    const float row1 = c0 + 132.0f * u, row2 = row1 + 100.0f * u;
+    s.base_label_y = row1 + 8.0f * u;
+    s.base_field = {x0, row1 + 26.0f * u, x1 - 190.0f * u, row1 + 76.0f * u};
+    s.base_browse = {x1 - 170.0f * u, row1 + 26.0f * u, x1, row1 + 76.0f * u};
+    s.update_label_y = row2 + 8.0f * u;
+    s.update_field = {x0, row2 + 26.0f * u, x1 - 190.0f * u, row2 + 76.0f * u};
+    s.update_browse = {x1 - 170.0f * u, row2 + 26.0f * u, x1, row2 + 76.0f * u};
+    s.hint = {x0, row2 + 92.0f * u, x1, row2 + 122.0f * u};
+    s.primary = {x1 - 210.0f * u, l.keys.y1 - 46.0f * u, x1, l.keys.y1};
+    s.secondary = {s.primary.x0 - 18.0f * u - 170.0f * u, s.primary.y0, s.primary.x0 - 18.0f * u, s.primary.y1};
+    s.step_y = c0 + 14.0f * u;
+    s.bar = {x0, c0 + 44.0f * u, x1 - 110.0f * u, c0 + 72.0f * u};
+    s.eta_y = c0 + 98.0f * u;
+    s.log = {x0, c0 + 120.0f * u, x1, s.primary.y0 - 16.0f * u};
+    return s;
+}
+
 void WindowOf(const Layout& l, std::size_t total, int sel, int* first, int* fit) {
     const int f = std::max(1, static_cast<int>(std::floor(l.rows.H() / l.row_h)));
     int start = sel < f ? 0 : sel + 1 - f;
@@ -270,6 +295,14 @@ public:
     }
 
     bool Draw(void* recorder, const View& view, std::uint32_t width, std::uint32_t height) override {
+        return Frame(recorder, width, height, [&](float dt) { Build(view, static_cast<float>(width), static_cast<float>(height), dt); });
+    }
+    bool DrawSetup(void* recorder, const SetupView& view, std::uint32_t width, std::uint32_t height) override {
+        return Frame(recorder, width, height, [&](float dt) { BuildSetup(view, static_cast<float>(width), static_cast<float>(height), dt); });
+    }
+
+    template <class Build>
+    bool Frame(void* recorder, std::uint32_t width, std::uint32_t height, Build&& build) {
         if (!initialised_) return false;
         ImGui::SetCurrentContext(context_);
         const auto now = std::chrono::steady_clock::now();
@@ -280,7 +313,7 @@ public:
         io.DeltaTime = dt;
         ImGui_ImplVulkan_NewFrame();
         ImGui::NewFrame();
-        Build(view, static_cast<float>(width), static_cast<float>(height), dt);
+        build(dt);
         ImGui::Render();
         ImDrawData* data = ImGui::GetDrawData();
         if (data == nullptr || data->CmdLists.Size == 0) return true;
@@ -319,6 +352,115 @@ private:
     float fade_ = 0.0f;
     float pill_x_ = -1.0f, bar_y_ = -1.0f;
     float blink_ = 0.0f;
+
+    float setup_progress_ = 0.0f;
+
+    // A button of the first start's screen.
+    void Button(const Painter& p, const Rect& r, const std::string& text, bool primary, bool enabled, bool focus, bool hover, float u, float fade) {
+        const float lift = hover && enabled ? 1.0f : 0.0f;
+        if (primary && enabled) {
+            p.GradV(r, C(kGold, fade), C(0xB9741C, fade));
+            p.Frame(r, 9.0f * u, C(kInk, fade), 1.0f);
+        } else {
+            p.Fill(r, 9.0f * u, C(hover && enabled ? 0x3A2A18 : kCap, fade));
+        }
+        p.Frame(r, 9.0f * u, C(enabled ? kGold : kGoldDim, (enabled ? 1.0f : 0.5f) * fade), focus ? 2.4f * u : 1.0f);
+        const ImU32 colour = !enabled ? C(kCream, 0.3f * fade) : primary ? C(kInk, fade) : C(kGold, fade);
+        p.Write(font_, 21.0f * u, (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2 - lift, Align::Center, colour, text.c_str());
+    }
+
+    void BuildSetup(const SetupView& v, float sw, float sh, float dt) {
+        if (!v.open) return;
+        const SetupLayout s = SetupLayoutOf(sw, sh);
+        const Layout& l = s.l;
+        const float u = l.u;
+        bool moving = false;
+        fade_ = Approach(fade_, 1.0f, dt, 10.0f);
+        if (fade_ > 0.995f) fade_ = 1.0f; else moving = true;
+        const float fade = fade_;
+        Painter p;
+        p.dl = ImGui::GetForegroundDrawList();
+        p.font = font_;
+        p.text = text_;
+        p.fade = fade;
+        blink_ += dt;
+        p.dl->AddRectFilled(ImVec2(0, 0), ImVec2(sw, sh), C(kPanelBottom, 1.0f));  // nothing of the test picture shows through
+        Backdrop(p, l, fade);
+        const float hy = (l.header.y0 + l.header.y1) / 2;
+        const Rect brand = p.Write(font_, 32.0f * u, l.header.x0, hy - 2 * u, Align::Left, C(kGold, fade), "Caravan4URecomp");
+        p.Write(font_, 17.0f * u, brand.x1 + 18.0f * u, hy + 6 * u, Align::Left, C(kCream, 0.55f * fade), v.title.c_str());
+        Rule(p, l.header.y1 - 2 * u, l.header.x0, l.header.x1, u, fade);
+
+        const auto wrapped = [&](const Rect& r, const std::string& text, float size, ImU32 colour) {
+            p.dl->AddText(text_, size, ImVec2(r.x0, r.y0), colour, text.c_str(), nullptr, r.W());
+        };
+        if (v.stage == 0) {
+            wrapped(s.intro, v.intro, 19.0f * u, C(kCream, 0.9f * fade));
+            const auto row = [&](const char* label, float label_y, const Rect& field, const Rect& browse, const std::string& path, int index) {
+                p.Write(font_, 21.0f * u, l.header.x0, label_y, Align::Left, C(kCream, 0.92f * fade), label);
+                p.Fill(field, 8.0f * u, C(kWell, 0.85f * fade));
+                p.Frame(field, 8.0f * u, C(path.empty() ? kGoldDim : kBlueDeep, fade), 1.0f);
+                p.dl->PushClipRect(ImVec2(field.x0 + 10 * u, field.y0), ImVec2(field.x1 - 10 * u, field.y1), true);
+                if (path.empty()) {
+                    p.Write(p.text, 18.0f * u, field.x0 + 16 * u, (field.y0 + field.y1) / 2, Align::Left, C(kCream, 0.35f * fade), v.placeholder.c_str());
+                } else {
+                    // the end of a long path is what tells the files apart
+                    const float room = field.W() - 32.0f * u;
+                    std::string shown = path;
+                    while (shown.size() > 8 && p.Size(p.text, 18.0f * u, shown.c_str()).x > room) shown.erase(0, 4), shown.insert(0, "...");
+                    p.Write(p.text, 18.0f * u, field.x0 + 16 * u, (field.y0 + field.y1) / 2, Align::Left, C(kBlue, fade), shown.c_str());
+                }
+                p.dl->PopClipRect();
+                Button(p, browse, v.browse, false, true, v.focus == index, v.hover == index, u, fade);
+            };
+            row(v.base_label.c_str(), s.base_label_y, s.base_field, s.base_browse, v.base_path, 0);
+            row(v.update_label.c_str(), s.update_label_y, s.update_field, s.update_browse, v.update_path, 1);
+            p.Write(p.text, 17.0f * u, s.hint.x0, (s.hint.y0 + s.hint.y1) / 2, Align::Left, C(kCream, 0.6f * fade), v.hint.c_str());
+        } else if (v.stage == 1 || v.stage == 3) {
+            p.Write(font_, 26.0f * u, l.header.x0, s.step_y, Align::Left, C(kGold, fade), v.step.c_str());
+            const float target = v.progress < 0 ? 0.0f : std::clamp(v.progress, 0.0f, 1.0f);
+            setup_progress_ = Approach(setup_progress_, target, dt, 6.0f);
+            if (std::fabs(setup_progress_ - target) > 0.002f) moving = true; else setup_progress_ = target;
+            p.Fill(s.bar, 8.0f * u, C(kWell, fade));
+            p.Frame(s.bar, 8.0f * u, C(kGoldDim, fade), 1.0f);
+            const float fx = s.bar.x0 + s.bar.W() * setup_progress_;
+            if (fx - s.bar.x0 > 2.0f) p.GradH(Shrink({s.bar.x0, s.bar.y0, fx, s.bar.y1}, 2 * u, 2 * u), C(kBlueDeep, fade), C(kGold, fade));
+            p.Diamond(fx, (s.bar.y0 + s.bar.y1) / 2, 11.0f * u, C(kGold, fade), C(kInk, fade));
+            char percent[16];
+            std::snprintf(percent, sizeof percent, "%d%%", static_cast<int>(std::lround(setup_progress_ * 100.0f)));
+            p.Write(font_, 24.0f * u, l.header.x1, (s.bar.y0 + s.bar.y1) / 2, Align::Right, C(kBlue, fade), percent);
+            p.Write(p.text, 19.0f * u, l.header.x0, s.eta_y, Align::Left, C(kCream, 0.75f * fade), v.eta.c_str());
+            // what the tool says, the last lines
+            p.Fill(s.log, 8.0f * u, C(kWell, 0.7f * fade));
+            p.Frame(s.log, 8.0f * u, C(kBlueDeep, fade), 1.0f);
+            p.dl->PushClipRect(ImVec2(s.log.x0 + 6 * u, s.log.y0 + 4 * u), ImVec2(s.log.x1 - 6 * u, s.log.y1 - 4 * u), true);
+            const float line_h = 22.0f * u;
+            const int fit = std::max(1, static_cast<int>((s.log.H() - 12.0f * u) / line_h));
+            const int first = std::max(0, static_cast<int>(v.log.size()) - fit);
+            for (int i = first; i < static_cast<int>(v.log.size()); ++i) {
+                const float y = s.log.y0 + 12.0f * u + line_h * static_cast<float>(i - first) + line_h / 2;
+                p.Write(p.text, 15.5f * u, s.log.x0 + 14 * u, y, Align::Left, C(kCream, 0.55f * fade), v.log[static_cast<std::size_t>(i)].c_str());
+            }
+            p.dl->PopClipRect();
+        } else {  // failed
+            p.Write(font_, 26.0f * u, l.header.x0, s.step_y, Align::Left, C(0xFF7B6B, fade), v.step.c_str());
+            wrapped({s.intro.x0, s.intro.y0 + 36 * u, s.intro.x1, s.intro.y1 + 40 * u}, v.error, 19.0f * u, C(kCream, 0.92f * fade));
+            p.Fill(s.log, 8.0f * u, C(kWell, 0.7f * fade));
+            p.Frame(s.log, 8.0f * u, C(kBlueDeep, fade), 1.0f);
+            p.dl->PushClipRect(ImVec2(s.log.x0 + 6 * u, s.log.y0 + 4 * u), ImVec2(s.log.x1 - 6 * u, s.log.y1 - 4 * u), true);
+            const float line_h = 22.0f * u;
+            const int fit = std::max(1, static_cast<int>((s.log.H() - 12.0f * u) / line_h));
+            const int first = std::max(0, static_cast<int>(v.log.size()) - fit);
+            for (int i = first; i < static_cast<int>(v.log.size()); ++i) {
+                const float y = s.log.y0 + 12.0f * u + line_h * static_cast<float>(i - first) + line_h / 2;
+                p.Write(p.text, 15.5f * u, s.log.x0 + 14 * u, y, Align::Left, C(kCream, 0.55f * fade), v.log[static_cast<std::size_t>(i)].c_str());
+            }
+            p.dl->PopClipRect();
+        }
+        if (!v.primary.empty()) Button(p, s.primary, v.primary, true, v.primary_enabled, v.focus == 2, v.hover == 2, u, fade);
+        if (!v.secondary.empty()) Button(p, s.secondary, v.secondary, false, true, v.focus == 3, v.hover == 3, u, fade);
+        if (moving && redraw_) redraw_();
+    }
 
     void Build(const View& view, float sw, float sh, float dt) {
         const Layout l = LayoutOf(sw, sh);
@@ -511,10 +653,7 @@ private:
         // the keys
         float x = l.keys.x0;
         const float ky = (l.keys.y0 + l.keys.y1) / 2;
-        x += KeyHint(p, x, ky, "A", "Accept  (Enter)", u, fade);
-        x += KeyHint(p, x, ky, "B", "Back  (Esc)", u, fade);
-        x += KeyHint(p, x, ky, "LB RB", "Pages  (Q / E)", u, fade);
-        KeyHint(p, x, ky, "L3 R3", "Close  (F1)", u, fade);
+        for (const auto& [cap, what] : view.keys) x += KeyHint(p, x, ky, cap.c_str(), what.c_str(), u, fade);
 
         if (moving && redraw_) redraw_();
     }

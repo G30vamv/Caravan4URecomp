@@ -32,7 +32,7 @@ I'd rather be upfront about what I have actually tested.
 
 ## Getting it
 
-The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.2.0**, a pre-release, tagged `windows-v0.2.0`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.2.1**, a pre-release, tagged `windows-v0.2.1`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
@@ -41,13 +41,13 @@ SmartScreen warning: "More info", then "Run anyway". You can also build it yours
 ## What you need
 
 - Windows 10 or 11, 64-bit, and a GPU with Vulkan 1.2 or newer.
-- About 1.5 GB of free space (the game's code library and a compiler that is downloaded once).
+- About 1 GB of free space while the game is prepared (afterwards it takes about 350 MB: the game's code library and the part of the compiler that was downloaded).
 - **Your own decrypted copy of Monster Hunter 4 Ultimate (USA):** the base game and the **v1.3.0 update**.
 
 ## First start
 
 Open `Caravan4URecomp.exe`. The first time it asks for the two game files and builds the game's code library for your PC,
-which takes a few minutes and downloads a compiler (about 150 MB, checked against its SHA-256). After that the game starts
+which takes a few minutes and downloads only the part of a compiler that it needs (about 50 MB; each file is checked against its SHA-256). After that the game starts
 straight away. `--setup` repeats this step if you change files. What it builds is made from your game: keep it for
 yourself and don't share it.
 
@@ -63,10 +63,11 @@ Press **F1** or **L3 + R3** on a controller. It works with the keyboard, the mou
 right click to go back) and the controller (D-pad or left stick, A and B; LB and RB, or Q and E, change the page). The
 design comes from the menu of my MH3U port, with this game's colours, in the Cinzel font (SIL Open Font License).
 
-- **Graphics:** fullscreen, VSync, screen layout, internal resolution (auto, or 1x to 10x the 3DS's; needs a restart), FPS counter.
+- **Graphics:** fullscreen, VSync, screen layout, internal resolution (auto, or 1x to 7x the 3DS's; needs a restart), FPS counter.
 - **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 90, 120, 144, 165, 180, 240 or unlimited), steady
   frame rate, particle effects.
 - **Audio:** volume.
+- **System:** the language of the menu (English or Spanish; "auto" follows Windows), resume and quit.
 - **Online:** nickname, public rooms, join by address, host a room, leave.
 
 The default screen layout is the **popup** one described above: **F2** shows or hides the touch screen by hand, and the
@@ -81,7 +82,7 @@ restarts anything by itself. **Graphics > Open the HD textures folder** opens th
 - **Frame rate:** the limit goes up to 240 fps. In my tests the menus and the town ran at about 119 fps with the limit at 120
   and about 237 fps at 240, with VSync off. With VSync on you get at most your display's refresh rate, so "display" in
   the limit setting is the natural choice. I haven't measured a hunt at high frame rates yet.
-- **Internal resolution:** everything the GPU draws (the 3D scene, the HUD and the text) is rendered at the chosen multiple
+- **Internal resolution (1x to 7x for now):** at 8x and above the picture comes out black on my card, so the menu stops at 7x while I look into why and try to bring it back up to 10x. Everything the GPU draws (the 3D scene, the HUD and the text) is rendered at the chosen multiple
   of the 3DS's resolution; "auto" picks the one closest to your window. The game's own textures stay at their original
   resolution, so edges get sharper but not more detailed. HD texture packs made for Azahar and Citra (PNG, their folder
   layout and hashes) are supported by the runtime: put them under `game\user\load\textures`. I haven't tested a pack on

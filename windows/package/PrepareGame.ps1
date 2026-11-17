@@ -8,8 +8,9 @@
 # folder).
 #
 # It needs nothing installed: the Python that runs the recompiler comes with the package (game-tools\python), and the C
-# compiler (llvm-mingw's clang, from the llvm-mingw project, checked against a SHA-256) is downloaded once into the game
-# folder when the PC has none.
+# compiler (llvm-mingw's clang, from the llvm-mingw project) is downloaded once into the game folder when the PC has none:
+# only the 50 files that building needs (about 50 MB, fetch_toolchain.py, each checked against a SHA-256), or, if that does
+# not work, the whole release (about 190 MB, checked against the SHA-256 of the zip).
 #
 #   Caravan4URecomp.exe                                       (first start: asks for the two files)
 #   powershell -File PrepareGame.ps1 -Base <base .cia/.3ds/.cci> -Update <update .cia> [-Wait]
@@ -43,10 +44,16 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Python 3.10 or newer is needed." }
     }
 
-    # the C compiler: llvm-mingw's clang; when the PC has none, the tool downloads it once (about 150 MB, checked against its SHA-256)
+    # the C compiler: llvm-mingw's clang; when the PC has none, the part of it that building needs is downloaded once
     $fetch = @()
     if (-not (Get-Command x86_64-w64-mingw32-clang -ErrorAction SilentlyContinue)) {
-        Write-Host "No C compiler found: the first time, one is downloaded (llvm-mingw, about 150 MB; needs Internet)."
+        Write-Host "No C compiler found: the first time, the part of llvm-mingw that building needs is downloaded (about 50 MB; needs Internet)."
+        $fetchTool = Join-Path $root "fetch_toolchain.py"
+        if (Test-Path $fetchTool) {
+            & $python $fetchTool --dest (Join-Path $out "toolchain")
+            if ($LASTEXITCODE -ne 0) { Write-Host "The small download did not work: the whole compiler is downloaded instead (about 190 MB)." }
+        }
+        # build_game.py uses the compiler in game\toolchain when it is there, and downloads the whole llvm-mingw when it is not
         $fetch = @("--fetch-compiler")
     }
 
@@ -56,6 +63,10 @@ try {
 
     $dll = Get-ChildItem (Join-Path $out "recomp") -Filter "*_native.dll" | Select-Object -First 1
     if (-not $dll) { throw "the code library was not made" }
+
+    # the C and the objects the library was made from are only a cache for making it again: the game runs from the library
+    # alone, and they take more than 500 MB
+    Remove-Item (Join-Path $out "recomp\src"), (Join-Path $out "recomp\obj") -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Host "Preparing the game folder..."
     $runner = Join-Path $tools "bin\mh4u_native_runner.exe"

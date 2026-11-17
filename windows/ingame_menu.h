@@ -29,6 +29,7 @@
 
 #include "gpu/backend/vulkan_access.h"
 #include "menu_gui.h"
+#include "menu_text.h"
 #include "mh4n/rooms.h"
 
 namespace ingame {
@@ -119,6 +120,14 @@ constexpr int kMaxRows = 22;    // lines of the panel
 // The panel as the present thread draws it: the main thread hands over the lines, the present thread reads them.
 class Overlay {
 public:
+    // The first start's screen, drawn instead of the menu while it is open.
+    void SetSetup(bool open, SetupView view) {
+        std::lock_guard lock(mutex_);
+        setup_open_ = open;
+        setup_ = std::move(view);
+    }
+    bool GuiFailed() const { return gui_failed_.load(); }
+
     void Set(bool open, std::vector<Line> lines, View view) {
         std::lock_guard lock(mutex_);
         open_ = open;
@@ -154,15 +163,23 @@ public:
     void Draw(VkCommandBuffer commands, void* recorder, std::uint32_t width, std::uint32_t height) const {
         std::vector<Line> lines;
         View view;
+        SetupView setup;
+        bool setup_open = false;
         {
             std::lock_guard lock(mutex_);
-            if (!open_) return;
+            setup_open = setup_open_;
+            if (setup_open) setup = setup_;
+            else if (!open_) return;
             lines = lines_;
             view = view_;
         }
-        if (make_gui_ && !gui_failed_) {
+        if (make_gui_ && !gui_failed_.load()) {
             if (!gui_) gui_ = make_gui_();
             if (!gui_) gui_failed_ = true;
+        }
+        if (setup_open) {  // (the first start without the look is the console's, which the shell falls back to)
+            if (gui_) gui_->DrawSetup(recorder, setup, width, height);
+            return;
         }
         if (gui_ && gui_->Draw(recorder, view, width, height)) return;
         struct Sq {
@@ -236,7 +253,9 @@ private:
     View view_;
     std::function<std::unique_ptr<GuiRenderer>()> make_gui_;
     mutable std::unique_ptr<GuiRenderer> gui_;
-    mutable bool gui_failed_ = false;
+    mutable std::atomic<bool> gui_failed_{false};
+    bool setup_open_ = false;
+    SetupView setup_;
 };
 
 // ---- the menu --------------------------------------------------------------------------------------------------------
@@ -275,6 +294,7 @@ struct Item {
     bool slider = false;              // Choice shown as a slider (numbers)
     float frac = 0.0f;
     bool room = false;                // a row of the list of public rooms
+    bool locked = false;              // ... with a password
     bool restart = false;             // the change waits for a restart
     std::function<void(float)> set_frac;  // a slider set by the mouse
     bool Selectable() const { return kind != Info; }
@@ -685,8 +705,14 @@ private:
         Say("Saved. This change applies the next time you start the game.");
     }
 
+    // The language of the menu: the setting, or (auto) the one of Windows.
+    void RefreshLanguage() {
+        const std::string l = host_.value("language");
+        g_spanish = l == "es" || (l != "en" && host_.value("system_language") == "es");
+    }
+
     void Say(const std::string& text) {
-        message_ = text;
+        message_ = Tr(text);
         message_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(8);
         dirty_ = true;
     }
@@ -798,13 +824,14 @@ private:
             {"touch_show", "When the touch screen's popup appears: when the game needs it (auto), always, or never. F2 shows or hides it by hand."},
             {"popup_size", "The height of the touch screen's popup, as a percentage of the window's height."},
             {"popup_corner", "The corner of the window where the touch screen's popup sits."},
-            {"scale", "How sharp the 3D scene, the HUD and the text are drawn: a multiple of the 3DS's resolution. Auto picks the one closest to your window."},
+            {"scale", "How sharp the 3D scene, the HUD and the text are drawn: a multiple of the 3DS top screen's 400 x 240. Auto picks the one closest to your window."},
             {"fps_counter", "Shows the game's frame rate in the top-left corner."},
             {"Open the HD textures folder", "Opens the folder for HD texture packs (Azahar or Citra format). They are read when the game starts."},
             {"fps", "Caps the game's frame rate. Default is the game's own, Display matches your screen, Unlimited uses all the CPU."},
             {"steady", "Keeps the frame rate even instead of letting it vary. Default leaves the game's own setting."},
             {"effects", "Turns the game's particle effects on or off. Default leaves the game's own setting."},
             {"volume", "The volume of the game."},
+            {"language", "The language of this menu. Auto follows Windows."},
             {"Nickname", "Your name in network rooms: 4 to 20 letters, digits, spaces, dots, underscores or dashes."},
             {"Public rooms >", "Lists the rooms of the community lobby (the same rooms Azahar uses). Everyone needs Monster Hunter 4 Ultimate USA 1.3.0."},
             {"Address HOST:PORT", "The address of a room, like 203.0.113.7:24872."},
@@ -827,6 +854,7 @@ private:
     }
 
     std::vector<Item> Build() {
+        RefreshLanguage();
         std::vector<Item> items;
         switch (page_) {
         case Page::Graphics:
@@ -838,12 +866,12 @@ private:
                 items.push_back(Choice("Touch popup size", "popup_size", Numbers(20, 70, 5)));
                 items.push_back(Choice("Touch popup corner", "popup_corner", {"bottom-right", "bottom-left", "top-right", "top-left"}));
             }
-            items.push_back(Choice("Internal resolution", "scale", {"auto", "1", "2", "3", "4", "5", "6", "8", "10"}, true));
+            items.push_back(Choice("Internal resolution", "scale", {"auto", "1", "2", "3", "4", "5", "6", "7"}, true));
             items.push_back(Choice("FPS counter", "fps_counter", {"off", "on"}));
             items.push_back(Action("Open the HD textures folder", [this] {
                 const std::string said = host_.action ? host_.action("open_textures") : "Not available";
                 NeedRestart("HD textures");
-                Say(said + ". Restart the game to load the packs.");
+                Say(Tr(said) + Tr(". Restart the game to load the packs."));
             }, "Open"));
             break;
         case Page::Game:
@@ -858,6 +886,7 @@ private:
             BuildOnline(items);
             break;
         case Page::System:
+            items.push_back(Choice("Language", "language", {"auto", "en", "es"}));
             items.push_back(Action("Resume the game", [this] { open = false; }, "Resume"));
             items.push_back(Action("Quit the game", [this] { host_.quit(); }, "Quit"));
             items.push_back(Info("Every change is saved as soon as you make it."));
@@ -867,7 +896,7 @@ private:
             BuildRooms(items);
             break;
         case Page::Password: {
-            items.push_back(Info("Room: " + Plain(pending_.name), 1));
+            items.push_back(Info(Tr("Room: ") + Plain(pending_.name), 1));
             items.push_back(TextField("Password", &join_password_, 32, true));
             items.push_back(Action("Join", [this] {
                 JoinRoom(pending_.address, pending_.port, join_password_);
@@ -888,18 +917,18 @@ private:
         using mh4n::rooms::State;
         const mh4n::rooms::Status st = mh4n::rooms::GetStatus();
         if (st.state == State::Joined || st.state == State::Moderator) {
-            items.push_back(Info("In room: " + Plain(st.room.name) + " (" + std::to_string(st.members.size()) + " members)", 3));
+            items.push_back(Info(Tr("In room: ") + Plain(st.room.name) + " (" + std::to_string(st.members.size()) + " " + Tr("members") + ")", 3));
             std::string who;
             for (const auto& m : st.members) who += (who.empty() ? "" : ", ") + Plain(m.nickname);
             items.push_back(Info("  " + who));
         } else if (st.state == State::Joining) {
-            items.push_back(Info("Joining " + Plain(st.host) + (st.waiting_for_console ? " (waiting for the game)" : "..."), 1));
+            items.push_back(Info(Tr("Joining ") + Plain(st.host) + (st.waiting_for_console ? Tr(" (waiting for the game)") : "..."), 1));
         } else if (st.error != mh4n::rooms::Error::None) {
-            items.push_back(Info(std::string("Not in a room: ") + mh4n::rooms::ErrorMessage(st.error), 4));
+            items.push_back(Info(Tr("Not in a room: ") + mh4n::rooms::ErrorMessage(st.error), 4));
         } else {
             items.push_back(Info("Not in a room."));
         }
-        if (st.hosting) items.push_back(Info("Hosting on UDP port " + std::to_string(st.hosted_port) + " (open it on your router)", 3));
+        if (st.hosting) items.push_back(Info(Tr("Hosting on UDP port ") + std::to_string(st.hosted_port) + Tr(" (open it on your router)"), 3));
         items.push_back(TextField("Nickname", &nick_, 20, false, [this] { host_.apply("nick", nick_); }));
         {
             Item i = Action("Public rooms >", [this] {
@@ -951,7 +980,7 @@ private:
                     return;
                 }
                 JoinRoom("127.0.0.1", room.port, host_password_);
-                Say("Hosting: others join your public IP address, port " + std::to_string(port) + ".");
+                Say(Tr("Hosting: others join your public IP address, port ") + std::to_string(port) + ".");
             }, st.hosting ? "Close" : "Host");
             host.id = "host";
             items.push_back(host);
@@ -1000,7 +1029,8 @@ private:
             i.kind = Item::Action;
             i.room = true;
             i.label = Plain(room.name);
-            i.value = std::to_string(room.players.size()) + "/" + std::to_string(room.max_players) + (room.password ? "  (password)" : "");
+            i.value = std::to_string(room.players.size()) + "/" + std::to_string(room.max_players);
+            i.locked = room.password;
             i.color = room.preferred ? 0 : 2;
             i.id = room.address + ":" + std::to_string(room.port) + room.name;
             i.help = "Joins this room. Rooms with a password ask for it first.";
@@ -1032,7 +1062,7 @@ private:
         if (!mh4n::rooms::Join(request, &error)) {
             Say(error);
         } else {
-            Say("Joining " + host + ":" + std::to_string(port) + "...");
+            Say(Tr("Joining ") + host + ":" + std::to_string(port) + "...");
         }
     }
 
@@ -1061,6 +1091,23 @@ private:
         if (!items.empty()) id = items[static_cast<std::size_t>(sel)].id;
     }
 
+    // The text of an option's value: its name in the language, or the value with a capital.
+    // "3x  (1200 x 720)": the multiple of the 3DS's top screen (400 x 240) and the size it comes to; auto says which it chose.
+    static std::string ScaleText(const std::string& value, int auto_scale) {
+        const bool automatic = value == "auto";
+        const int n = automatic ? auto_scale : std::atoi(value.c_str());
+        if (n < 1) return Tr("auto");
+        const std::string size = std::to_string(n) + "x  (" + std::to_string(400 * n) + " \xC3\x97 " + std::to_string(240 * n) + ")";
+        return automatic ? Tr("Auto") + "  " + size : size;
+    }
+
+    static std::string Shown(const Item& item, int auto_scale) {
+        if (item.id == "language") return item.value == "en" ? "English" : item.value == "es" ? "Espa\xC3\xB1ol" : Tr("auto");
+        if (item.id == "scale") return ScaleText(item.value, auto_scale);
+        const std::string t = Tr(item.value);
+        return t != item.value ? t : Capital(item.value);
+    }
+
     static std::string Capital(std::string s) {
         if (!s.empty()) s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
         return s;
@@ -1070,6 +1117,7 @@ private:
     // The page as the look draws it (a View) and, for when that can't be drawn, as plain lines of text.
     void Render(std::vector<Line>* out_lines, View* out_view) {
         static const char* const kTitles[] = {"Graphics", "Game", "Audio", "Online", "System", "Public rooms", "Room password"};
+        RefreshLanguage();
         std::vector<Item> items = Build();
         SyncSelection(items);
         const int sel = sel_[static_cast<int>(page_)];
@@ -1077,8 +1125,9 @@ private:
 
         View view;
         view.open = true;
-        view.title = kTitles[static_cast<int>(page_)];
-        for (int t = 0; t < kTabCount; ++t) view.tabs.push_back(kTabNames[t]);
+        view.title = Tr(kTitles[static_cast<int>(page_)]);
+        for (int t = 0; t < kTabCount; ++t) view.tabs.push_back(Tr(kTabNames[t]));
+        view.keys = {{"A", Tr("Accept  (Enter)")}, {"B", Tr("Back  (Esc)")}, {"LB RB", Tr("Pages  (Q / E)")}, {"L3 R3", Tr("Close  (F1)")}};
         view.tab = TabOf(page_);
         view.sel = sel;
         view.hover_tab = hover_tab_;
@@ -1086,8 +1135,8 @@ private:
         for (std::size_t i = 0; i < items.size(); ++i) {
             const Item& item = items[i];
             ViewRow r;
-            r.label = item.label;
-            r.help = item.help;
+            r.label = Tr(item.label);
+            r.help = Tr(item.help);
             r.selected = static_cast<int>(i) == sel && item.Selectable();
             switch (item.kind) {
             case Item::Info:
@@ -1098,14 +1147,14 @@ private:
                 if (item.toggle) {
                     r.kind = ViewRow::Toggle;
                     r.on = item.on;
-                    r.value = item.on ? "On" : "Off";
+                    r.value = Tr(item.on ? "On" : "Off");
                 } else if (item.slider) {
                     r.kind = ViewRow::Slider;
                     r.frac = item.frac;
                     r.value = item.value + (item.id == "volume" || item.id == "popup_size" ? "%" : "");
                 } else {
                     r.kind = ViewRow::Choice;
-                    r.value = Capital(item.value);
+                    r.value = Shown(item, std::atoi(host_.value("scale_auto").c_str()));
                 }
                 if (item.restart) r.label += " *";
                 break;
@@ -1113,11 +1162,11 @@ private:
             case Item::Link:
                 if (item.room) {
                     r.kind = ViewRow::Room;
-                    r.value = item.value;
+                    r.value = item.value + (item.locked ? "  (" + Tr("password") + ")" : "");
                     r.enabled = item.color != 2;
                 } else {
                     r.kind = ViewRow::Button;
-                    r.value = item.cap;
+                    r.value = Tr(item.cap);
                 }
                 break;
             case Item::Text: {
@@ -1133,8 +1182,8 @@ private:
         }
         if (!restart_.empty()) {
             std::string what;
-            for (const std::string& r : restart_) what += (what.empty() ? "" : ", ") + Plain(r);
-            view.notice = "Waiting for a restart of the game: " + what + ".";
+            for (const std::string& r : restart_) what += (what.empty() ? "" : ", ") + Tr(r);
+            view.notice = Tr("Waiting for a restart of the game: ") + what + ".";
         }
         if (now < message_until_) view.message = message_;
         view_ = view;
