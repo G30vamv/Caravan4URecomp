@@ -1,3 +1,6 @@
+// MODIFIED for the Windows port (2026-11-17, G30vamv and the Caravan4URecomp contributors): a count of the layout objects
+// drawn on the touch screen in the last frame (TouchScreenObjects), so that the port's shell can tell when the touch screen
+// has something on it. Nothing else of the file changes.
 #include "hooks.h"
 
 #include "game_addr.h"
@@ -39,6 +42,9 @@ extern "C" {
 namespace Port::Hooks {
 
 namespace {
+
+int touch_objects_count = 0;             // layout objects drawn on the touch screen in this frame so far
+std::atomic<int> touch_objects_last{0};  // ... in the last whole frame (TouchScreenObjects)
 
 // ── The platform: everything the hooks use from the program that runs the game (platform.h).
 
@@ -752,6 +758,8 @@ void Frame(RCtx* ctx, RFunc original) {
     u32 rewards = 0, rewards_left = 0, rewards_part = 0;
     const bool rewards_held = QolRewardsHold(ctx, &rewards, &rewards_left, &rewards_part);
     original(ctx);
+    touch_objects_last.store(touch_objects_count, std::memory_order_relaxed);
+    touch_objects_count = 0;
     if (rewards_held) {
         QolRewardsKeep(ctx, rewards, rewards_left, rewards_part);
     }
@@ -1120,6 +1128,7 @@ void LayoutObjectConstants(RCtx* ctx, RFunc original) {
                 hash, screen, ReadF32(ctx, constants), ReadF32(ctx, constants + 4));
     }
     if (screen == LAYOUT_TOUCH_SCREEN) {
+        ++touch_objects_count;
         if (WatchingQuestMap()) {
             NoteTouchScreenObject(ReadF32(ctx, constants), ReadF32(ctx, constants + 4));
         }
@@ -3285,6 +3294,10 @@ bool LockOnFollowing() {
 
 int MissingHookPoints() {
     return missing_hook_points;
+}
+
+int TouchScreenObjects() {
+    return touch_objects_last.load(std::memory_order_relaxed);
 }
 
 GameState CurrentGameState() {

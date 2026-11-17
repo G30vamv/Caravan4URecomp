@@ -224,6 +224,8 @@ struct Host {
     std::function<std::string(const std::string&)> value;
     std::function<void(const std::string&, const std::string&)> apply;
     std::function<void()> quit;
+    /// A one-off action by name ("open_textures"); answers with the line the menu shows.
+    std::function<std::string(const std::string&)> action;
 };
 
 enum class Page { Main, Graphics, Game, Audio, Online, Rooms, Password, Count };
@@ -535,6 +537,13 @@ private:
     std::size_t edit_max_ = 0;
     std::function<void()> edit_done_;
 
+    // Settings saved that only the next start takes: the menu lists them until the game is closed.
+    std::vector<std::string> restart_;
+    void NeedRestart(const std::string& what) {
+        if (std::find(restart_.begin(), restart_.end(), what) == restart_.end()) restart_.push_back(what);
+        Say("SAVED. THIS CHANGE APPLIES THE NEXT TIME YOU START THE GAME");
+    }
+
     void Say(const std::string& text) {
         message_ = text;
         message_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(8);
@@ -560,7 +569,8 @@ private:
     }
 
     // ---- items -----------------------------------------------------------------------------------------------------------
-    Item Choice(const std::string& label, const std::string& key, std::vector<std::string> options, bool restart = false) {
+    Item Choice(const std::string& label, const std::string& key, std::vector<std::string> options, bool restart = false,
+                bool restart_to_default = false) {
         Item item;
         item.kind = Item::Choice;
         item.id = key;
@@ -575,10 +585,13 @@ private:
             }
         }
         item.value = found ? options[index] : (now.empty() ? options[0] : now);
-        auto step = [this, key, options, index, found](int dir) {
+        const std::string name = label;
+        auto step = [this, key, options, index, found, restart, restart_to_default, name](int dir) {
             const int n = static_cast<int>(options.size());
             const int next = (static_cast<int>(found ? index : 0) + dir + n) % n;
             host_.apply(key, options[static_cast<std::size_t>(next)]);
+            // a change that the running game can't take is saved and said to wait: nothing restarts by itself
+            if (restart || (restart_to_default && options[static_cast<std::size_t>(next)] == "default")) NeedRestart(name);
             dirty_ = true;
         };
         item.change = step;
@@ -642,15 +655,28 @@ private:
         case Page::Graphics:
             items.push_back(Choice("Fullscreen", "fullscreen", {"on", "off"}));
             items.push_back(Choice("VSync", "vsync", {"on", "off"}));
-            items.push_back(Choice("Screen layout", "mode", {"stacked", "overlay", "single", "side"}));
-            items.push_back(Choice("Internal resolution", "scale", {"1", "2", "3", "4", "5", "6"}, true));
+            items.push_back(Choice("Screen layout", "mode", {"popup", "stacked", "overlay", "single", "side"}));
+            if (host_.value("mode") == "popup") {  // the top screen full, the touch screen over it when it is wanted
+                items.push_back(Choice("Touch screen shows", "touch_show", {"auto", "always", "hidden"}));
+                items.push_back(Choice("Touch popup size %", "popup_size", Numbers(20, 70, 5)));
+                items.push_back(Choice("Touch popup corner", "popup_corner", {"bottom-right", "bottom-left", "top-right", "top-left"}));
+                items.push_back(Info("F2 SHOWS OR HIDES THE TOUCH SCREEN BY HAND"));
+            }
+            items.push_back(Choice("Internal resolution", "scale", {"auto", "1", "2", "3", "4", "5", "6", "8", "10"}, true));
             items.push_back(Choice("FPS counter", "fps_counter", {"off", "on"}));
+            items.push_back(Action("Open the HD textures folder", [this] {
+                const std::string said = host_.action ? host_.action("open_textures") : "NOT AVAILABLE";
+                NeedRestart("HD textures");
+                Say(said + ". RESTART THE GAME TO LOAD THEM");
+            }));
+            items.push_back(Info("PACKS (AZAHAR/CITRA FORMAT) LOAD WHEN THE GAME STARTS"));
             break;
         case Page::Game:
-            items.push_back(Choice("Frame rate limit", "fps", {"default", "30", "60", "90", "120", "144", "165", "240"}));
-            items.push_back(Choice("Steady frame rate", "steady", {"default", "on", "off"}));
-            items.push_back(Choice("Particle effects", "effects", {"default", "on", "off"}));
-            items.push_back(Info("DEFAULT = THE GAME'S OWN SETTING"));
+            items.push_back(Choice("Frame rate limit", "fps", {"default", "display", "30", "60", "90", "120", "144", "165", "180", "240", "unlimited"}));
+            items.push_back(Choice("Steady frame rate", "steady", {"default", "on", "off"}, false, true));
+            items.push_back(Choice("Particle effects", "effects", {"default", "on", "off"}, false, true));
+            items.push_back(Info("DEFAULT = THE GAME'S OWN SETTING   DISPLAY = YOUR SCREEN'S RATE"));
+            items.push_back(Info("UNLIMITED: ALL THE CPU. VSYNC ON: SCREEN RATE IS THE MAX"));
             break;
         case Page::Audio:
             items.push_back(Choice("Volume", "volume", Numbers(0, 100, 5)));
@@ -869,7 +895,7 @@ private:
         row_item_.assign(2, -1);
         lines.push_back({std::string("CARAVAN4URECOMP - ") + kTitles[static_cast<int>(page_)], 1, false});
         lines.push_back({"", 0, false});
-        const int rows = kMaxRows - 5;  // title, gap, gap, message, hint
+        const int rows = kMaxRows - 6;  // title, gap, gap, restart note, message, hint
         const int n = static_cast<int>(items.size());
         const int first = std::clamp(sel - rows / 2, 0, std::max(0, n - rows));
         for (int i = first; i < std::min(n, first + rows); ++i) {
@@ -878,7 +904,7 @@ private:
             std::string text;
             if (item.kind == Item::Choice) {
                 std::string label = item.label;
-                label.resize(std::max<std::size_t>(label.size(), 28), ' ');
+                label.resize(std::max<std::size_t>(label.size() + 1, 30), ' ');
                 text = label + (selected ? "< " + item.value + " >" : item.value);
             } else if (item.kind == Item::Text) {
                 std::string label = item.label;
@@ -893,8 +919,13 @@ private:
             lines.push_back({Plain(text), selected ? 0 : item.color, selected});
             row_item_.push_back(i);
         }
-        row_item_.resize(lines.size() + 3, -1);
+        row_item_.resize(lines.size() + 4, -1);
         lines.push_back({"", 0, false});
+        if (!restart_.empty()) {
+            std::string what;
+            for (const std::string& r : restart_) what += (what.empty() ? "" : ", ") + r;
+            lines.push_back({"PENDING A RESTART OF THE GAME: " + Plain(what), 1, false});
+        }
         const auto now = std::chrono::steady_clock::now();
         lines.push_back({now < message_until_ ? Plain(message_) : "", 1, false});
         lines.push_back({edit_ != nullptr ? "ENTER/A: OK  ESC/B: CANCEL  PAD: UP/DN=LETTER R=ADD L=DEL"

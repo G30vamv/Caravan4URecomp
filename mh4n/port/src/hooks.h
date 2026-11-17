@@ -147,6 +147,10 @@ struct GameState {
 };
 GameState CurrentGameState();
 
+/// MODIFIED for the Windows port: how many layout objects the game drew on the touch screen in its last frame (0: the touch
+/// screen shows nothing, as at the title). Safe from any thread.
+int TouchScreenObjects();
+
 /// How many of the port's hook points the code library loaded last didn't have (it was built
 /// with an older config/hooks.txt, so the options behind them don't work until it is rebuilt).
 int MissingHookPoints();

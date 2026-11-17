@@ -12,12 +12,13 @@
 // screens' layout. No game runs yet: this proves the window, the Win32 surface, the swapchain, resizing and
 // the present thread on this machine (roadmap phase 3). The game, input and audio come next.
 //
-//   mh4u-win [--seconds N] [--vsync on|off] [--mode overlay|stacked|single|side]
+//   mh4u-win [--seconds N] [--vsync on|off] [--mode popup|overlay|stacked|single|side]
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -107,6 +108,12 @@ void SendInput(const mh4n::InputState& state) {
 }
 std::atomic<int> g_game_status{0};
 std::atomic<int> g_layout_mode{static_cast<int>(sl::Mode::Stacked)};  // the screen layout, changed live by the menu
+// "popup": the top screen fills the window and the touch screen is a picture-in-picture over it, only while the game
+// waits for something on it (the layout is then Overlay, else Single). The mouse works on the popup as on the touch screen.
+std::atomic<bool> g_popup{true};
+std::atomic<bool> g_touch_visible{false};
+std::atomic<int> g_popup_size{38};    // the popup's height, % of the window's
+std::atomic<int> g_popup_corner{3};   // Port::ScreenOverlay::Corner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
 
 // Once the display GPU exists (the `devices` phase), the presenter becomes one of its screen sinks and the runtime is
 // kept for the input.
@@ -540,6 +547,28 @@ struct KeyboardTyping {
 };
 
 
+// Whether the game waits for something on the touch screen, from what the port knows of the game (hooks.h GameState): the
+// intro, the title and the character's creation, and the pages of a town's touch screen that the player opened (Hunters for
+// Hire, Guild Cards, Gestures, Friends). The game's own keyboard is handled by the caller. Tuned by playing: set
+// MH4U_LOG_STATE=1 to print the state as it changes.
+bool TouchWanted(const Port::Hooks::GameState& gs) {
+    // (a touch screen the game draws nothing on, as at the title, has nothing to wait for)
+    if (gs.front_end == 1) return Port::Hooks::TouchScreenObjects() > 0;
+    if (gs.place == Port::Hooks::GameState::PLACE_TOWN) {
+        switch (gs.town_panel) {
+        case 5: case 8: case 11: case 18: return true;
+        default: break;
+        }
+    }
+    return false;
+}
+
+// The refresh rate of the display a window is on, in whole hertz (60 when it can't be read).
+int DisplayHz(SDL_Window* window) {
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window));
+    return mode != nullptr && mode->refresh_rate >= 20.0f ? static_cast<int>(std::lround(mode->refresh_rate)) : 60;
+}
+
 // A call through a null function pointer leaves no frame the unwinder can follow: at that fault the stack's own words
 // are the return addresses. Writes the ones that lie in this program's image as "image+offset" lines to stderr, for
 // llvm-symbolizer. Only a first look at a crash; the crash file (mh4n::app::report) is the real one.
@@ -637,9 +666,13 @@ struct Ini {
     }
     void Save() const {
         if (path.empty()) return;
-        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        const std::string temp = path + ".tmp";
+        if (FILE* f = std::fopen(temp.c_str(), "wb")) {
             for (const auto& line : lines) std::fprintf(f, "%s\r\n", line.c_str());
+            const bool ok = std::fflush(f) == 0;
             std::fclose(f);
+            if (ok && MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return;
+            std::remove(temp.c_str());
         }
     }
 };
@@ -813,7 +846,14 @@ int main(int argc, char** argv) {
     int display_index = std::atoi(ini.Get("display", "-1").c_str());  // -1: the first display that is not the primary
     bool force_setup = false;
     std::string base_game, update_game;  // --base-game / --update: the files for the setup, without asking
-    sl::Mode mode = ini.Get("mode").empty() ? sl::Mode::Stacked : sl::ParseMode(ini.Get("mode"));
+    bool popup = ini.Get("mode").empty() || ini.Get("mode") == "popup";  // the default: a full top screen and a touch popup
+    sl::Mode mode = popup ? sl::Mode::Stacked : sl::ParseMode(ini.Get("mode"));
+    std::string touch_show = ini.Get("touch_show", "auto");  // auto | always | hidden: when the popup shows
+    g_popup_size.store(std::clamp(std::atoi(ini.Get("popup_size", "38").c_str()), 15, 80));
+    {
+        const std::string corner = ini.Get("popup_corner", "bottom-right");
+        g_popup_corner.store(corner == "top-left" ? 0 : corner == "top-right" ? 1 : corner == "bottom-left" ? 2 : 3);
+    }
     std::vector<std::string> online_args;  // --join / --host / --nick / --room-password, as the runner's own options
     std::vector<std::string> game_args;  // after "--": the runner's arguments (PROGRAM --code LIB ...)
     for (int i = 1; i < argc; ++i) {
@@ -828,7 +868,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--vsync") {
             vsync = next() != "off";
         } else if (arg == "--mode") {
-            mode = sl::ParseMode(next());
+            const std::string name = next();
+            popup = name == "popup";
+            mode = sl::ParseMode(name);
         } else if (arg == "--skip-key") {
             skip_key_name = next();
         } else if (arg == "--setup") {
@@ -873,7 +915,7 @@ int main(int argc, char** argv) {
             online_args.push_back(arg == "--join" ? "--room-join" : arg == "--host" ? "--room-host" : arg);
             online_args.push_back(next());
         } else {
-            std::fprintf(stderr, "usage: Caravan4URecomp [--seconds N] [--vsync on|off] [--mode overlay|stacked|single|side] "
+            std::fprintf(stderr, "usage: Caravan4URecomp [--seconds N] [--vsync on|off] [--mode popup|overlay|stacked|single|side] "
                                  "[--display N] [--credits] [--list-rooms [URL]] [--join HOST:PORT | --host PORT] [--nick NAME] [--room-password TEXT] [--setup] [--base-game FILE --update FILE] [--mouse-camera] [--skip-key NAME|none] [-- PROGRAM --code LIB [runner options]]\n"
                                  "without a program it shows a test pattern\n");
             return arg == "--help" ? 0 : 2;
@@ -917,6 +959,10 @@ int main(int argc, char** argv) {
                 game_args.push_back("--set");
                 game_args.push_back(std::string("0:") + key + "=" + v);
             }
+        }
+        if (popup) {  // the touch screen's menus go to the top screen (the game's own single-screen mode)
+            game_args.push_back("--set");
+            game_args.push_back("0:single_screen=on");
         }
         if (!online_args.empty()) {
             const bool has_nick = std::find(online_args.begin(), online_args.end(), "--nick") != online_args.end();
@@ -1007,9 +1053,18 @@ int main(int argc, char** argv) {
     int pixel_w = 0, pixel_h = 0;
     SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
     g_layout_mode.store(static_cast<int>(mode));
+    g_popup.store(popup);
     sc::LayoutSource layout = [] {
         sc::LayoutRequest request;
         request.inputs.mode = static_cast<sl::Mode>(g_layout_mode.load());
+        if (g_popup.load()) {  // a full top screen; the touch screen over it in a corner while it is wanted
+            request.inputs.mode = g_touch_visible.load() ? sl::Mode::Overlay : sl::Mode::Single;
+            Port::ScreenOverlay overlay;
+            overlay.height = static_cast<float>(g_popup_size.load()) / 100.0f;
+            overlay.opacity = 1.0f;
+            overlay.corner = static_cast<Port::ScreenOverlay::Corner>(g_popup_corner.load());
+            request.inputs.overlay = overlay;
+        }
         request.options.linear_filter = true;  // bilinear when the window is not a whole multiple of the picture
         return request;
     };
@@ -1062,10 +1117,16 @@ int main(int argc, char** argv) {
             }
         };
         give("--gpu", "native-display");
+        for (std::string& a : args) {  // fps = display: the refresh rate of the display the window is on
+            if (a == "0:fps=display") a = "0:fps=" + std::to_string(DisplayHz(window));
+            if (a == "0:fps=unlimited") a = "0:fps=1000";  // no limit in practice: the game runs as fast as it can
+        }
         give("--audio", "sdl");
         give("--input-source", "live");
         give("--input-latch", "none");
-        give("--scale", scale_value.c_str());
+        // "auto": a whole number of times the 3DS's 240 rows that is nearest to the window's height (3 at 720, 5 at 1080)
+        const std::string scale_arg = scale_value == "auto" ? std::to_string(std::clamp((pixel_h + 120) / 240, 1, 10)) : scale_value;
+        give("--scale", scale_arg.c_str());
         give("--volume", volume_value.c_str());  // the runner's own option of the SDL audio device (app/audio)  // internal resolution: the runner's default is the 3DS's own (1), which looks soft on a PC
         // the runner stops after 10 s of game time unless told otherwise; --frames alone means no time limit
         // (what the Android app does)
@@ -1114,7 +1175,13 @@ int main(int argc, char** argv) {
     menu_host.value = [&](const std::string& key) -> std::string {
         if (key == "fullscreen") return fullscreen ? "on" : "off";
         if (key == "vsync") return vsync ? "on" : "off";
-        if (key == "mode") return sl::ModeName(static_cast<sl::Mode>(g_layout_mode.load()));
+        if (key == "mode") return g_popup.load() ? "popup" : sl::ModeName(static_cast<sl::Mode>(g_layout_mode.load()));
+        if (key == "touch_show") return touch_show;
+        if (key == "popup_size") return std::to_string(g_popup_size.load());
+        if (key == "popup_corner") {
+            static const char* const kCorners[] = {"top-left", "top-right", "bottom-left", "bottom-right"};
+            return kCorners[std::clamp(g_popup_corner.load(), 0, 3)];
+        }
         if (key == "fps_counter") return show_fps ? "on" : "off";
         if (key == "scale") return scale_value;
         if (key == "volume") return volume_value;
@@ -1129,7 +1196,23 @@ int main(int argc, char** argv) {
             vsync = value == "on";
             (*presenter)->SetVsync(vsync);
         } else if (key == "mode") {
+            const bool was_popup = g_popup.load();
+            g_popup.store(value == "popup");
             g_layout_mode.store(static_cast<int>(sl::ParseMode(value)));
+            if (was_popup != g_popup.load()) {  // the game's menus follow: on the top screen in popup mode
+                if (mh4n::Runtime* rt = g_runtime.load()) {
+                    const std::string v = g_popup.load() ? "on" : "off";
+                    rt->GetKernel().Post([v] { Port::Hooks::SetOption("single_screen", v); });
+                }
+            }
+            (*presenter)->RequestRedraw();
+        } else if (key == "touch_show") {
+            touch_show = value;
+        } else if (key == "popup_size") {
+            g_popup_size.store(std::clamp(std::atoi(value.c_str()), 15, 80));
+            (*presenter)->RequestRedraw();
+        } else if (key == "popup_corner") {
+            g_popup_corner.store(value == "top-left" ? 0 : value == "top-right" ? 1 : value == "bottom-left" ? 2 : 3);
             (*presenter)->RequestRedraw();
         } else if (key == "fps_counter") {
             show_fps = value == "on";
@@ -1143,7 +1226,10 @@ int main(int argc, char** argv) {
             // the hooks read these as the game runs; "default" for the other two takes effect at the next start
             if (mh4n::Runtime* rt = g_runtime.load()) {
                 if (key == "fps" || value != "default") {
-                    const std::string k = key, v = (key == "fps" && value == "default") ? "0" : value;
+                    const std::string k = key;
+                    const std::string v = key == "fps" ? (value == "default" ? "0" : value == "display" ? std::to_string(DisplayHz(window))
+                                                      : value == "unlimited" ? "1000" : value)
+                                      : value;
                     rt->GetKernel().Post([k, v] { Port::Hooks::SetOption(k, v); });
                 }
             }
@@ -1152,10 +1238,34 @@ int main(int argc, char** argv) {
         ini.Save();
     };
     menu_host.quit = [&] { running = false; };
+    menu_host.action = [&](const std::string& name) -> std::string {
+        if (name == "open_textures") {  // <user>\load\textures, where the runtime reads HD texture packs from at start
+            std::string user;
+            for (std::size_t i = 0; i + 1 < game_args.size(); ++i) {
+                if (game_args[i] == "--user") user = game_args[i + 1];
+            }
+            if (user.empty()) return "NO USER FOLDER IS SET";
+            const std::string dir = user + "\\load\\textures";
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(WideFromUtf8(dir)), ec);
+            if (!std::getenv("MH4U_TEST_SCRIPT")) {  // (a test doesn't open a window of Explorer)
+                ShellExecuteW(nullptr, L"open", WideFromUtf8(dir).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            return "THE TEXTURES FOLDER IS OPEN";
+        }
+        return "";
+    };
     ingame::Menu menu(menu_host, menu_overlay);
     g_cursor.menu = &menu_overlay;
     if (std::getenv("MH4U_TEST_MENU")) menu.Toggle(window);  // draws the menu without a keyboard (a check)
     bool menu_was_open = false;
+    bool size_dirty = false;  // the window was resized: its size is saved when it has been still for a second
+    auto size_changed_at = std::chrono::steady_clock::now();
+    bool touch_forced = false;  // F2: the popup shows whatever the game does
+    auto touch_needed_at = std::chrono::steady_clock::now();
+    const bool log_state = std::getenv("MH4U_LOG_STATE") != nullptr;  // prints the game's state when it changes (tuning)
+    Port::Hooks::GameState last_state;
+    int last_objects = -1;
 
     // A test harness (MH4U_TEST_SCRIPT=file): synthetic events pushed into the program's own SDL queue at set times, so
     // a test never touches the real keyboard, mouse or focus. One line per step: "SECONDS COMMAND [ARGS]" with
@@ -1244,7 +1354,17 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
+                // a press is held for a moment: the game samples its input once a frame, so a press and its release in
+                // the same instant would never be seen
+                ScriptStep release{at + 0.12, {}};
+                std::vector<SDL_Event> downs;
+                for (const SDL_Event& e : step.events) {
+                    const bool up = e.type == SDL_EVENT_KEY_UP || e.type == SDL_EVENT_MOUSE_BUTTON_UP || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP;
+                    (up ? release.events : downs).push_back(e);
+                }
+                step.events = std::move(downs);
                 script.push_back(std::move(step));
+                if (!release.events.empty()) script.push_back(std::move(release));
             }
             std::fclose(f);
         }
@@ -1309,11 +1429,19 @@ int main(int argc, char** argv) {
                 (event.key.key == SDLK_F11 || (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT)))) {
                 fullscreen = !fullscreen;  // borderless fullscreen on the display the window is on
                 SDL_SetWindowFullscreen(window, fullscreen);
+                ini.Set("fullscreen", fullscreen ? "on" : "off");
+                ini.Save();
+            }
+            if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && !typing.active && !menu_open && event.key.key == SDLK_F2 &&
+                g_popup.load()) {
+                touch_forced = !touch_forced;  // show or let go of the touch popup by hand
             }
             typing.OnEvent(event, window);
             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 running = false;
             } else if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+                size_changed_at = std::chrono::steady_clock::now();
+                size_dirty = true;
                 (*presenter)->Resize(static_cast<std::uint32_t>(event.window.data1),
                                      static_cast<std::uint32_t>(event.window.data2));
             }
@@ -1329,7 +1457,46 @@ int main(int argc, char** argv) {
                 g_skip_held = false;
             }
         }
+        if (size_dirty && std::chrono::steady_clock::now() - size_changed_at > std::chrono::seconds(1)) {
+            size_dirty = false;
+            if (!fullscreen && !(SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)) {
+                int w = 0, h = 0;
+                SDL_GetWindowSize(window, &w, &h);
+                if (w >= 320 && h >= 240) {
+                    ini.Set("width", std::to_string(w));
+                    ini.Set("height", std::to_string(h));
+                    ini.Save();
+                }
+            }
+        }
         if (menu.Update()) (*presenter)->RequestRedraw();
+        if (g_popup.load()) {
+            // The touch screen shows as a popup while the game waits for something on it: its own keyboard is open, or
+            // (auto) the game's state says the touch screen is the way in; F2 forces it. It stays a moment after the need
+            // is gone (so that it doesn't flicker) and while the mouse holds it.
+            const auto now = std::chrono::steady_clock::now();
+            bool need = touch_show == "always" || touch_forced || touching || typing.active;
+            if (touch_show == "auto" && game) need = need || TouchWanted(Port::Hooks::CurrentGameState());
+            if (touch_show == "hidden" && !touch_forced && !typing.active) need = false;
+            if (need) touch_needed_at = now;
+            const bool show = need || (now - touch_needed_at < std::chrono::milliseconds(1200) && g_touch_visible.load());
+            if (show != g_touch_visible.load()) {
+                g_touch_visible.store(show);
+                (*presenter)->RequestRedraw();
+                if (log_state) std::fprintf(stderr, "mh4u-win: touch popup %s\n", show ? "shown" : "hidden");
+            }
+        }
+        if (log_state && game) {
+            const Port::Hooks::GameState gs = Port::Hooks::CurrentGameState();
+            const int objects = Port::Hooks::TouchScreenObjects() > 0 ? 1 : 0;
+            if (gs.place != last_state.place || gs.town_panel != last_state.town_panel || gs.menu != last_state.menu ||
+                gs.front_end != last_state.front_end || objects != last_objects) {
+                std::fprintf(stderr, "mh4u-win: state place=%d town_panel=%d menu=%d front_end=%d touch_objects=%d\n", gs.place,
+                             gs.town_panel, gs.menu, gs.front_end, objects);
+                last_state = gs;
+                last_objects = objects;
+            }
+        }
         if (show_fps && std::chrono::steady_clock::now() - counter_at >= std::chrono::seconds(1)) {
             const sc::Stats counter_stats = (*presenter)->GetStats();
             const double counter_dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - counter_at).count();

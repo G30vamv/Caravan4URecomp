@@ -14,7 +14,8 @@
 param(
     [ValidateSet("release", "test")][string]$Mode = "release",
     [string]$OutDir = "",
-    [string]$BuildDir = ""
+    [string]$BuildDir = "",
+    [string]$Version = "0.1.0"   # semantic versioning (semver.org); the zip and the tag of a release are named after it
 )
 $ErrorActionPreference = "Stop"
 $source = $PSScriptRoot
@@ -36,7 +37,7 @@ if (-not (Test-Path $pythonZip)) {
 }
 if ((Get-FileHash $pythonZip -Algorithm SHA256).Hash -ne $pythonSha256) { throw "$pythonZip does not have the expected SHA-256" }
 
-$name = "Caravan4URecomp-windows-" + (Get-Date -Format "yyyyMMdd") + $(if ($Mode -eq "test") { "-test" } else { "" })
+$name = "Caravan4URecomp-$Version-windows-x64" + $(if ($Mode -eq "test") { "-test" } else { "" })
 $pkg = Join-Path $OutDir $name
 if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
 New-Item -ItemType Directory -Force $pkg | Out-Null
@@ -82,6 +83,7 @@ foreach ($d in "tools", "config") {
 # 5. the instructions, the setup script and the source offer (and, in a test package, the helper files)
 Copy-Item (Join-Path $source "package\*") $pkg -Force -Recurse
 Remove-Item (Join-Path $pkg "1-PrepareGame.bat") -Force -ErrorAction SilentlyContinue  # the program asks for the files itself
+Set-Content -Path (Join-Path $pkg "VERSION.txt") -Value ("Caravan4URecomp " + $Version) -Encoding ascii
 if ($Mode -eq "release") {
     foreach ($f in "2-GpuCheck.bat", "perf_summary.py", "LEEME-PRUEBA.txt") { Remove-Item (Join-Path $pkg $f) -Force -ErrorAction SilentlyContinue }
 } else {

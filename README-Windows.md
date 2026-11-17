@@ -20,6 +20,8 @@ I'd rather be upfront about what I have actually tested.
 - Character creation, a full quest and a complete hunt, without crashes.
 - Keyboard, mouse (as the stylus of the touch screen) and controller, including typing a hunter's name with a controller.
 - Windowed and fullscreen (F11 or Alt+Enter), resizing, and a 3x internal resolution by default.
+- The top screen fills the window; the touch screen appears as a small popup over it only when the game is waiting for you
+  there (the save selection and character creation, the game's keyboard, a few town pages), and the mouse works on it.
 - An in-game settings menu (see below).
 - Network rooms that speak the same protocol as Azahar's: I joined a real public room from the in-game menu while the game was running.
 
@@ -30,10 +32,10 @@ I'd rather be upfront about what I have actually tested.
 
 ## Getting it
 
-There are no releases yet. When there are, they will be on the Releases page, with a checksum next to each download. The
-program is not code-signed, so Windows may show a SmartScreen warning: "More info", then "Run anyway".
-
-Until then you can build it yourself (see [Building](#building)).
+The first release is on the [Releases](../../releases) page: **v0.1.0**, a pre-release. Versions follow
+[semantic versioning](https://semver.org); while the number starts with 0, anything can still change. Each download has its
+SHA-256 next to it. The program is not code-signed, so Windows may show a SmartScreen warning: "More info", then "Run
+anyway". You can also build it yourself (see [Building](#building)).
 
 ## What you need
 
@@ -59,12 +61,29 @@ the bottom screen. A controller works as it is.
 Press **F1** or **L3 + R3** on a controller. It works with the keyboard, the mouse (click, wheel, right click to go
 back) and the controller (D-pad or left stick, A and B).
 
-- **Graphics:** fullscreen, VSync, screen layout, internal resolution (needs a restart), FPS counter.
-- **Game:** frame rate limit, steady frame rate, particle effects.
+- **Graphics:** fullscreen, VSync, screen layout, internal resolution (auto, or 1x to 10x the 3DS's; needs a restart), FPS counter.
+- **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 90, 120, 144, 165, 180, 240 or unlimited), steady
+  frame rate, particle effects.
 - **Audio:** volume.
 - **Online:** nickname, public rooms, join by address, host a room, leave.
 
-Settings are kept in `Caravan4URecomp.ini`, next to the program.
+The default screen layout is the **popup** one described above: **F2** shows or hides the touch screen by hand, and the
+menu lets you choose when it shows (auto, always, hidden), its size and its corner. The classic layouts (stacked, overlay,
+single, side) are still there. Every change is saved to `Caravan4URecomp.ini`, next to the program, as soon as you make it, so it survives closing the game
+normally or not. A few settings (the internal resolution, HD textures, and going back to "default" in the game options) only
+apply the next time the game starts: the menu saves them, says so, and lists them until you close the game; it never
+restarts anything by itself. **Graphics > Open the HD textures folder** opens the folder for texture packs.
+
+## Frame rate and resolution
+
+- **Frame rate:** the limit goes up to 240 fps. In my tests the menus and the town ran at about 119 fps with the limit at 120
+  and about 237 fps at 240, with VSync off. With VSync on you get at most your display's refresh rate, so "display" in
+  the limit setting is the natural choice. I haven't measured a hunt at high frame rates yet.
+- **Internal resolution:** everything the GPU draws (the 3D scene, the HUD and the text) is rendered at the chosen multiple
+  of the 3DS's resolution; "auto" picks the one closest to your window. The game's own textures stay at their original
+  resolution, so edges get sharper but not more detailed. HD texture packs made for Azahar and Citra (PNG, their folder
+  layout and hashes) are supported by the runtime: put them under `game\user\load\textures`. I haven't tested a pack on
+  Windows yet.
 
 ## Playing online
 
@@ -97,6 +116,8 @@ player's PC from their own files, and it is never part of this repository.
 - New: the `windows/` folder (the Windows shell, the in-game menu, the build and packaging scripts).
 - New: `mh4n/native/src/applets/extrapad.{h,cpp}`, a minimal Extrapad applet so the Circle Pad Pro option in the game's
   settings doesn't close the game.
+- Changed: `mh4n/port/src/hooks.cpp` and `hooks.h` (one counter, `TouchScreenObjects`, of the layout objects the game draws on
+  the touch screen, which the shell uses to know when the touch screen has something on it).
 - Changed: `mh4n/native/src/gpu/native/native_gpu.cpp` (the renderer uses the Vulkan device the window shell already has),
   `mh4n/native/src/services/apt/applet_manager.cpp` and `mh4n/native/src/applets/CMakeLists.txt`.
 
