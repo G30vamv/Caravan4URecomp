@@ -32,10 +32,11 @@ I'd rather be upfront about what I have actually tested.
 
 ## Getting it
 
-The first release is on the [Releases](../../releases) page: **v0.1.0**, a pre-release. Versions follow
-[semantic versioning](https://semver.org); while the number starts with 0, anything can still change. Each download has its
-SHA-256 next to it. The program is not code-signed, so Windows may show a SmartScreen warning: "More info", then "Run
-anyway". You can also build it yourself (see [Building](#building)).
+The first release is on the [Releases](../../releases) page: **0.1.0**, a pre-release, tagged `windows-v0.1.0`. This port has its
+own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
+change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
+which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
+SmartScreen warning: "More info", then "Run anyway". You can also build it yourself (see [Building](#building)).
 
 ## What you need
 
