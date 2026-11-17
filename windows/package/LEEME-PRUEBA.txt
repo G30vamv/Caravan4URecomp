@@ -1,0 +1,19 @@
+Prueba de rendimiento (paquete de prueba)
+=========================================
+
+Este paquete es igual al normal (mira LEEME.txt) pero con el contador de fps activado y un registro de rendimiento.
+
+Para que sirve: ver como corre en una PC de gama baja (fps, tirones, si arranca la GPU).
+
+1) Abre 2-GpuCheck.bat . Guarda GpuCheck.txt: comprueba las funciones de Vulkan que el renderizador necesita (y el
+   plan B de cada una que falte). Si una obligatoria falta, el juego puede no arrancar en esa GPU.
+2) Abre Caravan4URecomp.exe y sigue el LEEME.txt (primera vez: elige los dos archivos del juego).
+3) Juega unos minutos, idealmente una mision. Si va lento, prueba "scale = 1" en Caravan4URecomp.ini.
+
+Que me mandas
+-------------
+- GpuCheck.txt
+- Caravan4URecomp.log (junto al .exe)
+- Caravan4URecomp-perf.csv (se escribe al jugar). Con Python (no hace falta; el paquete trae uno en game-tools\python):
+    game-tools\python\python.exe perf_summary.py Caravan4URecomp-perf.csv      (resumen: fps, tirones, uso de CPU)
+- Tu modelo de CPU y GPU y la RAM, y que fps ves en el contador en el pueblo y en una caza.

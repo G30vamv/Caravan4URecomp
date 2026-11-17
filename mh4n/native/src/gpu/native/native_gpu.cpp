@@ -1650,18 +1650,27 @@ private:
             return false;
         }
         renderer_failed_ = true;
-        rhi::Result<std::shared_ptr<rhi::Instance>> instance = rhi::CreateInstance();
-        if (!instance.ok()) {
-            MH4N_LOG(Error, kLog, "no Vulkan instance: {}", instance.error());
-            return false;
+        // MODIFIED for the Windows port (2026-11-16, not in the upstream 4u-native): the use of the shared backend below.
+        // The process's one Vulkan device (present.h, N2b rule 4): when the app made one for its window (the Windows
+        // shell does), the renderer uses it. A second instance would reload the global Vulkan function pointers
+        // (volk) with ones that lack the surface extensions, and the app's swapchain could no longer be recreated.
+        // With none set (the Android app, the headless runner) the renderer makes its own, as before.
+        if (std::shared_ptr<void> shared = present::SharedBackend()) {
+            backend_ = std::static_pointer_cast<rhi::Backend>(shared);
+        } else {
+            rhi::Result<std::shared_ptr<rhi::Instance>> instance = rhi::CreateInstance();
+            if (!instance.ok()) {
+                MH4N_LOG(Error, kLog, "no Vulkan instance: {}", instance.error());
+                return false;
+            }
+            instance_ = *instance;
+            rhi::Result<std::shared_ptr<rhi::Backend>> backend = rhi::CreateBackend(instance_);
+            if (!backend.ok()) {
+                MH4N_LOG(Error, kLog, "no Vulkan device: {}", backend.error());
+                return false;
+            }
+            backend_ = *backend;
         }
-        instance_ = *instance;
-        rhi::Result<std::shared_ptr<rhi::Backend>> backend = rhi::CreateBackend(instance_);
-        if (!backend.ok()) {
-            MH4N_LOG(Error, kLog, "no Vulkan device: {}", backend.error());
-            return false;
-        }
-        backend_ = *backend;
         const rhi::Capabilities& caps = backend_->Caps();
         MH4N_LOG(Info, kLog, "device: {} ({})", caps.device_name, caps.driver_name);
         owing_allowed_ = OwingFor(caps);

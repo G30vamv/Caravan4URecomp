@@ -1,3 +1,8 @@
+> **Caravan4URecomp** is a *modified version* of 4u-native by khorne-hub, adapted to run on Windows. It is not the official
+> version and is not made or endorsed by khorne-hub, so please don't ask them for help with it. Everything about the
+> Windows port is in [README-Windows.md](README-Windows.md). What follows is the original README of 4u-native (for Android),
+> kept as it was, with its Credits and License.
+
 # MH4U for Android
 
 Play your own copy of Monster Hunter 4 Ultimate on Android, natively and with touch controls made for phones.

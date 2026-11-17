@@ -10,6 +10,7 @@
 
 #include "applets/erreula.h"
 #include "applets/mii_selector.h"
+#include "applets/extrapad.h"
 #include "applets/mint.h"
 #include "applets/swkbd.h"
 #include "mh4n/assert.h"
@@ -484,6 +485,12 @@ Result AppletManager::CreateHleApplet(AppletId id, AppletId parent, bool preload
     case AppletId::Mint:
     case AppletId::Mint2:
         hle_applets_[id] = std::make_shared<Mint>(id, parent, weak_from_this(), context_);
+        break;
+    case AppletId::Extrapad:
+    case AppletId::Extrapad2:
+        // MODIFIED for the Windows port (2026-11-16, not in the upstream 4u-native): the Extrapad applet.
+        // Not in Azahar (the game breaks there): the Circle Pad Pro's setup, closed at once (applets/extrapad.h)
+        hle_applets_[id] = std::make_shared<Extrapad>(id, parent, weak_from_this(), context_);
         break;
     default:
         // Azahar's default case (the other ids, the system applets' too: "Could not create applet").

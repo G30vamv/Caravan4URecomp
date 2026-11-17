@@ -1,0 +1,61 @@
+Caravan4URecomp (MH4U for Windows): what this port adds to THIRD_PARTY_NOTICES
+==============================================================================
+
+This is a MODIFIED version of 4u-native (MH4U for Android) by khorne-hub, https://github.com/khorne-hub/4u-native.
+It is not the official version, and is not made or endorsed by khorne-hub. Everything in THIRD_PARTY_NOTICES (the
+upstream project's notices) applies to it as well; this file lists only what the Windows port adds or changes.
+
+The port's own code (windows/ in the source tree, and the files it adds under mh4n/) is free software under the GNU
+General Public License, version 3 or (at your option) any later version (LICENSE), with the additional terms of
+ADDITIONAL-TERMS, like the code it builds on.
+
+Distributed with the Windows program (the folder that holds mh4u-win.exe)
+--------------------------------------------------------------------------
+
+SDL 3.4.20 (SDL3.dll, the official MinGW build from https://github.com/libsdl-org/SDL/releases)
+    Copyright (C) 1997-2026 Sam Lantinga. zlib licence (SDL3-LICENSE.txt in the LICENSES folder). https://libsdl.org
+
+llvm-mingw (https://github.com/mstorsjo/llvm-mingw) runtime libraries, as built by that project and copied unchanged
+next to the program: libc++.dll and libunwind.dll (the LLVM Project's libc++ and libunwind)
+    Apache License v2.0 with LLVM Exceptions (LLVM-LICENSE.txt in the LICENSES folder).
+    Copyright (c) the LLVM Project contributors. https://llvm.org
+
+libwinpthread-1.dll (winpthreads, from the mingw-w64 project, https://www.mingw-w64.org)
+    Copyright (c) 2011 mingw-w64 project, under a permissive MIT-style licence; parts derived from the "Posix Threads
+    library for Microsoft Windows" are (C) 2010 Lockless Inc. under a BSD-style licence. Both texts are in
+    winpthreads-COPYING.txt in the LICENSES folder (the file is mingw-w64-libraries/winpthreads/COPYING of
+    https://github.com/mingw-w64/mingw-w64, kept in windows/licenses/ in the source tree).
+
+Python 3.12.8, the embeddable package of python.org (game-tools\python, run by the setup that builds the player's code library)
+    Copyright (c) 2001 Python Software Foundation; All Rights Reserved. Python Software Foundation License Version 2
+    (PYTHON-LICENSE.txt in the LICENSES folder). https://www.python.org
+    The package also holds OpenSSL (libssl, libcrypto), libffi, SQLite and other libraries of python.org's build, with
+    their own licenses (summarised in PYTHON-LICENSE.txt).
+
+Downloaded by the setup on the player's PC the first time (not distributed with this program)
+-----------------------------------------------------------------------------------------------
+
+llvm-mingw (https://github.com/mstorsjo/llvm-mingw): clang and lld, the C compiler that builds the player's own code
+library. Apache License v2.0 with LLVM Exceptions, with the MinGW-w64 runtime's permissive licenses. The download is
+refused unless it matches the SHA-256 in mh4n/tools/build_game.py.
+
+Used to build it (not distributed)
+-----------------------------------
+
+llvm-mingw's clang and lld (Apache License v2.0 with LLVM Exceptions), CMake (BSD-3-Clause), Ninja (Apache-2.0).
+
+The game
+--------
+
+The game's code is not part of this program. Each player builds their own code library from their own copy of the game
+(mh4n/tools/build_game.py), and it stays with them: it must never be shared or uploaded.
+
+Changes to upstream files
+-------------------------
+
+Files of the upstream project changed for the Windows port (each carries a notice of the change):
+  mh4n/native/src/gpu/native/native_gpu.cpp        the renderer uses the process's shared Vulkan device when one is set
+  mh4n/native/src/services/apt/applet_manager.cpp  the Extrapad applet is created
+  mh4n/native/src/applets/CMakeLists.txt           extrapad.cpp is built
+New files: mh4n/native/src/applets/extrapad.h and extrapad.cpp (derived from the Mint applet, itself derived from
+Azahar), and everything under windows/.

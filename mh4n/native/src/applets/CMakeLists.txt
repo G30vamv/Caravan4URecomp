@@ -1,3 +1,4 @@
+# MODIFIED for the Windows port (2026-11-16, not in the upstream 4u-native): extrapad.cpp is built.
 # mh4n_applets: the HLE library applets of the APT service (N1-14): what an applet is and sees of the
 # applet manager (applet.h), and the software keyboard answering as Azahar's default keyboard does
 # (swkbd.h), and the error, Mint and Mii selector applets that close at once (N1-14c: erreula.h,
@@ -10,6 +11,7 @@ mh4n_module(
         applet_frontend.cpp
         swkbd.cpp
         erreula.cpp
+        extrapad.cpp
         mint.cpp
         mii_selector.cpp
     DEPENDS
