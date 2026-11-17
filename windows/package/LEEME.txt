@@ -38,7 +38,7 @@ espera algo ahi (seleccion de partida, creacion de personaje, teclado del juego,
 funciona sobre el recuadro. F2 la muestra u oculta a mano; el menu (F1) deja elegir cuando aparece, su tamano y su esquina.
 
 Menu en el juego: F1 (o L3 + R3 a la vez en el mando). Se maneja con teclado, raton (clic, rueda, clic derecho = atras) y mando
-(cruceta o stick izquierdo, A, B). Tiene: Graficos (pantalla completa, VSync, disposicion de pantallas, resolucion interna,
+(cruceta o stick izquierdo, A, B; LB y RB o Q y E cambian de pagina). Tiene: Graficos (pantalla completa, VSync, disposicion de pantallas, resolucion interna,
 contador de fps), Juego (limite de fps, fps estables, efectos), Audio (volumen) y Online.
 Online (salas de Azahar, compatibles con Azahar/Citra; todos deben usar MH4U USA v1.3.0): en el menu, Online > Public rooms
 lista las salas publicas; o escribe una direccion HOST:PORT; o aloja tu propia sala (abre el puerto UDP en tu router).

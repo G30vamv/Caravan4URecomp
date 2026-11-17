@@ -44,6 +44,14 @@ Used to build it (not distributed)
 
 llvm-mingw's clang and lld (Apache License v2.0 with LLVM Exceptions), CMake (BSD-3-Clause), Ninja (Apache-2.0).
 
+The menu's look
+---------------
+
+The in-game menu is drawn with Dear ImGui (MIT, mh4n/port/app/third_party/imgui, with its Vulkan backend) in the Cinzel font
+(Copyright 2020 The Cinzel Project Authors, https://github.com/NDISCOVER/Cinzel, SIL Open Font License 1.1: windows/licenses/Cinzel-OFL.txt,
+installed as LICENSES\Cinzel-OFL.txt). The font is embedded in the program, unmodified. The design is that of the menu of my own
+MH3U port; the colours are this game's.
+
 The game
 --------
 

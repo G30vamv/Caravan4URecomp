@@ -1,6 +1,6 @@
 > **Caravan4URecomp** is a *modified version* of 4u-native by khorne-hub, adapted to run on Windows. It is not the official
 > version and is not made or endorsed by khorne-hub, so please don't ask them for help with it. Everything about the
-> Windows port is in [README-Windows.md](README-Windows.md). What follows is the original README of 4u-native (for Android),
+> Windows port is in [the README of this port](.github/README.md). What follows is the original README of 4u-native (for Android),
 > kept as it was, with its Credits and License.
 
 # MH4U for Android

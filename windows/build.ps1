@@ -86,7 +86,8 @@ $copies = @(
     @((Join-Path $repo "README.es.md"), "README.es.md"),
     @((Join-Path $sdlRoot "LICENSE.txt"), "SDL3-LICENSE.txt"),
     @((Join-Path $mingwBin "..\LICENSE.TXT"), "LLVM-LICENSE.txt"),
-    @((Join-Path $source "licenses\winpthreads-COPYING.txt"), "winpthreads-COPYING.txt")
+    @((Join-Path $source "licenses\winpthreads-COPYING.txt"), "winpthreads-COPYING.txt"),
+    @((Join-Path $source "licenses\Cinzel-OFL.txt"), "Cinzel-OFL.txt")
 )
 foreach ($c in $copies) {
     if (Test-Path $c[0]) { Copy-Item $c[0] (Join-Path $lic $c[1]) -Force } else { Write-Warning "license file not found: $($c[0])" }

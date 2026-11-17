@@ -32,7 +32,7 @@ I'd rather be upfront about what I have actually tested.
 
 ## Getting it
 
-The first release is on the [Releases](../../releases) page: **0.1.0**, a pre-release, tagged `windows-v0.1.0`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.2.0**, a pre-release, tagged `windows-v0.2.0`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
@@ -59,8 +59,9 @@ the bottom screen. A controller works as it is.
 
 ### In-game menu
 
-Press **F1** or **L3 + R3** on a controller. It works with the keyboard, the mouse (click, wheel, right click to go
-back) and the controller (D-pad or left stick, A and B).
+Press **F1** or **L3 + R3** on a controller. It works with the keyboard, the mouse (click, drag the sliders, wheel,
+right click to go back) and the controller (D-pad or left stick, A and B; LB and RB, or Q and E, change the page). The
+design comes from the menu of my MH3U port, with this game's colours, in the Cinzel font (SIL Open Font License).
 
 - **Graphics:** fullscreen, VSync, screen layout, internal resolution (auto, or 1x to 10x the 3DS's; needs a restart), FPS counter.
 - **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 90, 120, 144, 165, 180, 240 or unlimited), steady
@@ -131,12 +132,12 @@ Every changed file says so in its header. The Android app is untouched.
 - 4u-native, the Android app this port is based on: [khorne-hub](https://github.com/khorne-hub/4u-native).
 - Parts of the runtime come from [Azahar](https://github.com/azahar-emu/azahar) and Citra.
 - The libraries used, with their licenses, are listed in `THIRD_PARTY_NOTICES` and `windows/THIRD_PARTY_NOTICES_WINDOWS`.
-- The full credits of 4u-native are in its [README](README.md), which is kept as it was.
+- The full credits of 4u-native are in its [README](../README.md), which is kept as it was.
 
 ## License
 
-Free software under the [GNU General Public License, version 3](LICENSE) or (at your option) any later version. The code
-by khorne-hub carries [additional terms](ADDITIONAL-TERMS), which still apply: keep the author's credits, mark a changed
+Free software under the [GNU General Public License, version 3](../LICENSE) or (at your option) any later version. The code
+by khorne-hub carries [additional terms](../ADDITIONAL-TERMS), which still apply: keep the author's credits, mark a changed
 version as changed and don't present it as the official one, and give the license and the complete source code with
 every copy of the program. New code of this port: Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors.
 

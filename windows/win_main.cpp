@@ -37,6 +37,7 @@
 #include "mh4n/rooms.h"
 #include "mh4n/runtime.h"
 #include "screen_layout/screen_layout.h"
+#include "swapchain/policy.h"
 #include "swapchain/presenter.h"
 #include "swkbd_bridge.h"
 
@@ -256,7 +257,7 @@ public:
         VkCommandBuffer commands = rhi::CommandBuffer(*static_cast<rhi::Recorder*>(recorder));
         if (show_fps.load() && fps.load() >= 0) DrawFps(commands, width, height);
         if (visible.load()) DrawHand(commands, owner->CurrentLayout(), width, height);
-        if (menu != nullptr) menu->Draw(commands, width, height);
+        if (menu != nullptr) menu->Draw(commands, recorder, width, height);
     }
 
 private:
@@ -1167,6 +1168,20 @@ int main(int argc, char** argv) {
     // The in-game settings menu (F1, or L3 + R3 on a controller): what each setting is now and how a change is
     // applied to the running game and kept in the settings file.
     ingame::Overlay menu_overlay;
+    {   // the menu's look is drawn on the present thread with Dear ImGui over this device, in the swapchain's format
+        int surface_format = static_cast<int>(VK_FORMAT_B8G8R8A8_UNORM);
+        const rhi::VulkanHandles handles = rhi::Handles(**backend);
+        std::uint32_t count = 0;
+        vkGetPhysicalDeviceSurfaceFormatsKHR(handles.physical_device, vk_surface, &count, nullptr);
+        std::vector<VkSurfaceFormatKHR> offered(count);
+        if (count > 0) vkGetPhysicalDeviceSurfaceFormatsKHR(handles.physical_device, vk_surface, &count, offered.data());
+        if (const auto chosen = mh4n::swapchain::ChooseSurfaceFormat(offered)) surface_format = static_cast<int>(chosen->format);
+        sc::Presenter* present_thread = presenter->get();
+        std::shared_ptr<rhi::Backend> shared_backend = *backend;
+        menu_overlay.UseGui([shared_backend, surface_format, present_thread] {
+            return ingame::MakeGuiRenderer(shared_backend, surface_format, [present_thread] { present_thread->RequestRedraw(); });
+        });
+    }
     if (ini.Get("nick").empty()) {  // a nickname for the rooms that is unlikely to be taken
         ini.Set("nick", "Hunter" + std::to_string(1000 + static_cast<int>(SDL_GetPerformanceCounter() % 9000)));
         ini.Save();
@@ -1548,6 +1563,7 @@ int main(int argc, char** argv) {
     g_cursor.menu = nullptr;
     g_cursor.presenter.store(nullptr);
     (*presenter)->Stop();
+    menu_overlay.ResetGui();  // the menu's renderer waits for the device and lets its Vulkan objects go
     presenter->reset();
     SDL_Vulkan_DestroySurface(rhi::NativeInstance(**instance), vk_surface, nullptr);
     backend->reset();

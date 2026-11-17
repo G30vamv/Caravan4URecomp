@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -27,6 +28,7 @@
 #include <SDL3/SDL.h>
 
 #include "gpu/backend/vulkan_access.h"
+#include "menu_gui.h"
 #include "mh4n/rooms.h"
 
 namespace ingame {
@@ -117,10 +119,20 @@ constexpr int kMaxRows = 22;    // lines of the panel
 // The panel as the present thread draws it: the main thread hands over the lines, the present thread reads them.
 class Overlay {
 public:
-    void Set(bool open, std::vector<Line> lines) {
+    void Set(bool open, std::vector<Line> lines, View view) {
         std::lock_guard lock(mutex_);
         open_ = open;
         lines_ = std::move(lines);
+        view_ = std::move(view);
+    }
+
+    // The look of the menu (menu_gui.h): made on the present thread when the first frame needs it. If it can't be made,
+    // the menu is drawn with plain rectangles and the 5 x 7 font below.
+    void UseGui(std::function<std::unique_ptr<GuiRenderer>()> make) { make_gui_ = std::move(make); }
+    // On the present thread or after it stopped (the renderer waits for the device).
+    void ResetGui() {
+        gui_.reset();
+        make_gui_ = nullptr;
     }
 
     // Where the panel is in a target of this size (the drawing and the mouse use the same numbers).
@@ -139,13 +151,20 @@ public:
         return g;
     }
 
-    void Draw(VkCommandBuffer commands, std::uint32_t width, std::uint32_t height) const {
+    void Draw(VkCommandBuffer commands, void* recorder, std::uint32_t width, std::uint32_t height) const {
         std::vector<Line> lines;
+        View view;
         {
             std::lock_guard lock(mutex_);
             if (!open_) return;
             lines = lines_;
+            view = view_;
         }
+        if (make_gui_ && !gui_failed_) {
+            if (!gui_) gui_ = make_gui_();
+            if (!gui_) gui_failed_ = true;
+        }
+        if (gui_ && gui_->Draw(recorder, view, width, height)) return;
         struct Sq {
             int x, y, w, h;
         };
@@ -214,6 +233,10 @@ private:
     mutable std::mutex mutex_;
     bool open_ = false;
     std::vector<Line> lines_;
+    View view_;
+    std::function<std::unique_ptr<GuiRenderer>()> make_gui_;
+    mutable std::unique_ptr<GuiRenderer> gui_;
+    mutable bool gui_failed_ = false;
 };
 
 // ---- the menu --------------------------------------------------------------------------------------------------------
@@ -228,7 +251,11 @@ struct Host {
     std::function<std::string(const std::string&)> action;
 };
 
-enum class Page { Main, Graphics, Game, Audio, Online, Rooms, Password, Count };
+// The pages: five tabs, and two that belong to the Online tab (the public rooms and a room's password).
+enum class Page { Graphics, Game, Audio, Online, System, Rooms, Password, Count };
+constexpr int kTabCount = 5;
+inline int TabOf(Page page) { return page == Page::Rooms || page == Page::Password ? static_cast<int>(Page::Online) : static_cast<int>(page); }
+inline const char* const kTabNames[kTabCount] = {"Graphics", "Game", "Audio", "Online", "System"};
 
 struct Item {
     enum Kind { Info, Choice, Action, Text, Link };
@@ -242,6 +269,14 @@ struct Item {
     std::size_t max_length = 0;
     bool secret = false;
     std::function<void()> done;       // Text: after the text is accepted
+    std::string help;                 // what the row says about itself when it is marked
+    std::string cap;                  // Action: the word on its button
+    bool toggle = false, on = false;  // Choice that is an on / off switch
+    bool slider = false;              // Choice shown as a slider (numbers)
+    float frac = 0.0f;
+    bool room = false;                // a row of the list of public rooms
+    bool restart = false;             // the change waits for a restart
+    std::function<void(float)> set_frac;  // a slider set by the mouse
     bool Selectable() const { return kind != Info; }
 };
 
@@ -279,12 +314,12 @@ public:
     }
 
     // Every SDL event, on the main thread. The menu opens and closes with F1 or L3 + R3 (both stick clicks). While it is open:
-    //  - keyboard: arrows, Enter, Escape, Backspace, and the text of a field;
-    //  - controller: D-pad or left stick (they repeat while held), A, B, the shoulder buttons to change a value, Start
-    //    to close; a text field is typed with the D-pad (up / down changes the last letter, right adds one, left
-    //    deletes) and A accepts, B cancels;
-    //  - mouse: moving over a row selects it, a click does what Enter does (a click on a field starts typing), the right
-    //    button goes back, the wheel moves.
+    //  - keyboard: arrows, Enter, Escape, Backspace, Q and E (or Page Up and Down in a list) for the pages, and the text of
+    //    a field;
+    //  - controller: D-pad or left stick (they repeat while held), A, B, LB and RB for the pages, Start to close; a text field
+    //    is typed with the D-pad (up / down changes the last letter, right adds one, left deletes) and A accepts, B cancels;
+    //  - mouse: moving over a row selects it, a click does what Enter does (on an arrow, a step; on a slider, it sets the
+    //    value; on a field, it starts typing), a click on a tab changes the page, the right button goes back, the wheel moves.
     void OnEvent(const SDL_Event& e, SDL_Window* window) {
         window_ = window;
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.key == SDLK_F1) {
@@ -305,6 +340,10 @@ public:
             if (e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_LEFT || e.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) dpad_change_ = 0;
             return;
         }
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_LEFT) {
+            drag_ = -1;
+            return;
+        }
         if (!open) return;
         if (e.type == SDL_EVENT_TEXT_INPUT && edit_ != nullptr) {
             for (const char* p = e.text.text; *p; ++p) {
@@ -323,6 +362,8 @@ public:
             case SDLK_RIGHT: act.change = 1; break;
             case SDLK_PAGEUP: act.move = -5; break;
             case SDLK_PAGEDOWN: act.move = 5; break;
+            case SDLK_Q: act.tab_step = -1; break;
+            case SDLK_E: act.tab_step = 1; break;
             case SDLK_RETURN:
             case SDLK_KP_ENTER: act.enter = !e.key.repeat; break;
             case SDLK_ESCAPE: act.back = !e.key.repeat; break;
@@ -337,8 +378,8 @@ public:
             case SDL_GAMEPAD_BUTTON_DPAD_DOWN: act.move = dpad_move_ = 1; break;
             case SDL_GAMEPAD_BUTTON_DPAD_LEFT: act.change = dpad_change_ = -1; break;
             case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: act.change = dpad_change_ = 1; break;
-            case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: act.change = -1; act.shoulder = true; break;
-            case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: act.change = 1; act.shoulder = true; break;
+            case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: act.tab_step = -1; break;
+            case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: act.tab_step = 1; break;
             case SDL_GAMEPAD_BUTTON_SOUTH: act.enter = true; break;
             case SDL_GAMEPAD_BUTTON_EAST: act.back = true; break;
             case SDL_GAMEPAD_BUTTON_START: Toggle(window); return;
@@ -358,19 +399,46 @@ public:
             next_repeat_ms_ = SDL_GetTicks() + 380;
             break;
         }
-        case SDL_EVENT_MOUSE_MOTION:
-            act.row = RowAt(window, e.motion.x, e.motion.y);
-            if (act.row < 0) return;
-            act.hover = true;
+        case SDL_EVENT_MOUSE_MOTION: {
+            const Hit hit = HitTest(window, e.motion.x, e.motion.y);
+            const int tab = hit.kind == Hit::Tab ? hit.index : -1;
+            const int row = hit.kind == Hit::Row ? hit.index : -1;
+            if (tab != hover_tab_ || row != hover_row_) {
+                hover_tab_ = tab;
+                hover_row_ = row;
+                dirty_ = true;
+            }
+            if (drag_ >= 0 && (e.motion.state & SDL_BUTTON_LMASK)) {  // a slider being dragged
+                act.hit = drag_;
+                act.slider = SliderFraction(window, e.motion.x, drag_);
+            } else if (hit.kind == Hit::Row) {
+                act.hit = hit.index;
+                act.hover = true;
+            } else {
+                return;
+            }
             break;
+        }
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             if (e.button.button == SDL_BUTTON_RIGHT || e.button.button == SDL_BUTTON_X1) {
                 act.back = true;
             } else if (e.button.button == SDL_BUTTON_LEFT) {
-                act.row = RowAt(window, e.button.x, e.button.y);
+                const Hit hit = HitTest(window, e.button.x, e.button.y);
                 if (edit_ != nullptr) EndEdit(window, true);
-                if (act.row < 0) return;
-                act.enter = true;
+                if (hit.kind == Hit::Tab) {
+                    act.tab = hit.index;
+                } else if (hit.kind == Hit::Row) {
+                    act.hit = hit.index;
+                    act.zone = hit.zone;
+                    if (hit.frac >= 0.0f) {
+                        act.slider = hit.frac;
+                        drag_ = hit.index;
+                    } else {
+                        act.enter = true;
+                    }
+                } else {
+                    return;
+                }
             } else {
                 return;
             }
@@ -404,31 +472,88 @@ public:
         if (!dirty_ && now < next_refresh_) return false;
         next_refresh_ = now + std::chrono::milliseconds(300);
         dirty_ = false;
-        std::vector<Line> lines = open ? Render() : std::vector<Line>{};
-        if (open == shown_open_ && lines == shown_) return false;
+        std::vector<Line> lines;
+        View view;
+        if (open) Render(&lines, &view);
+        if (open == shown_open_ && lines == shown_ && view == shown_view_) return false;
         shown_open_ = open;
         shown_ = lines;
-        overlay_.Set(open, std::move(lines));
+        shown_view_ = view;
+        overlay_.Set(open, std::move(lines), std::move(view));
         return true;
     }
 
 private:
     struct Act {
-        int move = 0, change = 0, row = -1;
-        bool enter = false, back = false, erase = false, pad = false, shoulder = false, hover = false;
+        int move = 0, change = 0;
+        int tab = -1, tab_step = 0;    // a page chosen by name (the mouse) or stepped to (LB, RB, Q, E)
+        int hit = -1, zone = 0;        // an item under the mouse, and its arrow (-1 left, 1 right)
+        float slider = -1.0f;          // a slider set by the mouse
+        bool enter = false, back = false, erase = false, pad = false, hover = false;
     };
 
-    // The row of the panel under a point of the window (in window units), as an index of the lines; -1: none.
-    int RowAt(SDL_Window* window, float x, float y) const {
+    // What is under a point of the window (in window units): a tab, or a row (as an index of the page's items).
+    struct Hit {
+        enum Kind { None, Tab, Row } kind = None;
+        int index = -1;
+        int zone = 0;
+        float frac = -1.0f;  // a press on a slider's bar
+    };
+
+    // The pixel size of the window and the layout the drawing uses in it.
+    Layout CurrentLayout(SDL_Window* window, float* density) const {
         int w = 0, h = 0;
         SDL_GetWindowSizeInPixels(window, &w, &h);
-        const float density = SDL_GetWindowPixelDensity(window);
-        const Overlay::Geometry g = Overlay::GeometryOf(static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h), line_count_);
-        const int px = static_cast<int>(x * density), py = static_cast<int>(y * density);
-        if (px < g.x0 || px >= g.x0 + g.panel_w) return -1;
-        const int row = (py - g.y0 - g.pad + g.unit) / (10 * g.unit);
-        if (py < g.y0 + g.pad - g.unit || row < 0 || row >= static_cast<int>(line_count_)) return -1;
-        return row;
+        *density = SDL_GetWindowPixelDensity(window);
+        return LayoutOf(static_cast<float>(w), static_cast<float>(h));
+    }
+
+    Hit HitTest(SDL_Window* window, float x, float y) const {
+        Hit hit;
+        float density = 1.0f;
+        const Layout l = CurrentLayout(window, &density);
+        const float px = x * density, py = y * density;
+        if (l.tabs.Contains(px, py) && !view_.tabs.empty()) {
+            hit.kind = Hit::Tab;
+            hit.index = std::clamp(static_cast<int>((px - l.tabs.x0) / (l.tabs.W() / static_cast<float>(view_.tabs.size()))), 0,
+                                   static_cast<int>(view_.tabs.size()) - 1);
+            return hit;
+        }
+        if (!l.rows.Contains(px, py)) return hit;
+        int first = 0, fit = 1;
+        WindowOf(l, view_.rows.size(), view_.sel, &first, &fit);
+        const int slot = static_cast<int>((py - l.rows.y0) / l.row_h);
+        const int index = first + slot;
+        if (slot < 0 || slot >= fit || index < 0 || index >= static_cast<int>(view_.rows.size())) return hit;
+        const ViewRow& row = view_.rows[static_cast<std::size_t>(index)];
+        if (row.kind == ViewRow::Info) return hit;
+        hit.kind = Hit::Row;
+        hit.index = index;
+        const float u = l.u;
+        const float value_left = l.rows.x0 + l.rows.W() * 0.50f, value_right = l.rows.x1 - 18.0f * u;
+        if (row.kind == ViewRow::Choice) {
+            if (std::fabs(px - (value_left + 12 * u)) < 22 * u) hit.zone = -1;
+            else if (std::fabs(px - (value_right - 12 * u)) < 22 * u) hit.zone = 1;
+        } else if (row.kind == ViewRow::Slider) {
+            const float bar_x0 = value_left, bar_x1 = value_right - 74.0f * u - 12.0f * u;
+            if (px >= bar_x0 - 10 * u && px <= bar_x1 + 10 * u) hit.frac = std::clamp((px - bar_x0) / std::max(1.0f, bar_x1 - bar_x0), 0.0f, 1.0f);
+        }
+        return hit;
+    }
+
+    float SliderFraction(SDL_Window* window, float x, int row) const {
+        float density = 1.0f;
+        const Layout l = CurrentLayout(window, &density);
+        (void)row;
+        const float u = l.u;
+        const float bar_x0 = l.rows.x0 + l.rows.W() * 0.50f, bar_x1 = l.rows.x1 - 18.0f * u - 74.0f * u - 12.0f * u;
+        return std::clamp((x * density - bar_x0) / std::max(1.0f, bar_x1 - bar_x0), 0.0f, 1.0f);
+    }
+
+    void SetPage(Page page) {
+        page_ = page;
+        hover_row_ = -1;
+        dirty_ = true;
     }
 
     void Do(const Act& a, SDL_Window* window) {
@@ -455,6 +580,14 @@ private:
             if (a.back) EndEdit(window, false);
             return;
         }
+        if (a.tab >= 0) {  // a tab clicked
+            SetPage(static_cast<Page>(std::clamp(a.tab, 0, kTabCount - 1)));
+            return;
+        }
+        if (a.tab_step != 0) {  // LB, RB, Q, E
+            SetPage(static_cast<Page>((TabOf(page_) + a.tab_step + kTabCount) % kTabCount));
+            return;
+        }
         std::vector<Item> items = Build();
         int& sel = sel_[static_cast<int>(page_)];
         SyncSelection(items);
@@ -462,12 +595,18 @@ private:
             sel = std::clamp(sel, 0, std::max(0, static_cast<int>(items.size()) - 1));
             if (!items.empty()) sel_id_[static_cast<int>(page_)] = items[static_cast<std::size_t>(sel)].id;
         };
-        if (a.row >= 0) {  // the mouse: the row under it
-            const int index = a.row < static_cast<int>(row_item_.size()) ? row_item_[static_cast<std::size_t>(a.row)] : -1;
-            if (index < 0 || index >= static_cast<int>(items.size()) || !items[static_cast<std::size_t>(index)].Selectable()) return;
-            sel = index;
-            if (a.hover) {
-                clamp_to_item();
+        if (a.hit >= 0) {  // the mouse: the row under it
+            if (a.hit >= static_cast<int>(items.size()) || !items[static_cast<std::size_t>(a.hit)].Selectable()) return;
+            sel = a.hit;
+            clamp_to_item();
+            if (a.hover) return;
+            Item& item = items[static_cast<std::size_t>(a.hit)];
+            if (a.slider >= 0.0f) {
+                if (item.set_frac) item.set_frac(a.slider);
+                return;
+            }
+            if (a.zone != 0 && item.change) {
+                item.change(a.zone);
                 return;
             }
         }
@@ -493,10 +632,10 @@ private:
             }
         }
         if (a.back) {
-            if (page_ == Page::Main) {
-                open = false;
+            if (page_ == Page::Rooms || page_ == Page::Password) {
+                SetPage(Page::Online);
             } else {
-                page_ = (page_ == Page::Rooms || page_ == Page::Password) ? Page::Online : Page::Main;
+                open = false;
             }
         }
     }
@@ -505,18 +644,20 @@ private:
     bool l3_ = false, r3_ = false;  // the stick clicks held: both open and close the menu
     int dpad_move_ = 0, dpad_change_ = 0, stick_move_ = 0, stick_change_ = 0;
     Uint64 next_repeat_ms_ = 0;
-    std::size_t line_count_ = 0;
-    std::vector<int> row_item_;  // the item each line of the panel shows (-1: none)
+    int drag_ = -1;                 // the slider (an item's index) the mouse holds
+    int hover_tab_ = -1, hover_row_ = -1;
+    View view_;                     // what the last frame of the menu showed (the mouse reads its layout)
 
     Host host_;
     Overlay& overlay_;
-    Page page_ = Page::Main;
+    Page page_ = Page::Graphics;
     int sel_[static_cast<int>(Page::Count)] = {};
     std::string sel_id_[static_cast<int>(Page::Count)];
     bool dirty_ = true;
     std::chrono::steady_clock::time_point next_refresh_{};
     bool shown_open_ = false;
     std::vector<Line> shown_;
+    View shown_view_;
 
     // online
     std::string nick_, addr_, password_, host_port_, host_password_, join_password_;
@@ -541,7 +682,7 @@ private:
     std::vector<std::string> restart_;
     void NeedRestart(const std::string& what) {
         if (std::find(restart_.begin(), restart_.end(), what) == restart_.end()) restart_.push_back(what);
-        Say("SAVED. THIS CHANGE APPLIES THE NEXT TIME YOU START THE GAME");
+        Say("Saved. This change applies the next time you start the game.");
     }
 
     void Say(const std::string& text) {
@@ -574,7 +715,7 @@ private:
         Item item;
         item.kind = Item::Choice;
         item.id = key;
-        item.label = label + (restart ? " (RESTART)" : "");
+        item.label = label;
         std::string now = host_.value(key);
         std::size_t index = 0;
         bool found = false;
@@ -585,17 +726,33 @@ private:
             }
         }
         item.value = found ? options[index] : (now.empty() ? options[0] : now);
+        item.toggle = options.size() == 2 && ((options[0] == "on" && options[1] == "off") || (options[0] == "off" && options[1] == "on"));
+        item.on = item.value == "on";
+        item.slider = key == "volume" || key == "popup_size";
+        item.frac = options.size() > 1 ? static_cast<float>(found ? index : 0) / static_cast<float>(options.size() - 1) : 0.0f;
+        if (item.slider && options.size() > 1) {  // where the number is between the first and the last, even if it is between steps
+            const float from = static_cast<float>(std::atof(options.front().c_str())), to = static_cast<float>(std::atof(options.back().c_str()));
+            if (to > from) item.frac = std::clamp((static_cast<float>(std::atof(item.value.c_str())) - from) / (to - from), 0.0f, 1.0f);
+        }
+        item.restart = restart;
         const std::string name = label;
-        auto step = [this, key, options, index, found, restart, restart_to_default, name](int dir) {
-            const int n = static_cast<int>(options.size());
-            const int next = (static_cast<int>(found ? index : 0) + dir + n) % n;
+        auto apply_at = [this, key, options, restart, restart_to_default, name](int next) {
             host_.apply(key, options[static_cast<std::size_t>(next)]);
             // a change that the running game can't take is saved and said to wait: nothing restarts by itself
             if (restart || (restart_to_default && options[static_cast<std::size_t>(next)] == "default")) NeedRestart(name);
             dirty_ = true;
         };
+        auto step = [apply_at, options, index, found](int dir) {
+            const int n = static_cast<int>(options.size());
+            apply_at((static_cast<int>(found ? index : 0) + dir + n) % n);
+        };
         item.change = step;
         item.act = [step] { step(1); };
+        item.set_frac = [apply_at, options, index, found](float frac) {
+            const int n = static_cast<int>(options.size());
+            const int next = std::clamp(static_cast<int>(std::lround(frac * static_cast<float>(n - 1))), 0, n - 1);
+            if (next != static_cast<int>(found ? index : 0)) apply_at(next);
+        };
         return item;
     }
     static Item Info(const std::string& text, int color = 2) {
@@ -604,11 +761,12 @@ private:
         item.color = color;
         return item;
     }
-    static Item Action(const std::string& label, std::function<void()> act) {
+    static Item Action(const std::string& label, std::function<void()> act, const std::string& cap = "Accept") {
         Item item;
         item.kind = Item::Action;
         item.id = label;
         item.label = label;
+        item.cap = cap;
         item.act = std::move(act);
         return item;
     }
@@ -631,52 +789,67 @@ private:
         return v;
     }
 
+    // What a row says about itself when it is marked.
+    static std::string HelpFor(const std::string& id) {
+        static const std::pair<const char*, const char*> kHelp[] = {
+            {"fullscreen", "Borderless fullscreen on the display the window is on. F11 or Alt+Enter does the same."},
+            {"vsync", "Shows each frame when your display refreshes. Off lets the game run above your display's rate, and the picture may tear."},
+            {"mode", "Popup: the top screen fills the window and the touch screen pops up over it when the game needs it. The others show both screens all the time."},
+            {"touch_show", "When the touch screen's popup appears: when the game needs it (auto), always, or never. F2 shows or hides it by hand."},
+            {"popup_size", "The height of the touch screen's popup, as a percentage of the window's height."},
+            {"popup_corner", "The corner of the window where the touch screen's popup sits."},
+            {"scale", "How sharp the 3D scene, the HUD and the text are drawn: a multiple of the 3DS's resolution. Auto picks the one closest to your window."},
+            {"fps_counter", "Shows the game's frame rate in the top-left corner."},
+            {"Open the HD textures folder", "Opens the folder for HD texture packs (Azahar or Citra format). They are read when the game starts."},
+            {"fps", "Caps the game's frame rate. Default is the game's own, Display matches your screen, Unlimited uses all the CPU."},
+            {"steady", "Keeps the frame rate even instead of letting it vary. Default leaves the game's own setting."},
+            {"effects", "Turns the game's particle effects on or off. Default leaves the game's own setting."},
+            {"volume", "The volume of the game."},
+            {"Nickname", "Your name in network rooms: 4 to 20 letters, digits, spaces, dots, underscores or dashes."},
+            {"Public rooms >", "Lists the rooms of the community lobby (the same rooms Azahar uses). Everyone needs Monster Hunter 4 Ultimate USA 1.3.0."},
+            {"Address HOST:PORT", "The address of a room, like 203.0.113.7:24872."},
+            {"Room password", "The password of the room you join, if it has one. It is not saved."},
+            {"Join this address", "Joins the room at that address. Then, in the game, go to the Gathering Hall and choose Local Play."},
+            {"Host port (UDP)", "The UDP port your room listens on. Open it on your router so others can join."},
+            {"Host password", "An optional password for the room you host. It is not saved."},
+            {"host", "Opens a room on your PC and joins it. Others join your public IP address and this port."},
+            {"Leave the room", "Leaves the room you are in."},
+            {"Resume the game", "Closes the menu and goes back to the game."},
+            {"Quit the game", "Closes the game."},
+            {"refresh", "Gets the list of rooms again."},
+            {"Password", "The password of this room."},
+            {"Join", "Joins the room with that password."},
+        };
+        for (const auto& [key, text] : kHelp) {
+            if (id == key) return text;
+        }
+        return {};
+    }
+
     std::vector<Item> Build() {
         std::vector<Item> items;
         switch (page_) {
-        case Page::Main: {
-            const auto link = [&](const char* label, Page to) {
-                Item i;
-                i.kind = Item::Link;
-                i.label = std::string(label) + " >";
-                i.id = i.label;
-                i.act = [this, to] { page_ = to; };
-                items.push_back(i);
-            };
-            link("Graphics", Page::Graphics);
-            link("Game", Page::Game);
-            link("Audio", Page::Audio);
-            link("Online", Page::Online);
-            items.push_back(Info(""));
-            items.push_back(Action("Resume the game", [this] { open = false; }));
-            items.push_back(Action("Quit the game", [this] { host_.quit(); }));
-            break;
-        }
         case Page::Graphics:
             items.push_back(Choice("Fullscreen", "fullscreen", {"on", "off"}));
             items.push_back(Choice("VSync", "vsync", {"on", "off"}));
             items.push_back(Choice("Screen layout", "mode", {"popup", "stacked", "overlay", "single", "side"}));
             if (host_.value("mode") == "popup") {  // the top screen full, the touch screen over it when it is wanted
                 items.push_back(Choice("Touch screen shows", "touch_show", {"auto", "always", "hidden"}));
-                items.push_back(Choice("Touch popup size %", "popup_size", Numbers(20, 70, 5)));
+                items.push_back(Choice("Touch popup size", "popup_size", Numbers(20, 70, 5)));
                 items.push_back(Choice("Touch popup corner", "popup_corner", {"bottom-right", "bottom-left", "top-right", "top-left"}));
-                items.push_back(Info("F2 SHOWS OR HIDES THE TOUCH SCREEN BY HAND"));
             }
             items.push_back(Choice("Internal resolution", "scale", {"auto", "1", "2", "3", "4", "5", "6", "8", "10"}, true));
             items.push_back(Choice("FPS counter", "fps_counter", {"off", "on"}));
             items.push_back(Action("Open the HD textures folder", [this] {
-                const std::string said = host_.action ? host_.action("open_textures") : "NOT AVAILABLE";
+                const std::string said = host_.action ? host_.action("open_textures") : "Not available";
                 NeedRestart("HD textures");
-                Say(said + ". RESTART THE GAME TO LOAD THEM");
-            }));
-            items.push_back(Info("PACKS (AZAHAR/CITRA FORMAT) LOAD WHEN THE GAME STARTS"));
+                Say(said + ". Restart the game to load the packs.");
+            }, "Open"));
             break;
         case Page::Game:
             items.push_back(Choice("Frame rate limit", "fps", {"default", "display", "30", "60", "90", "120", "144", "165", "180", "240", "unlimited"}));
             items.push_back(Choice("Steady frame rate", "steady", {"default", "on", "off"}, false, true));
             items.push_back(Choice("Particle effects", "effects", {"default", "on", "off"}, false, true));
-            items.push_back(Info("DEFAULT = THE GAME'S OWN SETTING   DISPLAY = YOUR SCREEN'S RATE"));
-            items.push_back(Info("UNLIMITED: ALL THE CPU. VSYNC ON: SCREEN RATE IS THE MAX"));
             break;
         case Page::Audio:
             items.push_back(Choice("Volume", "volume", Numbers(0, 100, 5)));
@@ -684,55 +857,55 @@ private:
         case Page::Online:
             BuildOnline(items);
             break;
+        case Page::System:
+            items.push_back(Action("Resume the game", [this] { open = false; }, "Resume"));
+            items.push_back(Action("Quit the game", [this] { host_.quit(); }, "Quit"));
+            items.push_back(Info("Every change is saved as soon as you make it."));
+            items.push_back(Info("Open this menu with F1, or L3 + R3 on a controller."));
+            break;
         case Page::Rooms:
             BuildRooms(items);
             break;
         case Page::Password: {
-            items.push_back(Info("ROOM: " + Plain(pending_.name), 1));
+            items.push_back(Info("Room: " + Plain(pending_.name), 1));
             items.push_back(TextField("Password", &join_password_, 32, true));
             items.push_back(Action("Join", [this] {
                 JoinRoom(pending_.address, pending_.port, join_password_);
                 join_password_.clear();
-                page_ = Page::Online;
-            }));
+                SetPage(Page::Online);
+            }, "Join"));
             break;
         }
         default: break;
         }
+        for (Item& i : items) {
+            if (i.help.empty()) i.help = HelpFor(i.id);
+        }
         return items;
-    }
-
-    static std::string StatusName(const mh4n::rooms::Status& st) {
-        using mh4n::rooms::State;
-        return st.state == State::Idle ? "NOT IN A ROOM" : (st.state == State::Joining ? "JOINING" : "IN A ROOM");
     }
 
     void BuildOnline(std::vector<Item>& items) {
         using mh4n::rooms::State;
         const mh4n::rooms::Status st = mh4n::rooms::GetStatus();
         if (st.state == State::Joined || st.state == State::Moderator) {
-            items.push_back(Info("IN ROOM: " + Plain(st.room.name) + " (" + std::to_string(st.members.size()) + " MEMBERS)", 3));
+            items.push_back(Info("In room: " + Plain(st.room.name) + " (" + std::to_string(st.members.size()) + " members)", 3));
             std::string who;
             for (const auto& m : st.members) who += (who.empty() ? "" : ", ") + Plain(m.nickname);
             items.push_back(Info("  " + who));
         } else if (st.state == State::Joining) {
-            items.push_back(Info("JOINING " + Plain(st.host) + (st.waiting_for_console ? " (WAITING FOR THE GAME)" : "..."), 1));
+            items.push_back(Info("Joining " + Plain(st.host) + (st.waiting_for_console ? " (waiting for the game)" : "..."), 1));
         } else if (st.error != mh4n::rooms::Error::None) {
-            items.push_back(Info(std::string("NOT IN A ROOM: ") + mh4n::rooms::ErrorMessage(st.error), 4));
+            items.push_back(Info(std::string("Not in a room: ") + mh4n::rooms::ErrorMessage(st.error), 4));
         } else {
-            items.push_back(Info("NOT IN A ROOM"));
+            items.push_back(Info("Not in a room."));
         }
-        if (st.hosting) items.push_back(Info("HOSTING ON UDP PORT " + std::to_string(st.hosted_port) + " (OPEN IT ON YOUR ROUTER)", 3));
+        if (st.hosting) items.push_back(Info("Hosting on UDP port " + std::to_string(st.hosted_port) + " (open it on your router)", 3));
         items.push_back(TextField("Nickname", &nick_, 20, false, [this] { host_.apply("nick", nick_); }));
         {
-            Item i;
-            i.kind = Item::Link;
-            i.label = "Public rooms >";
-            i.id = i.label;
-            i.act = [this] {
-                page_ = Page::Rooms;
+            Item i = Action("Public rooms >", [this] {
+                SetPage(Page::Rooms);
                 StartFetch(false);
-            };
+            }, "Open");
             items.push_back(i);
         }
         items.push_back(TextField("Address HOST:PORT", &addr_, 64, false, [this] { host_.apply("join_address", addr_); }));
@@ -746,47 +919,48 @@ private:
                 host.resize(colon);
             }
             if (host.empty() || port == 0 || port > 65535) {
-                Say("TYPE THE ADDRESS AS HOST:PORT");
+                Say("Type the address as HOST:PORT.");
                 return;
             }
             JoinRoom(host, static_cast<std::uint16_t>(port), password_);
-        }));
+        }, "Join"));
         items.push_back(TextField("Host port (UDP)", &host_port_, 5, false, [this] { host_.apply("host_port", host_port_); }));
         items.push_back(TextField("Host password", &host_password_, 32, true));
-        items.push_back(Action(st.hosting ? "Close the room I host" : "Host a room", [this, hosting = st.hosting] {
-            if (hosting) {
-                mh4n::rooms::Leave();
-                mh4n::rooms::CloseRoom();
-                Say("ROOM CLOSED");
-                return;
-            }
-            const int port = std::atoi(host_port_.c_str());
-            if (port <= 0 || port > 65535 || !mh4n::rooms::ValidNickname(nick_)) {
-                Say(mh4n::rooms::ValidNickname(nick_) ? "THE PORT MUST BE 1 TO 65535" : "NICKNAME: 4 TO 20 LETTERS, DIGITS, SPACE . _ -");
-                return;
-            }
-            mh4n::rooms::HostRequest room;
-            room.port = static_cast<std::uint16_t>(port);
-            room.name = "Caravan4URecomp room";
-            room.slots = 16;
-            room.password = host_password_;
-            room.host_username = nick_;
-            std::string error;
-            if (!mh4n::rooms::Host(room, &error)) {
-                Say(error);
-                return;
-            }
-            JoinRoom("127.0.0.1", room.port, host_password_);
-            Say("HOSTING: OTHERS JOIN YOUR PUBLIC IP, PORT " + std::to_string(port));
-        }));
+        {
+            Item host = Action(st.hosting ? "Close the room I host" : "Host a room", [this, hosting = st.hosting] {
+                if (hosting) {
+                    mh4n::rooms::Leave();
+                    mh4n::rooms::CloseRoom();
+                    Say("Room closed.");
+                    return;
+                }
+                const int port = std::atoi(host_port_.c_str());
+                if (port <= 0 || port > 65535 || !mh4n::rooms::ValidNickname(nick_)) {
+                    Say(mh4n::rooms::ValidNickname(nick_) ? "The port must be 1 to 65535." : "Nickname: 4 to 20 letters, digits, spaces, dots, underscores or dashes.");
+                    return;
+                }
+                mh4n::rooms::HostRequest room;
+                room.port = static_cast<std::uint16_t>(port);
+                room.name = "Caravan4URecomp room";
+                room.slots = 16;
+                room.password = host_password_;
+                room.host_username = nick_;
+                std::string error;
+                if (!mh4n::rooms::Host(room, &error)) {
+                    Say(error);
+                    return;
+                }
+                JoinRoom("127.0.0.1", room.port, host_password_);
+                Say("Hosting: others join your public IP address, port " + std::to_string(port) + ".");
+            }, st.hosting ? "Close" : "Host");
+            host.id = "host";
+            items.push_back(host);
+        }
         items.push_back(Action("Leave the room", [this] {
             mh4n::rooms::Leave();
-            Say("LEFT THE ROOM");
-        }));
-        for (Item& i : items) {
-            if (i.label == "Host a room" || i.label == "Close the room I host") i.id = "host";
-        }
-        items.push_back(Info("THEN, IN THE GAME: GATHERING HALL > LOCAL PLAY"));
+            Say("Left the room.");
+        }, "Leave"));
+        items.push_back(Info("Then, in the game: Gathering Hall, Local Play."));
     }
 
     void StartFetch(bool force) {
@@ -809,33 +983,35 @@ private:
     void BuildRooms(std::vector<Item>& items) {
         std::shared_ptr<Fetch> fetch = fetch_;
         std::lock_guard lock(fetch->mutex);
-        Item refresh = Action(fetch->busy ? "Refreshing..." : "Refresh the list", [this] { StartFetch(true); });
+        Item refresh = Action(fetch->busy ? "Refreshing..." : "Refresh the list", [this] { StartFetch(true); }, "Refresh");
         refresh.id = "refresh";
         items.push_back(refresh);
         if (fetch->busy && !fetch->fetched) {
-            items.push_back(Info("LOADING THE LIST OF ROOMS...", 1));
+            items.push_back(Info("Loading the list of rooms...", 1));
             return;
         }
         if (!fetch->list.ok) {
             items.push_back(Info(Plain(fetch->list.error), 4));
             return;
         }
-        items.push_back(Info("* = SET UP FOR MH4U   (P) = PASSWORD   YOU NEED MH4U USA 1.3.0"));
+        items.push_back(Info("Rooms for MH4U come first. You need MH4U USA 1.3.0."));
         for (const mh4n::rooms::LobbyRoom& room : fetch->list.rooms) {
             Item i;
             i.kind = Item::Action;
-            i.label = std::string(room.preferred ? "*" : " ") + (room.password ? "(P) " : "    ") +
-                      std::to_string(room.players.size()) + "/" + std::to_string(room.max_players) + " " + Plain(room.name);
+            i.room = true;
+            i.label = Plain(room.name);
+            i.value = std::to_string(room.players.size()) + "/" + std::to_string(room.max_players) + (room.password ? "  (password)" : "");
             i.color = room.preferred ? 0 : 2;
             i.id = room.address + ":" + std::to_string(room.port) + room.name;
+            i.help = "Joins this room. Rooms with a password ask for it first.";
             i.act = [this, room] {
                 if (room.password) {
                     pending_ = room;
                     join_password_.clear();
-                    page_ = Page::Password;
+                    SetPage(Page::Password);
                 } else {
                     JoinRoom(room.address, room.port, "");
-                    page_ = Page::Online;
+                    SetPage(Page::Online);
                 }
             };
             items.push_back(i);
@@ -844,7 +1020,7 @@ private:
 
     void JoinRoom(const std::string& host, std::uint16_t port, const std::string& password) {
         if (!mh4n::rooms::ValidNickname(nick_)) {
-            Say("NICKNAME: 4 TO 20 LETTERS, DIGITS, SPACE . _ -");
+            Say("Nickname: 4 to 20 letters, digits, spaces, dots, underscores or dashes.");
             return;
         }
         mh4n::rooms::JoinRequest request;
@@ -856,7 +1032,7 @@ private:
         if (!mh4n::rooms::Join(request, &error)) {
             Say(error);
         } else {
-            Say("JOINING " + host + ":" + std::to_string(port) + "...");
+            Say("Joining " + host + ":" + std::to_string(port) + "...");
         }
     }
 
@@ -885,17 +1061,91 @@ private:
         if (!items.empty()) id = items[static_cast<std::size_t>(sel)].id;
     }
 
+    static std::string Capital(std::string s) {
+        if (!s.empty()) s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+        return s;
+    }
+
     // ---- the picture -----------------------------------------------------------------------------------------------------
-    std::vector<Line> Render() {
-        static const char* const kTitles[] = {"SETTINGS", "GRAPHICS", "GAME", "AUDIO", "ONLINE", "PUBLIC ROOMS", "ROOM PASSWORD"};
+    // The page as the look draws it (a View) and, for when that can't be drawn, as plain lines of text.
+    void Render(std::vector<Line>* out_lines, View* out_view) {
+        static const char* const kTitles[] = {"Graphics", "Game", "Audio", "Online", "System", "Public rooms", "Room password"};
         std::vector<Item> items = Build();
         SyncSelection(items);
         const int sel = sel_[static_cast<int>(page_)];
+        const auto now = std::chrono::steady_clock::now();
+
+        View view;
+        view.open = true;
+        view.title = kTitles[static_cast<int>(page_)];
+        for (int t = 0; t < kTabCount; ++t) view.tabs.push_back(kTabNames[t]);
+        view.tab = TabOf(page_);
+        view.sel = sel;
+        view.hover_tab = hover_tab_;
+        view.hover_row = hover_row_;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            const Item& item = items[i];
+            ViewRow r;
+            r.label = item.label;
+            r.help = item.help;
+            r.selected = static_cast<int>(i) == sel && item.Selectable();
+            switch (item.kind) {
+            case Item::Info:
+                r.kind = ViewRow::Info;
+                r.color = item.color;
+                break;
+            case Item::Choice:
+                if (item.toggle) {
+                    r.kind = ViewRow::Toggle;
+                    r.on = item.on;
+                    r.value = item.on ? "On" : "Off";
+                } else if (item.slider) {
+                    r.kind = ViewRow::Slider;
+                    r.frac = item.frac;
+                    r.value = item.value + (item.id == "volume" || item.id == "popup_size" ? "%" : "");
+                } else {
+                    r.kind = ViewRow::Choice;
+                    r.value = Capital(item.value);
+                }
+                if (item.restart) r.label += " *";
+                break;
+            case Item::Action:
+            case Item::Link:
+                if (item.room) {
+                    r.kind = ViewRow::Room;
+                    r.value = item.value;
+                    r.enabled = item.color != 2;
+                } else {
+                    r.kind = ViewRow::Button;
+                    r.value = item.cap;
+                }
+                break;
+            case Item::Text: {
+                r.kind = ViewRow::Text;
+                std::string shown = *item.target;
+                if (item.secret) shown.assign(shown.size(), '*');
+                r.value = shown;
+                r.caret = edit_ == item.target;
+                break;
+            }
+            }
+            view.rows.push_back(std::move(r));
+        }
+        if (!restart_.empty()) {
+            std::string what;
+            for (const std::string& r : restart_) what += (what.empty() ? "" : ", ") + Plain(r);
+            view.notice = "Waiting for a restart of the game: " + what + ".";
+        }
+        if (now < message_until_) view.message = message_;
+        view_ = view;
+
+        // the plain version: one line a row, as the first look of the menu
         std::vector<Line> lines;
-        row_item_.assign(2, -1);
-        lines.push_back({std::string("CARAVAN4URECOMP - ") + kTitles[static_cast<int>(page_)], 1, false});
-        lines.push_back({"", 0, false});
-        const int rows = kMaxRows - 6;  // title, gap, gap, restart note, message, hint
+        std::string tabs_line;
+        for (int t = 0; t < kTabCount; ++t) tabs_line += (t == view.tab ? "[" : " ") + std::string(kTabNames[t]) + (t == view.tab ? "]" : " ");
+        lines.push_back({"CARAVAN4URECOMP - " + view.title, 1, false});
+        lines.push_back({tabs_line + "   (Q / E: pages)", 2, false});
+        const int rows = kMaxRows - 7;
         const int n = static_cast<int>(items.size());
         const int first = std::clamp(sel - rows / 2, 0, std::max(0, n - rows));
         for (int i = first; i < std::min(n, first + rows); ++i) {
@@ -913,26 +1163,21 @@ private:
                 if (item.secret) shown.assign(shown.size(), '*');
                 if (edit_ == item.target && selected) shown += "_";
                 text = label + shown;
+            } else if (item.room) {
+                text = item.label + "  " + item.value;
             } else {
                 text = item.label;
             }
             lines.push_back({Plain(text), selected ? 0 : item.color, selected});
-            row_item_.push_back(i);
         }
-        row_item_.resize(lines.size() + 4, -1);
         lines.push_back({"", 0, false});
-        if (!restart_.empty()) {
-            std::string what;
-            for (const std::string& r : restart_) what += (what.empty() ? "" : ", ") + r;
-            lines.push_back({"PENDING A RESTART OF THE GAME: " + Plain(what), 1, false});
-        }
-        const auto now = std::chrono::steady_clock::now();
-        lines.push_back({now < message_until_ ? Plain(message_) : "", 1, false});
+        if (!view.notice.empty()) lines.push_back({Plain(view.notice), 1, false});
+        lines.push_back({Plain(view.message), 1, false});
         lines.push_back({edit_ != nullptr ? "ENTER/A: OK  ESC/B: CANCEL  PAD: UP/DN=LETTER R=ADD L=DEL"
                                           : "ARROWS/DPAD/MOUSE: MOVE  ENTER/A/CLICK: OK  ESC/B/RCLICK: BACK",
                          2, false});
-        line_count_ = lines.size();
-        return lines;
+        *out_lines = std::move(lines);
+        *out_view = std::move(view);
     }
 };
 
