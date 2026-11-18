@@ -42,6 +42,7 @@ struct View {
     int tab = 0;
     std::vector<ViewRow> rows;
     int sel = -1;                    // the marked row, or -1
+    int scroll = -1;                 // first row shown when the wheel scrolled the list (-1: follow the marked row)
     int hover_tab = -1, hover_row = -1;
     std::string notice;              // settings that wait for a restart
     std::string message;             // the last thing the menu said
@@ -63,7 +64,7 @@ struct Layout {
 };
 Layout LayoutOf(float width, float height);
 // How many rows fit, and the first one shown so that the marked one is in view.
-void WindowOf(const Layout& layout, std::size_t total, int sel, int* first, int* fit);
+void WindowOf(const Layout& layout, std::size_t total, int sel, int* first, int* fit, int scroll = -1);
 
 // The first start's screen: choosing the two files of the game, then the progress of building the code library for this PC.
 // Every text is already in the language.

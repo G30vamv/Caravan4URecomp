@@ -48,7 +48,21 @@ inline fs::path FindModRoot(const fs::path& dir, int depth = 3) {
         if (e.is_directory(de)) subs.push_back(e.path());
     }
     if (subs.size() == 1) return FindModRoot(subs[0], depth - 1);
-    return {};
+    // Emulator-style packages hold one folder per title id (0004000000126300 = the game, 0004000E00126300 = its update):
+    // the update's files are the ones that apply on top of the game as this program runs it, so take that one.
+    auto is_title_id = [](const fs::path& p) {
+        const std::string n = p.filename().string();
+        return n.size() == 16 && std::all_of(n.begin(), n.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+    };
+    fs::path game_folder;
+    for (const fs::path& sub : subs) {
+        if (!is_title_id(sub) || !LooksLikeMod(sub)) continue;
+        std::string n = sub.filename().string();
+        for (char& c : n) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (n.rfind("0004000E", 0) == 0) return sub;
+        game_folder = sub;
+    }
+    return game_folder;
 }
 
 inline std::string SafeName(std::string name) {

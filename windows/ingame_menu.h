@@ -488,10 +488,21 @@ public:
                 return;
             }
             break;
-        case SDL_EVENT_MOUSE_WHEEL:
+        case SDL_EVENT_MOUSE_WHEEL: {
+            // MODIFIED: the wheel scrolls the list (3 rows a notch) without moving the marked row; any key or pad move
+            // goes back to following the marked row.
             if (e.wheel.integer_y == 0) return;
-            act.move = e.wheel.integer_y > 0 ? -1 : 1;
-            break;
+            const int total = static_cast<int>(view_.rows.size());
+            float density = 1.0f;
+            const Layout l = CurrentLayout(window, &density);
+            int first = 0, fit = 1;
+            WindowOf(l, view_.rows.size(), view_.sel, &first, &fit, scroll_);
+            if (total <= fit) return;
+            scroll_ = std::clamp(first - e.wheel.integer_y * 3, 0, total - fit);
+            hover_row_ = -1;
+            dirty_ = true;
+            return;
+        }
         default:
             return;
         }
@@ -566,7 +577,7 @@ private:
         }
         if (!l.rows.Contains(px, py)) return hit;
         int first = 0, fit = 1;
-        WindowOf(l, view_.rows.size(), view_.sel, &first, &fit);
+        WindowOf(l, view_.rows.size(), view_.sel, &first, &fit, view_.scroll);
         const int slot = static_cast<int>((py - l.rows.y0) / l.row_h);
         const int index = first + slot;
         if (slot < 0 || slot >= fit || index < 0 || index >= static_cast<int>(view_.rows.size())) return hit;
@@ -597,12 +608,14 @@ private:
 
     void SetPage(Page page) {
         page_ = page;
+        scroll_ = -1;
         hover_row_ = -1;
         dirty_ = true;
     }
 
     void Do(const Act& a, SDL_Window* window) {
         dirty_ = true;
+        if (a.move != 0 || a.change != 0 || a.enter || a.tab >= 0) scroll_ = -1;
         if (edit_ != nullptr) {  // typing into a field
             static const std::string kLetters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .:-_";
             if (a.pad) {
@@ -690,6 +703,7 @@ private:
     bool l3_ = false, r3_ = false;  // the stick clicks held: both open and close the menu
     int dpad_move_ = 0, dpad_change_ = 0, stick_move_ = 0, stick_change_ = 0;
     Uint64 next_repeat_ms_ = 0;
+    int scroll_ = -1;               // first row shown after a wheel scroll (-1: follow the marked row)
     int drag_ = -1;                 // the slider (an item's index) the mouse holds
     int hover_tab_ = -1, hover_row_ = -1;
     View view_;                     // what the last frame of the menu showed (the mouse reads its layout)
@@ -1450,6 +1464,7 @@ private:
         view.keys = {{"A", Tr("Accept  (Enter)")}, {"B", Tr("Back  (Esc)")}, {"LB RB", Tr("Pages  (Q / E)")}, {"L3 R3", Tr("Close  (F1)")}};
         view.tab = TabOf(page_);
         view.sel = sel;
+        view.scroll = scroll_;
         view.hover_tab = hover_tab_;
         view.hover_row = hover_row_;
         for (std::size_t i = 0; i < items.size(); ++i) {

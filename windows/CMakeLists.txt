@@ -31,7 +31,20 @@ extern const unsigned int kCinzelTtfSize = ${CINZEL_SIZE};
 ")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CINZEL_TTF}")
 
-add_executable(mh4u-win WIN32 win_main.cpp menu_gui.cpp imgui_vulkan_backend.cpp "${CINZEL_CPP}")
+# the program's icon (app.rc): when the resource compiler is there (llvm-mingw has llvm-windres)
+include(CheckLanguage)
+check_language(RC)
+set(APP_ICON_RC "")
+if(CMAKE_RC_COMPILER)
+    enable_language(RC)
+    set(APP_ICON_RC "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/caravan4u.ico")
+else()
+    message(WARNING "no resource compiler found: the program will have no icon")
+endif()
+
+add_executable(mh4u-win WIN32 win_main.cpp menu_gui.cpp imgui_vulkan_backend.cpp "${CINZEL_CPP}" ${APP_ICON_RC})
+set_source_files_properties(app.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/caravan4u.ico")
 set_target_properties(mh4u-win PROPERTIES OUTPUT_NAME Caravan4URecomp)  # Caravan4URecomp.exe
 target_link_libraries(mh4u-win PRIVATE mh4n::app mh4n_warnings SDL3::SDL3 mh4n_imgui iphlpapi ws2_32)
 # the swapchain, present and screen_layout headers are included as "swapchain/..."; screen_layout.h includes the port's platform.h

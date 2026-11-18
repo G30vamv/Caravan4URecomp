@@ -70,9 +70,9 @@ SetupLayout SetupLayoutOf(float sw, float sh) {
     return s;
 }
 
-void WindowOf(const Layout& l, std::size_t total, int sel, int* first, int* fit) {
+void WindowOf(const Layout& l, std::size_t total, int sel, int* first, int* fit, int scroll) {
     const int f = std::max(1, static_cast<int>(std::floor(l.rows.H() / l.row_h)));
-    int start = sel < f ? 0 : sel + 1 - f;
+    int start = scroll >= 0 ? scroll : (sel < f ? 0 : sel + 1 - f);
     start = std::min(start, std::max(0, static_cast<int>(total) - f));
     *first = std::max(0, start);
     *fit = f;
@@ -522,7 +522,7 @@ private:
 
         // rows
         int first = 0, fit = 1;
-        WindowOf(l, view.rows.size(), view.sel, &first, &fit);
+        WindowOf(l, view.rows.size(), view.sel, &first, &fit, view.scroll);
         const float label_x = l.rows.x0 + 26.0f * u;
         const float value_left = l.rows.x0 + l.rows.W() * 0.50f;
         const float value_right = l.rows.x1 - 18.0f * u;

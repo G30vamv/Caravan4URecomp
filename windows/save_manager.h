@@ -41,11 +41,27 @@ struct Tree {
     std::uint64_t signature = 0;  // size and write time of every file, mixed: the same saves give the same number
 };
 
+// Paths past the old 260-character limit (a deep install folder plus the saves' own depth) need the \?\ prefix, or the
+// copy fails with "The filename or extension is too long" and no backup is made.
+inline fs::path Long(const fs::path& p) {
+#if defined(_WIN32)
+    std::error_code ec;
+    fs::path abs = fs::absolute(p, ec);
+    if (ec) return p;
+    const std::wstring w = abs.make_preferred().wstring();
+    if (w.rfind(LR"(\\?\)", 0) == 0) return abs;
+    if (w.size() < 2 || w[1] != L':') return abs;
+    return fs::path(std::wstring(LR"(\\?\)") + w);
+#else
+    return p;
+#endif
+}
+
 inline Tree Measure(const fs::path& root) {
     Tree t;
     std::error_code ec;
-    if (!fs::is_directory(root, ec)) return t;
-    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end; it != end; it.increment(ec)) {
+    if (!fs::is_directory(Long(root), ec)) return t;
+    for (fs::recursive_directory_iterator it(Long(root), fs::directory_options::skip_permission_denied, ec), end; it != end; it.increment(ec)) {
         if (ec) break;
         std::error_code fe;
         if (!it->is_regular_file(fe) || it->path().filename().string().rfind('.', 0) == 0) continue;  // (a backup's .signature is not a save)
@@ -119,8 +135,8 @@ inline std::vector<Backup> List(const fs::path& user) {
 
 inline bool CopyFolder(const fs::path& from, const fs::path& to, std::string* error) {
     std::error_code ec;
-    fs::create_directories(to.parent_path(), ec);
-    fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    fs::create_directories(Long(to.parent_path()), ec);
+    fs::copy(Long(from), Long(to), fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
     if (ec) {
         if (error) *error = ec.message();
         return false;
@@ -144,7 +160,7 @@ inline std::string MakeBackup(const fs::path& user, const std::string& label, st
     for (const char* f : kFolders) {
         if (!fs::is_directory(user / f, ec)) continue;
         if (!CopyFolder(user / f, target / f, error)) {
-            fs::remove_all(target, ec);
+            fs::remove_all(Long(target), ec);
             return {};
         }
     }
@@ -177,7 +193,7 @@ inline std::string AutoBackup(const fs::path& user, int keep) {
         if (b.label != "auto") continue;
         if (++seen > keep) {
             std::error_code ec;
-            fs::remove_all(BackupsFolder(user) / b.name, ec);
+            fs::remove_all(Long(BackupsFolder(user) / b.name), ec);
         }
     }
     return "backed up the saves as " + name;
@@ -186,7 +202,7 @@ inline std::string AutoBackup(const fs::path& user, int keep) {
 inline bool Delete(const fs::path& user, const std::string& name) {
     if (name.empty() || name.find_first_of("\\/") != std::string::npos || name[0] == '.') return false;
     std::error_code ec;
-    return fs::remove_all(BackupsFolder(user) / name, ec) > 0 && !ec;
+    return fs::remove_all(Long(BackupsFolder(user) / name), ec) > 0 && !ec;
 }
 
 // ---- putting one back: asked for now, done at the next start ----
@@ -227,7 +243,7 @@ inline std::string ApplyPendingRestore(const fs::path& user) {
         return "the saves now could not be backed up (" + error + "): nothing was restored";
     }
     for (const char* f : kFolders) {
-        fs::remove_all(user / f, ec);
+        fs::remove_all(Long(user / f), ec);
         if (fs::is_directory(from / f, ec) && !CopyFolder(from / f, user / f, &error)) return "restoring failed: " + error;
     }
     return "restored the saves of " + name;

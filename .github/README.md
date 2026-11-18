@@ -1,3 +1,5 @@
+<p align="center"><img src="icon.png" alt="Caravan4URecomp icon" width="160"></p>
+
 # Caravan4URecomp
 
 **Monster Hunter 4 Ultimate on Windows, running natively through Vulkan.**
@@ -36,7 +38,7 @@ I'd rather be upfront about what I have actually tested.
 
 ## Getting it
 
-The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.3.0**, tagged `windows-v0.3.0`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.3.1**, tagged `windows-v0.3.1`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
@@ -183,7 +185,7 @@ alrededor de ese runtime.
 funciona con teclado, ratón y mando, y entré a una sala pública real de Azahar desde el menú del juego. Todavía no he
 probado Local Play con otras personas, otras GPU, Windows 10 ni MSVC.
 
-**Cómo se usa:** la última versión es la 0.3.0, en la página de Releases (con su suma SHA-256). Abre `Caravan4URecomp.exe`: la
+**Cómo se usa:** la última versión es la 0.3.1, en la página de Releases (con su suma SHA-256). Abre `Caravan4URecomp.exe`: la
 primera vez pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con
 **F1** o **L3 + R3**, y tiene gráficos, juego, audio y online. Online usa las mismas salas que Azahar: menú → Online →
 **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.

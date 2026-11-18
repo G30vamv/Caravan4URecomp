@@ -1,0 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by
+// khorne-hub (https://github.com/khorne-hub/4u-native); see ADDITIONAL-TERMS and THIRD_PARTY_NOTICES.
+//
+// The program's icon (original art by the Caravan4URecomp contributors, see assets/caravan4u.svg). Resource 1 is the icon SDL
+// gives the window and the taskbar, and the one Explorer shows for the program.
+1 ICON "assets/caravan4u.ico"
