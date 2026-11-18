@@ -1759,11 +1759,12 @@ TEST_CASE("PreloadLibraryApplet makes the applet and marks it loaded, and the fl
 TEST_CASE("every other library or system applet id answers as the default case of Azahar's CreateHLEApplet: "
           "0xD8C0CFFA, and nothing is left behind") {
     // The ids of Azahar's AppletId that its HLE does not make (the keyboard 0x201/0x401, the Mii selector
-    // 0x202/0x402, the error applet 0x206/0x406 and the Mint applet 0x207/0x407 are made), and ids that are
+    // 0x202/0x402, the error applet 0x206/0x406 and the Mint applet 0x207/0x407 are made; so are the Extrapad applet's
+    // 0x208/0x408 in the Windows port (MODIFIED 2026-11-17: Azahar does not make them)), and ids that are
     // not applets at all.
     const std::vector<u32> ids = {0x000, 0x100, 0x101, 0x103, 0x110, 0x112, 0x113, 0x114, 0x115, 0x116,
-                                  0x117, 0x118, 0x119, 0x200, 0x204, 0x205, 0x208, 0x209, 0x300, 0x301,
-                                  0x400, 0x404, 0x405, 0x408, 0x409, 0xF00, 0x999};
+                                  0x117, 0x118, 0x119, 0x200, 0x204, 0x205, 0x209, 0x300, 0x301,
+                                  0x400, 0x404, 0x405, 0x409, 0xF00, 0x999};
     Fixture f;
     TempDir dir;
     std::vector<Result> prepare;

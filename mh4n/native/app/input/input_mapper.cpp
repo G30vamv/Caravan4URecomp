@@ -1,3 +1,4 @@
+// MODIFIED for the Windows port (2026-11-17, G30vamv and the Caravan4URecomp contributors): SetPadBind and ClearPadBinds.
 #include "input/input_mapper.h"
 
 #include <algorithm>
@@ -133,6 +134,8 @@ struct InputMapper::Impl {
     // controllers
     std::vector<Pad> pads;
     std::optional<std::int32_t> picked;  ///< the controller the default binds read
+    /// (the Windows port) a bind chosen by the player for a 3DS button, in place of the default one
+    std::array<std::optional<rules::PadBind>, App::Button::Count> pad_override;
 
     // keys
     std::bitset<kCodeCount> held;
@@ -370,7 +373,7 @@ struct InputMapper::Impl {
                 macro.code = App::Input::MACRO_KEY + i;
                 binding.sources.push_back(macro);
                 // (the Guide button, Azahar's HOME, opens the app's menu: it is never a bind here)
-                const rules::PadBind bind = rules::DefaultButtonBind(i);
+                const rules::PadBind bind = pad_override[idx] ? *pad_override[idx] : rules::DefaultButtonBind(i);
                 if (picked && bind.kind != rules::PadBind::Kind::None) {
                     Source pad;
                     pad.kind = bind.kind == rules::PadBind::Kind::Button ? Source::Kind::PadButton
@@ -766,6 +769,25 @@ struct InputMapper::Impl {
 InputMapper::InputMapper(IGamepadLayer* pads) : impl_(std::make_unique<Impl>(*this, pads)) {}
 
 InputMapper::~InputMapper() = default;
+
+void InputMapper::SetPadBind(int app_button, int kind, int index, bool greater) {
+    if (app_button < 0 || app_button >= App::Button::Count) {
+        return;
+    }
+    rules::PadBind bind;
+    bind.kind = kind == 1 ? rules::PadBind::Kind::Button : kind == 2 ? rules::PadBind::Kind::Axis : rules::PadBind::Kind::None;
+    bind.index = index;
+    bind.greater = greater;
+    impl_->pad_override[static_cast<std::size_t>(app_button)] = bind;
+    impl_->BuildBindings();
+    impl_->Recompute();
+}
+
+void InputMapper::ClearPadBinds() {
+    impl_->pad_override.fill(std::nullopt);
+    impl_->BuildBindings();
+    impl_->Recompute();
+}
 
 void InputMapper::Configure(const App::Config& config) {
     impl_->Configure(config);

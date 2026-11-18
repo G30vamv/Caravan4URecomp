@@ -29,6 +29,9 @@
 #include "config.h"
 #include "gpu/backend/rhi.h"
 #include "gpu/backend/vulkan_access.h"
+#include "mod_manager.h"
+#include "save_manager.h"
+#include "input/azahar_rules.h"
 #include "input/input_mapper.h"
 #include "input_live/live_input.h"
 #include "mh4n/options.h"
@@ -1114,7 +1117,34 @@ int main(int argc, char** argv) {
         input_config.input_mode = mouse_camera ? "keyboard_mouse" : "controller";
         mapper.Configure(input_config);
     };
+    // The controls the player changed in the menu: for each 3DS button of ingame::kBindNames, a key (settings key_<name>:
+    // an SDL key name, empty = the default keys) and a controller bind (pad_<name>: b<n> a button, a<n>+ or a<n>- an axis,
+    // none, empty = the default).
+    static const int kBindIds[ingame::kBindCount] = {App::Button::A,    App::Button::B,    App::Button::X,    App::Button::Y,
+                                                     App::Button::L,    App::Button::R,    App::Button::ZL,   App::Button::ZR,
+                                                     App::Button::Start, App::Button::Select, App::Button::Up, App::Button::Down,
+                                                     App::Button::Left, App::Button::Right};
+    const App::Config default_input = App::Defaults();
+    const auto bind_setting = [&](int i, const char* what) { return ini.Get(std::string(what) + "_" + ingame::Lower(ingame::kBindNames[i])); };
+    const auto apply_binds = [&] {
+        mapper.ClearPadBinds();
+        for (int i = 0; i < ingame::kBindCount; ++i) {
+            const auto id = static_cast<std::size_t>(kBindIds[i]);
+            const std::string key = bind_setting(i, "key");
+            input_config.keys[id] = key.empty() ? default_input.keys[id] : key;
+            const std::string pad = bind_setting(i, "pad");
+            if (pad == "none") {
+                mapper.SetPadBind(kBindIds[i], 0, -1, true);
+            } else if (pad.size() >= 2 && pad[0] == 'b') {
+                mapper.SetPadBind(kBindIds[i], 1, std::atoi(pad.c_str() + 1), true);
+            } else if (pad.size() >= 3 && pad[0] == 'a' && (pad.back() == '+' || pad.back() == '-')) {
+                mapper.SetPadBind(kBindIds[i], 2, std::atoi(pad.c_str() + 1), pad.back() == '+');
+            }
+        }
+        mapper.Configure(input_config);
+    };
     apply_mouse_mode();
+    apply_binds();
     mapper.on_state = [log_input](const mh4n::InputState& state) {
         if (log_input) {
             std::fprintf(stderr, "mh4u-win: input buttons 0x%08x\n", static_cast<unsigned>(state.buttons));
@@ -1123,7 +1153,22 @@ int main(int argc, char** argv) {
     };
 
     std::thread game_thread;
+    const auto user_folder = [&]() -> std::string {  // the --user of the game's arguments ("" when none)
+        for (std::size_t i = 0; i + 1 < game_args.size(); ++i) {
+            if (game_args[i] == "--user") return game_args[i + 1];
+        }
+        return {};
+    };
+    const auto user_path = [&] { return std::filesystem::path(WideFromUtf8(user_folder())); };
     const auto start_game = [&] {
+        if (!user_folder().empty()) {  // the saves: a restore that was asked for, then a backup of them as they are
+            const std::string restored = savemgr::ApplyPendingRestore(user_path());
+            if (!restored.empty()) std::printf("mh4u-win: saves: %s\n", restored.c_str());
+            for (const std::string& n : modmgr::DisableCodeMods(user_folder())) {
+                std::printf("mh4u-win: mods: %s changes the game's code, which this program can't use: turned off\n", n.c_str());
+            }
+            if (ini.Get("auto_backup") != "off") std::printf("mh4u-win: saves: %s\n", savemgr::AutoBackup(user_path(), 5).c_str());
+        }
         // crash files in <user>/log/crash-<pid>.txt (installed before Boot, so that the memory module's fault handler
         // chains to it)
         for (std::size_t i = 0; i + 1 < game_args.size(); ++i) {
@@ -1151,6 +1196,14 @@ int main(int argc, char** argv) {
         const std::string scale_arg = scale_value == "auto" ? std::to_string(std::clamp((pixel_h + 120) / 240, 1, 8))
                                                            : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 8));
         give("--scale", scale_arg.c_str());
+        {   // Every emulated VBlank reads the two scaled screens back (CPU copy), so the VBlank rate (= an fps cap above 60) is
+            // limited by how many pixels that is: ~1e9 pixels a second were measured to be fine on this PC; 2000 reads a second
+            // of 3.4 MB (fps unlimited at 3x) starved the game thread and the picture stayed black. Never below 60.
+            const int s = std::atoi(scale_arg.c_str());
+            const int max_hz = std::max(60, static_cast<int>(1.0e9 / (172800.0 * s * s)));
+            args.emplace_back("--set");
+            args.emplace_back("0:max_refresh=" + std::to_string(max_hz));
+        }
         give("--volume", volume_value.c_str());  // the runner's own option of the SDL audio device (app/audio)  // internal resolution: the runner's default is the 3DS's own (1), which looks soft on a PC
         // the runner stops after 10 s of game time unless told otherwise; --frames alone means no time limit
         // (what the Android app does)
@@ -1237,9 +1290,46 @@ int main(int argc, char** argv) {
             return std::to_string(std::clamp((h + 120) / 240, 1, 8));
         }
         if (key == "lobby") return ini.Get("lobby").empty() ? "http://88.198.47.46:5000" : ini.Get("lobby");
+        if (key.rfind("bind:", 0) == 0) {  // "A button: its keys, and its controller's button"
+            const int i = std::atoi(key.c_str() + 5);
+            if (i < 0 || i >= ingame::kBindCount) return "";
+            const auto id = static_cast<std::size_t>(kBindIds[i]);
+            std::string keys = bind_setting(i, "key");
+            if (keys.empty()) keys = default_input.keys[id];
+            std::string pad = bind_setting(i, "pad");
+            std::string pad_text;
+            const auto pad_name = [](int kind, int index, bool greater) -> std::string {
+                static const char* const kButtons[] = {"Pad A", "Pad B", "Pad X", "Pad Y", "Back", "Guide", "Start", "L3", "R3", "LB", "RB", "Pad up", "Pad down", "Pad left", "Pad right"};
+                if (kind == 1) return index >= 0 && index < 15 ? kButtons[index] : "?";
+                if (kind == 2) {
+                    static const char* const kAxes[] = {"Left stick right", "Left stick left", "Left stick down", "Left stick up", "Right stick right", "Right stick left", "Right stick down", "Right stick up", "LT", "LT", "RT", "RT"};
+                    const int at = index * 2 + (greater ? 0 : 1);
+                    return index >= 0 && index < 6 ? kAxes[at] : "?";
+                }
+                return "none";
+            };
+            if (pad == "none") {
+                pad_text = "none";
+            } else if (pad.size() >= 2 && pad[0] == 'b') {
+                pad_text = pad_name(1, std::atoi(pad.c_str() + 1), true);
+            } else if (pad.size() >= 3 && pad[0] == 'a') {
+                pad_text = pad_name(2, std::atoi(pad.c_str() + 1), pad.back() == '+');
+            } else {
+                const mh4n::app::azahar::PadBind bind = mh4n::app::azahar::DefaultButtonBind(kBindIds[i]);
+                pad_text = pad_name(bind.kind == mh4n::app::azahar::PadBind::Kind::Button ? 1 : bind.kind == mh4n::app::azahar::PadBind::Kind::Axis ? 2 : 0,
+                                    bind.index, bind.greater);
+            }
+            return keys + "   |   " + pad_text;
+        }
         return ini.Get(key, key == "fps" || key == "steady" || key == "effects" ? "default" : "");
     };
     menu_host.apply = [&](const std::string& key, const std::string& value) {
+        if (key.rfind("key_", 0) == 0 || key.rfind("pad_", 0) == 0) {  // a control changed in the menu
+            ini.Set(key, value);
+            ini.Save();
+            apply_binds();
+            return;
+        }
         if (key == "fullscreen") {
             fullscreen = value == "on";
             SDL_SetWindowFullscreen(window, fullscreen);
@@ -1309,6 +1399,75 @@ int main(int argc, char** argv) {
             std::string out = text ? text : "";
             SDL_free(text);
             return out;
+        }
+        if (name == "save_info") {  // "files|MB"
+            const savemgr::Tree t = savemgr::MeasureSaves(user_path());
+            if (t.files == 0) return "";
+            char mb[32];
+            std::snprintf(mb, sizeof mb, "%.1f", static_cast<double>(t.bytes) / 1048576.0);
+            return std::to_string(t.files) + "|" + mb;
+        }
+        if (name == "save_list") {  // "name|stamp|label|MB" a line, the newest first
+            std::string out;
+            for (const savemgr::Backup& b : savemgr::List(user_path())) {
+                char mb[32];
+                std::snprintf(mb, sizeof mb, "%.1f", static_cast<double>(b.bytes) / 1048576.0);
+                out += b.name + "|" + b.stamp + "|" + (b.label.empty() ? "-" : b.label) + "|" + mb + "\n";
+            }
+            return out;
+        }
+        if (name == "save_pending") return savemgr::Pending(user_path());
+        if (name == "save_unstage") {
+            savemgr::CancelRestore(user_path());
+            return "";
+        }
+        if (name == "save_backup") {
+            std::string error;
+            const std::string made = savemgr::MakeBackup(user_path(), "", &error);
+            return made.empty() ? error : "Backed up as " + made;
+        }
+        if (name.rfind("save_stage:", 0) == 0) {
+            return savemgr::StageRestore(user_path(), name.substr(11)) ? "It will be put back the next time the game starts." : "That backup is not there.";
+        }
+        if (name.rfind("save_delete:", 0) == 0) {
+            return savemgr::Delete(user_path(), name.substr(12)) ? "The backup was deleted." : "The backup could not be deleted.";
+        }
+        if (name == "open_saves" || name == "open_backups" || name == "open_mods") {
+            if (user_folder().empty()) return "No user folder is set";
+            std::filesystem::path dir = user_path();
+            dir /= name == "open_saves" ? "sdmc" : name == "open_backups" ? "backups" : "load\\mods";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (!std::getenv("MH4U_TEST_SCRIPT")) ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return "The folder is open";
+        }
+        if (name == "mods_list") {  // "name|flags|on" a line, in load order (flags: r romfs, c code)
+            std::string out;
+            for (const auto& m : modmgr::List(user_folder())) {
+                out += m.name + "|" + (m.romfs ? "r" : "") + (m.code ? "c" : "") + "|" + (m.on ? "1" : "0") + "\n";
+            }
+            return out;
+        }
+        if (name.rfind("mods_set:", 0) == 0) {  // mods_set:<name>:<on|off>
+            const std::string rest = name.substr(9);
+            const std::size_t colon = rest.rfind(':');
+            if (colon != std::string::npos) modmgr::SetOn(user_folder(), rest.substr(0, colon), rest.substr(colon + 1) == "on");
+            return "";
+        }
+        if (name.rfind("mods_move:", 0) == 0) {  // mods_move:<name>:<-1|1>
+            const std::string rest = name.substr(10);
+            const std::size_t colon = rest.rfind(':');
+            if (colon != std::string::npos) modmgr::Move(user_folder(), rest.substr(0, colon), std::atoi(rest.c_str() + colon + 1));
+            return "";
+        }
+        if (name == "reset_controls") {
+            for (int i = 0; i < ingame::kBindCount; ++i) {
+                ini.Set("key_" + ingame::Lower(ingame::kBindNames[i]), "");
+                ini.Set("pad_" + ingame::Lower(ingame::kBindNames[i]), "");
+            }
+            ini.Save();
+            apply_binds();
+            return "Every control is back as it was.";
         }
         if (name == "open_textures") {  // <user>\load\textures, where the runtime reads HD texture packs from at start
             std::string user;
@@ -1482,7 +1641,11 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&event)) {
             const bool menu_open = menu.open;  // as the event found it
             if (setup_active) setup.OnEvent(event, window);
-            else if (!typing.active || menu.open) menu.OnEvent(event, window);
+            else if (event.type == SDL_EVENT_DROP_FILE && game && !user_folder().empty()) {
+                // a mod dropped on the window (a folder or a .zip): it is put in <user>\load\mods and the menu shows the Mods page
+                const std::string dropped = event.drop.data != nullptr ? event.drop.data : "";
+                menu.ShowMods(window, modmgr::Install(user_folder(), std::filesystem::path(WideFromUtf8(dropped))));
+            } else if (!typing.active || menu.open) menu.OnEvent(event, window);
             App::InputEvent input;
             if (ToInputEvent(event, input)) {
                 // While the game's keyboard is open the physical keyboard types (KeyboardTyping) and its keys press no

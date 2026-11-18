@@ -1,6 +1,8 @@
 // MODIFIED for the Windows port (2026-11-17, G30vamv and the Caravan4URecomp contributors): a count of the layout objects
 // drawn on the touch screen in the last frame (TouchScreenObjects), so that the port's shell can tell when the touch screen
-// has something on it. Nothing else of the file changes.
+// has something on it. Also (2026-11-17): the option max_refresh, a ceiling for the emulated VBlank rate (RefreshRate), so that
+// a very high fps cap does not make the display read back the scaled screens thousands of times a second.
+// Nothing else of the file changes.
 #include "hooks.h"
 
 #include "game_addr.h"
@@ -151,6 +153,8 @@ struct Options {
     // player's choice
     bool steady = false;
     float refresh_rate = 0; // refresh_rate / MH4U_REFRESH_RATE: emulated LCD Hz, 0 = the 3DS's
+    float max_refresh = 0;  // max_refresh: a ceiling for the emulated LCD Hz (the Windows shell sets it from the internal
+                            // scale: each VBlank reads the scaled screens back), 0 = none
                             // (or, with an fps above 60, that fps: see RefreshRate)
     float widescreen = 0;   // widescreen / MH4U_WIDESCREEN: top-screen aspect ratio, 0 = native
     bool widescreen_match = false;  // widescreen = match: the top screen takes the frontend's
@@ -336,6 +340,8 @@ void Set(Options& o, const std::string& key, const std::string& value) {
         o.steady = IsOn(value);
     } else if (key == "refresh_rate") {
         o.refresh_rate = std::max(0.0f, std::strtof(value.c_str(), nullptr));
+    } else if (key == "max_refresh") {
+        o.max_refresh = std::max(0.0f, std::strtof(value.c_str(), nullptr));
     } else if (key == "widescreen") {
         // match: the frontend passes its window's shape (Port::SetWindowSize) and Install
         // resolves it; the other values are the aspect ratio itself
@@ -506,10 +512,11 @@ Options LoadOptions(std::vector<std::string>& log) {
 /// (the game presents at most once per VBlank, so more frames need more VBlanks), else 0 (the
 /// 3DS's 59.83 Hz).
 float RefreshRate() {
-    if (options.refresh_rate > 0) {
-        return options.refresh_rate;
+    float hz = options.refresh_rate > 0 ? options.refresh_rate : options.fps_cap > 60.0f ? options.fps_cap : 0.0f;
+    if (hz > 0 && options.max_refresh > 0 && hz > options.max_refresh) {
+        hz = std::max(options.max_refresh, 60.0f);
     }
-    return options.fps_cap > 60.0f ? options.fps_cap : 0.0f;
+    return hz;
 }
 
 GameAddr SVC_SLEEP_THREAD{0x0010d934};  // nn::svc::SleepThread(s64 ns), r0:r1 (the limiter's own sleep)
@@ -3376,7 +3383,7 @@ bool SetOption(const std::string& key, const std::string& value) {
     }
     // the options the hooks read each time they run; the others are applied once at start-up
     static constexpr std::string_view live[] = {
-        "fps", "refresh_rate", "steady", "dither", "stereo_3d", "antialiasing", "fov", "render_flags_set", "render_flags_clear",
+        "fps", "refresh_rate", "max_refresh", "steady", "dither", "stereo_3d", "antialiasing", "fov", "render_flags_set", "render_flags_clear",
         "kick",
         "target", "skip", "skip_panel", "skip_hint", "skip_end", "skip_end_hold", "touch_overlay",
         "quest_overlay", "target_overlay",
@@ -3388,7 +3395,7 @@ bool SetOption(const std::string& key, const std::string& value) {
         return false;
     }
     Set(options, key, value);
-    if ((key == "refresh_rate" || key == "fps") && frames > 0) {
+    if ((key == "refresh_rate" || key == "fps" || key == "max_refresh") && frames > 0) {
         P().SetRefreshRate(RefreshRate()); // 0: the 3DS's
     }
     if (key == "touch_overlay" || key == "quest_overlay" || key == "target_overlay") {

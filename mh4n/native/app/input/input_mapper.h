@@ -1,3 +1,6 @@
+// MODIFIED for the Windows port (2026-11-17, G30vamv and the Caravan4URecomp contributors): SetPadBind / ClearPadBinds,
+// so that the shell's controls page can replace the controller's bind of a 3DS button.
+//
 // The input of mh4u-native (N3-07, docs/native/input.md): the keyboard, the mouse and controllers
 // at the same time on every 3DS button, a controller mapped by itself as in `mh4u`, the keyboard
 // and mouse mode with the mouse as the camera, and the in-game menu's mute, as one
@@ -80,6 +83,14 @@ public:
 
     /// What the game reads now.
     mh4n::InputState State() const;
+
+    /// A controller bind for a 3DS button (an App::Button) that replaces the default one (Azahar's layout), on the
+    /// controller the mapper picked. `kind`: 0 the button has no controller bind, 1 a pad button (`index`: SDL's
+    /// number, 0 = south ... 14 = D-pad right), 2 a pad axis past its half (`index`: 0 left X ... 5 right trigger,
+    /// `greater` its direction). The keys of the button stay as the settings say.
+    void SetPadBind(int app_button, int kind, int index, bool greater);
+    /// Back to the defaults for every button.
+    void ClearPadBinds();
 
     /// The in-game menu is up: every button reads released and every stick centred; once it is
     /// gone, a button still held reads released until it is let go, a stick still pushed reads

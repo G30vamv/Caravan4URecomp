@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <functional>
 #include <memory>
@@ -272,10 +273,19 @@ struct Host {
 };
 
 // The pages: five tabs, and two that belong to the Online tab (the public rooms and a room's password).
-enum class Page { Graphics, Game, Audio, Online, System, Rooms, Password, Count };
-constexpr int kTabCount = 5;
+enum class Page { Graphics, Game, Controls, Audio, Online, Saves, Mods, System, Rooms, Password, Count };
+constexpr int kTabCount = 8;
 inline int TabOf(Page page) { return page == Page::Rooms || page == Page::Password ? static_cast<int>(Page::Online) : static_cast<int>(page); }
-inline const char* const kTabNames[kTabCount] = {"Graphics", "Game", "Audio", "Online", "System"};
+inline const char* const kTabNames[kTabCount] = {"Graphics", "Game", "Controls", "Audio", "Online", "Saves", "Mods", "System"};
+
+// The 3DS buttons the controls page lists, in the order of the page (the shell's settings are key_<lower case name> and
+// pad_<lower case name>).
+inline const char* const kBindNames[] = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "Start", "Select", "Up", "Down", "Left", "Right"};
+constexpr int kBindCount = 14;
+inline std::string Lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
 
 struct Item {
     enum Kind { Info, Choice, Action, Text, Link };
@@ -298,6 +308,7 @@ struct Item {
     bool locked = false;              // ... with a password
     bool restart = false;             // the change waits for a restart
     std::function<void(float)> set_frac;  // a slider set by the mouse
+    std::function<void()> erase;      // Backspace or Delete on the row (a backup to delete)
     bool Selectable() const { return kind != Info; }
 };
 
@@ -327,6 +338,18 @@ public:
     bool open = false;  // main thread
 
     bool Editing() const { return edit_ != nullptr; }
+
+    // The shell tells the menu something (a mod that was dropped on the window): shown on the menu's message line.
+    void Notify(const std::string& text) { Say(text); }
+
+    // Opens the menu on the Mods page with a line (a mod was dropped on the window).
+    void ShowMods(SDL_Window* window, const std::string& text) {
+        window_ = window;
+        open = true;
+        SetPage(Page::Mods);
+        if (text.rfind("Installed", 0) == 0) NeedRestart("Mods");
+        Say(text);
+    }
 
     void Toggle(SDL_Window* window) {
         open = !open;
@@ -366,6 +389,7 @@ public:
             return;
         }
         if (!open) return;
+        if (capture_ >= 0 && Capture(e)) return;
         if (e.type == SDL_EVENT_TEXT_INPUT && edit_ != nullptr) {
             for (const char* p = e.text.text; *p; ++p) {
                 if (edit_->size() < edit_max_ && static_cast<unsigned char>(*p) >= 0x20 && static_cast<unsigned char>(*p) < 0x7F) edit_->push_back(*p);
@@ -644,6 +668,7 @@ private:
         if (!items.empty()) {
             Item& item = items[static_cast<std::size_t>(sel)];
             if (a.change != 0 && item.change) item.change(a.change);
+            if (a.erase && item.erase) item.erase();
             if (a.enter) {
                 if (item.kind == Item::Text) {
                     BeginEdit(window, item);
@@ -845,6 +870,8 @@ private:
             {"paste_join", "Joins the room whose address you copied (Ctrl+C on your friend's message)."},
             {"copy_address", "Copies the address to send to your friends again."},
             {"Leave the room", "Leaves the room you are in."},
+            {"auto_backup", "Backs up your saves each time the game starts, if they changed since the last backup. The newest 5 automatic backups are kept; yours are never deleted."},
+            {"Back up my saves now", "Copies your saves to the backups folder."},
             {"Resume the game", "Closes the menu and goes back to the game."},
             {"Quit the game", "Closes the game."},
             {"refresh", "Gets the list of rooms again."},
@@ -884,6 +911,15 @@ private:
             items.push_back(Choice("Steady frame rate", "steady", {"default", "on", "off"}, false, true));
             items.push_back(Choice("Particle effects", "effects", {"default", "on", "off"}, false, true));
             break;
+        case Page::Controls:
+            BuildControls(items);
+            break;
+        case Page::Saves:
+            BuildSaves(items);
+            break;
+        case Page::Mods:
+            BuildMods(items);
+            break;
         case Page::Audio:
             items.push_back(Choice("Volume", "volume", Numbers(0, 100, 5)));
             break;
@@ -916,6 +952,222 @@ private:
             if (i.help.empty()) i.help = HelpFor(i.id);
         }
         return items;
+    }
+
+    // ---- the controls page: every 3DS button with its key and its controller button; Enter on a row, then press the key
+    // or the controller's button to use (a keyboard key sets the key, a controller's button or trigger sets the pad's). ----
+    int capture_ = -1;  // the button (an index of kBindNames) waiting for a key or a controller's button
+
+    void BuildControls(std::vector<Item>& items) {
+        items.push_back(Info(capture_ >= 0 ? "Now press a key or a controller button.  Esc or the right mouse button cancels, Backspace puts it back."
+                                           : "Enter on a button, then press the key or the controller's button you want for it.",
+                             capture_ >= 0 ? 1 : 2));
+        for (int i = 0; i < kBindCount; ++i) {
+            Item item;
+            item.kind = Item::Action;
+            item.room = true;  // (drawn as a label and a text on the right)
+            item.id = std::string("bind_") + kBindNames[i];
+            item.label = std::string(kBindNames[i]) + (i >= 10 ? " (D-pad)" : "");
+            item.value = capture_ == i ? Tr("Press a key or a button...") : host_.value("bind:" + std::to_string(i));
+            item.color = capture_ == i ? 1 : 0;
+            item.act = [this, i] {
+                capture_ = i;
+                dirty_ = true;
+            };
+            item.help = Tr("The key and the controller's button of this 3DS button. A keyboard key you press replaces the key, a controller button or trigger replaces the controller's.");
+            items.push_back(std::move(item));
+        }
+        items.push_back(Action("Put every control back as it was", [this] {
+            capture_ = -1;
+            if (host_.action) Say(host_.action("reset_controls"));
+        }, "Reset"));
+        items.push_back(Info("The sticks: W A S D and the left stick (circle pad), O L K ; and the right stick (C-stick)."));
+        items.push_back(Info("F1 (the menu), F2, F3 and F11 are the program's own keys."));
+    }
+
+    // What a host action answers, said in the language: a known sentence, or a sentence that ends with a name.
+    void SayHost(const std::string& text) {
+        static const char* const kPrefixes[] = {"Backed up as "};
+        for (const char* prefix : kPrefixes) {
+            if (text.rfind(prefix, 0) == 0) {
+                Say(Tr(prefix) + text.substr(std::strlen(prefix)));
+                return;
+            }
+        }
+        Say(text);
+    }
+
+    // ---- the saves page: backups of the hunter's saves, and putting one back (at the next start) ----
+    std::string confirm_;  // the backup (or "delete:" and the backup) waiting for its second Enter
+
+    static std::vector<std::string> SplitLines(const std::string& text, char sep = '\n') {
+        std::vector<std::string> out;
+        std::size_t from = 0;
+        while (from <= text.size()) {
+            const std::size_t to = text.find(sep, from);
+            const std::string part = text.substr(from, to == std::string::npos ? std::string::npos : to - from);
+            if (!part.empty()) out.push_back(part);
+            if (to == std::string::npos) break;
+            from = to + 1;
+        }
+        return out;
+    }
+
+    void BuildSaves(std::vector<Item>& items) {
+        const std::vector<std::string> info = SplitLines(host_.action ? host_.action("save_info") : "", '|');  // files|MB
+        if (info.size() >= 2) items.push_back(Info(Tr("Your saves: ") + info[0] + " " + Tr("files") + ", " + info[1] + " MB.", 3));
+        else items.push_back(Info("There are no saves yet. They appear when the game saves.", 2));
+        const std::string pending = host_.action ? host_.action("save_pending") : "";
+        if (!pending.empty()) {
+            items.push_back(Info(Tr("A restore is waiting: ") + pending + ". " + Tr("It is done the next time the game starts (the saves now are backed up first)."), 1));
+            items.push_back(Action("Cancel the restore", [this] {
+                if (host_.action) host_.action("save_unstage");
+                Say("The restore was cancelled.");
+            }, "Cancel"));
+        }
+        {
+            Item item = Action("Back up my saves now", [this] { if (host_.action) SayHost(host_.action("save_backup")); }, "Back up");
+            item.id = "save_backup";
+            items.push_back(item);
+        }
+        items.push_back(Choice("Back up automatically at start", "auto_backup", {"on", "off"}));
+        items.push_back(Action("Open the saves folder", [this] { if (host_.action) Say(host_.action("open_saves")); }, "Open"));
+        items.push_back(Action("Open the backups folder", [this] { if (host_.action) Say(host_.action("open_backups")); }, "Open"));
+        const std::vector<std::string> backups = SplitLines(host_.action ? host_.action("save_list") : "");
+        items.push_back(Info(backups.empty() ? "No backups yet."
+                                             : "Backups, newest first. Enter restores one; Backspace deletes it.", 2));
+        for (const std::string& line : backups) {  // name|stamp|label|MB
+            const std::vector<std::string> f = SplitLines(line, '|');
+            if (f.size() < 4) continue;
+            const std::string name = f[0];
+            Item item;
+            item.kind = Item::Action;
+            item.room = true;
+            item.id = "backup_" + name;
+            item.label = f[1] + (f[2] == "-" ? "" : "  (" + Tr(f[2]) + ")");
+            item.value = f[3] + " MB";
+            item.color = confirm_ == name || confirm_ == "delete:" + name ? 1 : 0;
+            item.act = [this, name] {
+                if (confirm_ == name) {
+                    confirm_.clear();
+                    Say(host_.action ? host_.action("save_stage:" + name) : "");
+                } else {
+                    confirm_ = name;
+                    Say("Press Enter again to put this backup back the next time the game starts.");
+                }
+            };
+            item.erase = [this, name] {
+                if (confirm_ == "delete:" + name) {
+                    confirm_.clear();
+                    Say(host_.action ? host_.action("save_delete:" + name) : "");
+                } else {
+                    confirm_ = "delete:" + name;
+                    Say("Press Backspace again to delete this backup.");
+                }
+            };
+            item.help = Tr("A copy of your saves. Enter twice puts it back the next time the game starts (the saves now are backed up first). Backspace twice deletes it.");
+            items.push_back(std::move(item));
+        }
+    }
+
+    // ---- the mods page: the folders of <user>\load\mods, on or off, in the order they are applied ----
+    void BuildMods(std::vector<Item>& items) {
+        const std::vector<std::string> mods = SplitLines(host_.action ? host_.action("mods_list") : "");  // name|flags|on
+        items.push_back(Info("Mods change the game's files. A change applies the next time the game starts.", 2));
+        if (mods.empty()) {
+            items.push_back(Info("No mods yet. Drop a mod's folder or .zip on this window, or open the folder and copy it there.", 1));
+        }
+        for (std::size_t i = 0; i < mods.size(); ++i) {
+            const std::vector<std::string> f = SplitLines(mods[i], '|');
+            if (f.size() < 3) continue;
+            const std::string name = f[0];
+            const bool code = f[1].find('c') != std::string::npos, on = f[2] == "1";
+            Item item;
+            item.kind = Item::Choice;
+            item.id = "mod_" + name;
+            item.label = Plain(name) + (code ? " (code)" : "");
+            item.toggle = true;
+            item.on = on;
+            item.value = on ? "on" : "off";
+            const auto set = [this, name, code](bool want) {
+                if (want && code) {
+                    Say("This mod changes the game's code: it needs the game's library built with it, which this program does not do.");
+                    return;
+                }
+                if (host_.action) host_.action(std::string("mods_set:") + name + ":" + (want ? "on" : "off"));
+                NeedRestart("Mods");
+                dirty_ = true;
+            };
+            item.change = [set, on](int dir) { set(dir > 0 ? true : dir < 0 ? false : !on); };
+            item.act = [set, on] { set(!on); };
+            item.help = code ? Tr("A code mod: it changes the game's code, so the game's library would have to be built with it. It can be turned off here, not on.")
+                             : Tr("Turns this mod on or off. Where two mods change the same file, the one lower in the list wins.");
+            items.push_back(std::move(item));
+            if (i > 0) {
+                Item up = Action("  " + Plain(name) + Tr(": move up"), [this, name] { if (host_.action) host_.action("mods_move:" + name + ":-1"); NeedRestart("Mods"); }, "Up");
+                up.id = "modup_" + name;
+                items.push_back(std::move(up));
+            }
+            if (i + 1 < mods.size()) {
+                Item down = Action("  " + Plain(name) + Tr(": move down"), [this, name] { if (host_.action) host_.action("mods_move:" + name + ":1"); NeedRestart("Mods"); }, "Down");
+                down.id = "moddown_" + name;
+                items.push_back(std::move(down));
+            }
+        }
+        items.push_back(Action("Open the mods folder", [this] { if (host_.action) Say(host_.action("open_mods")); }, "Open"));
+    }
+
+    // While a button waits for its key: true when the event was taken.
+    bool Capture(const SDL_Event& e) {
+        const std::string name = Lower(kBindNames[capture_]);
+        const auto finish = [this] {
+            capture_ = -1;
+            dirty_ = true;
+        };
+        if (e.type == SDL_EVENT_KEY_DOWN) {
+            if (e.key.repeat) return true;
+            if (e.key.key == SDLK_ESCAPE) {
+                finish();
+            } else if (e.key.key == SDLK_BACKSPACE || e.key.key == SDLK_DELETE) {
+                host_.apply("key_" + name, "");
+                host_.apply("pad_" + name, "");
+                Say("Put back as it was.");
+                finish();
+            } else if (e.key.key != SDLK_F1) {
+                const char* key = SDL_GetScancodeName(e.key.scancode);
+                if (key != nullptr && *key != ' ') {
+                    host_.apply("key_" + name, key);
+                    Say(Tr("Saved: ") + key);
+                }
+                finish();
+            } else {
+                return false;  // F1 closes the menu
+            }
+            return true;
+        }
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            if (e.button.button == SDL_BUTTON_RIGHT) finish();
+            return true;
+        }
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE) {
+                finish();  // (the Guide button cancels: a controller alone can get out)
+            } else {
+                host_.apply("pad_" + name, "b" + std::to_string(static_cast<int>(e.gbutton.button)));
+                Say("Saved.");
+                finish();
+            }
+            return true;
+        }
+        if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+            if (std::abs(static_cast<int>(e.gaxis.value)) > 26000) {
+                host_.apply("pad_" + name, "a" + std::to_string(static_cast<int>(e.gaxis.axis)) + (e.gaxis.value > 0 ? "+" : "-"));
+                Say("Saved.");
+                finish();
+            }
+            return true;
+        }
+        return e.type == SDL_EVENT_GAMEPAD_BUTTON_UP || e.type == SDL_EVENT_TEXT_INPUT;
     }
 
     void BuildOnline(std::vector<Item>& items) {
@@ -1184,7 +1436,7 @@ private:
     // ---- the picture -----------------------------------------------------------------------------------------------------
     // The page as the look draws it (a View) and, for when that can't be drawn, as plain lines of text.
     void Render(std::vector<Line>* out_lines, View* out_view) {
-        static const char* const kTitles[] = {"Graphics", "Game", "Audio", "Online", "System", "Public rooms", "Room password"};
+        static const char* const kTitles[] = {"Graphics", "Game", "Controls", "Audio", "Online", "Saves", "Mods", "System", "Public rooms", "Room password"};
         RefreshLanguage();
         std::vector<Item> items = Build();
         SyncSelection(items);

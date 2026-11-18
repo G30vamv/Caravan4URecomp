@@ -27,6 +27,7 @@ I'd rather be upfront about what I have actually tested.
 - Scales up to 8x the 3DS's resolution, and a frame counter that shows the frames you actually see.
 
 **Not tested yet:**
+- The new Controls, Saves and Mods pages: I tested them with the keyboard and with a copy of my saves; remapping a controller button, restoring a backup and dropping a mod have not been tried by other people yet.
 - The one-click **Host a room** and **Join with the copied address** buttons of the Online page (new in 0.2.0), and the touch screen staying up while you are in a room.
 - The mouse as the camera (**F3**, or `mouse_camera = on` in the ini).
 - Resolutions of 9x and 10x: the picture still comes out black there.
@@ -35,7 +36,7 @@ I'd rather be upfront about what I have actually tested.
 
 ## Getting it
 
-The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.2.0**, tagged `windows-v0.2.0`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.3.0**, tagged `windows-v0.3.0`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
@@ -70,6 +71,9 @@ design comes from the menu of my MH3U port, with this game's colours, in the Cin
 - **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 120, 180, 240, 300, 360 or unlimited), steady
   frame rate, particle effects.
 - **Audio:** volume.
+- **Controls:** every 3DS button with its key and its controller button. Press Enter on one, then the key or the controller's button or trigger you want (Backspace puts it back). The sticks and F1, F2, F3 and F11 stay as they are.
+- **Saves:** backups of your saves. One is made by hand, or automatically each time the game starts if the saves changed (the newest 5 automatic ones are kept). Enter twice on a backup puts it back the next time the game starts, after a backup of what was there.
+- **Mods:** drop a mod's folder or .zip on the window to install it, turn mods on and off and set their order (they apply the next time the game starts). Mods that change the game's files work; mods that change its code are installed turned off, because the game's library is built without them.
 - **System:** the language of the menu (English or Spanish; "auto" follows Windows), resume and quit.
 - **Online:** nickname, host a room, join with the copied address, public rooms, join by address, leave.
 
@@ -85,7 +89,7 @@ restarts anything by itself. **Graphics > Open the HD textures folder** opens th
 - **Frame rate:** the limit goes up to 360 fps. The counter shows the frames that reach your screen, not the ones the game
   makes: with a heavy internal resolution the two can differ, and then it feels choppy even if the game runs fast. With VSync
   on you get at most your display's refresh rate, so "display" in the limit setting is the natural choice. If it feels
-  uneven at a high refresh rate, lower the internal resolution (on my screen 3x and 5x showed almost no lost frames at 144 fps, and 7x lost about 15 %).
+  uneven at a high refresh rate, lower the internal resolution (on my screen 3x and 5x showed almost no lost frames at 144 fps, and 7x lost about 15 %). Each frame the game shows is read back from the GPU, so the highest rate the game can show depends on the internal resolution: about 580 fps at 3x, 160 at 6x and 97 at 8x. A higher limit, including unlimited, is held at that. Before 0.3.0, unlimited (or a very high limit) with a high internal resolution could leave the picture black.
 - **Internal resolution (1x to 8x):** everything the GPU draws (the 3D scene, the HUD and the text) is rendered at that multiple
   of the 3DS's resolution; "auto" picks the one closest to your window. The game's own textures stay at their original
   resolution, so edges get sharper but not more detailed. HD texture packs made for Azahar and Citra (PNG, their folder
@@ -179,7 +183,7 @@ alrededor de ese runtime.
 funciona con teclado, ratón y mando, y entré a una sala pública real de Azahar desde el menú del juego. Todavía no he
 probado Local Play con otras personas, otras GPU, Windows 10 ni MSVC.
 
-**Cómo se usa:** la última versión es la 0.2.0, en la página de Releases (con su suma SHA-256). Abre `Caravan4URecomp.exe`: la
+**Cómo se usa:** la última versión es la 0.3.0, en la página de Releases (con su suma SHA-256). Abre `Caravan4URecomp.exe`: la
 primera vez pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con
 **F1** o **L3 + R3**, y tiene gráficos, juego, audio y online. Online usa las mismas salas que Azahar: menú → Online →
 **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
