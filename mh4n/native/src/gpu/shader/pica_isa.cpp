@@ -1,76 +1,58 @@
-// Derived from Azahar externals/nihstro/include/nihstro/shader_bytecode.h at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (BSD 3-clause licence of externals/nihstro/license.txt,
-// reproduced at the top of the header next to this file; not GPL): the instruction info table (OpCode::GetInfo).
-// Copyright 2014 Tony Wasserka
-#include "gpu/shader/pica_isa.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: pica_isa.h and 3dbrew GPU/Shader Instruction Set.
+
+#include "pica_isa.h"
 
 #include <array>
 
 namespace mh4n::gpu::shader::isa {
-
 namespace {
 
-constexpr std::array<OpInfo, 64> MakeTable() {
-    std::array<OpInfo, 64> t{};
-    for (auto& e : t) {
-        e = {Format::Unknown, false, "UNK"};
-    }
-    auto set = [&](Opcode op, Format f, const char* name, bool inverted = false) {
-        t[static_cast<u32>(op)] = {f, inverted, name};
+constexpr auto MakeOpTable() {
+    std::array<OpInfo, 64> table{};
+    table.fill({Format::Unknown, false, "unknown"});
+    constexpr const char* arithmetic[] = {
+        "add", "dp3", "dp4", "dph", "dst", "ex2", "lg2", "lit", "mul", "sge", "slt", "flr", "max", "min", "rcp", "rsq",
     };
-    set(Opcode::ADD, Format::Arithmetic, "add");
-    set(Opcode::DP3, Format::Arithmetic, "dp3");
-    set(Opcode::DP4, Format::Arithmetic, "dp4");
-    set(Opcode::DPH, Format::Arithmetic, "dph");
-    set(Opcode::DST, Format::Arithmetic, "dst");
-    set(Opcode::EX2, Format::Arithmetic, "ex2");
-    set(Opcode::LG2, Format::Arithmetic, "lg2");
-    set(Opcode::LIT, Format::Arithmetic, "lit");
-    set(Opcode::MUL, Format::Arithmetic, "mul");
-    set(Opcode::SGE, Format::Arithmetic, "sge");
-    set(Opcode::SLT, Format::Arithmetic, "slt");
-    set(Opcode::FLR, Format::Arithmetic, "flr");
-    set(Opcode::MAX, Format::Arithmetic, "max");
-    set(Opcode::MIN, Format::Arithmetic, "min");
-    set(Opcode::RCP, Format::Arithmetic, "rcp");
-    set(Opcode::RSQ, Format::Arithmetic, "rsq");
-    set(Opcode::MOVA, Format::Arithmetic, "mova");
-    set(Opcode::MOV, Format::Arithmetic, "mov");
-    set(Opcode::DPHI, Format::Arithmetic, "dphi", true);
-    set(Opcode::DSTI, Format::Arithmetic, "dsti", true);
-    set(Opcode::SGEI, Format::Arithmetic, "sgei", true);
-    set(Opcode::SLTI, Format::Arithmetic, "slti", true);
-    set(Opcode::BREAK, Format::Trivial, "break");
-    set(Opcode::NOP, Format::Trivial, "nop");
-    set(Opcode::END, Format::Trivial, "end");
-    set(Opcode::BREAKC, Format::Conditional, "breakc");
-    set(Opcode::CALL, Format::Conditional, "call");
-    set(Opcode::CALLC, Format::Conditional, "callc");
-    set(Opcode::CALLU, Format::UniformFlowControl, "callu");
-    set(Opcode::IFU, Format::UniformFlowControl, "ifu");
-    set(Opcode::IFC, Format::Conditional, "ifc");
-    set(Opcode::LOOP, Format::UniformFlowControl, "loop");
-    set(Opcode::EMIT, Format::Trivial, "emit");
-    set(Opcode::SETEMIT, Format::SetEmit, "setemit");
-    set(Opcode::JMPC, Format::Conditional, "jmpc");
-    set(Opcode::JMPU, Format::Conditional, "jmpu");
-    t[0x2E] = {Format::Arithmetic, false, "cmp"};
-    t[0x2F] = {Format::Arithmetic, false, "cmp"};
+    for (u32 i = 0; i < std::size(arithmetic); ++i) {
+        table[i] = {Format::Arithmetic, false, arithmetic[i]};
+    }
+    constexpr const char* inverted[] = {"dphi", "dsti", "sgei", "slti"};
+    for (u32 i = 0; i < std::size(inverted); ++i) {
+        table[0x18 + i] = {Format::Arithmetic, true, inverted[i]};
+    }
+    table[0x12] = {Format::Arithmetic, false, "mova"};
+    table[0x13] = {Format::Arithmetic, false, "mov"};
+    table[0x20] = {Format::Trivial, false, "break"};
+    table[0x21] = {Format::Trivial, false, "nop"};
+    table[0x22] = {Format::Trivial, false, "end"};
+    table[0x23] = {Format::Conditional, false, "breakc"};
+    table[0x24] = {Format::Conditional, false, "call"};
+    table[0x25] = {Format::Conditional, false, "callc"};
+    table[0x26] = {Format::UniformFlowControl, false, "callu"};
+    table[0x27] = {Format::UniformFlowControl, false, "ifu"};
+    table[0x28] = {Format::Conditional, false, "ifc"};
+    table[0x29] = {Format::UniformFlowControl, false, "loop"};
+    table[0x2A] = {Format::Trivial, false, "emit"};
+    table[0x2B] = {Format::SetEmit, false, "setemit"};
+    table[0x2C] = {Format::Conditional, false, "jmpc"};
+    table[0x2D] = {Format::UniformFlowControl, false, "jmpu"};
+    table[0x2E] = table[0x2F] = {Format::Arithmetic, false, "cmp"};
     for (u32 i = 0x30; i < 0x38; ++i) {
-        t[i] = {Format::MultiplyAdd, true, "madi"};
+        table[i] = {Format::MultiplyAdd, true, "madi"};
+        table[i + 8] = {Format::MultiplyAdd, false, "mad"};
     }
-    for (u32 i = 0x38; i < 0x40; ++i) {
-        t[i] = {Format::MultiplyAdd, false, "mad"};
-    }
-    return t;
+    return table;
 }
 
-constexpr std::array<OpInfo, 64> kTable = MakeTable();
+constexpr auto kOpTable = MakeOpTable();
+constexpr OpInfo kUnknown{Format::Unknown, false, "unknown"};
 
 } // namespace
 
 const OpInfo& GetOpInfo(u32 opcode6) {
-    return kTable[opcode6 & 0x3F];
+    return opcode6 < kOpTable.size() ? kOpTable[opcode6] : kUnknown;
 }
 
 } // namespace mh4n::gpu::shader::isa

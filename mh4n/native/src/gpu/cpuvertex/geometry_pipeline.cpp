@@ -1,389 +1,247 @@
-// Derived from Azahar src/video_core/pica/geometry_pipeline.cpp, geometry_pipeline.h, shader_unit.h,
-// regs_pipeline.h and regs_shader.h at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later;
-// every one of those files says "Licensed under GPLv2 or any later version"): the three backends
-// (Point, VariablePrimitive, FixedPrimitive) and GeometryPipeline::SubmitVertex's b15 rule.
-// Copyright 2017-2024 Citra Emulator Project / Azahar Emulator Project (geometry_pipeline.cpp)
-// Copyright 2017 Citra Emulator Project (geometry_pipeline.h)
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (shader_unit.h)
-// Copyright 2017-2025 Citra Emulator Project / Azahar Emulator Project (regs_pipeline.h, regs_shader.h)
-#include "gpu/cpuvertex/geometry_pipeline.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: cpuvertex and PICA contracts, gpu_cpuvertex tests and 3dbrew GPU/Primitive Engine.
+
+#include "geometry_pipeline.h"
 
 #include <algorithm>
-
-#include "gpu/pica/regs.h"
+#include <utility>
 
 namespace mh4n::gpu::cpuvertex {
 
-using pica::BitsOf;
-namespace reg = pica::reg;
+class GeometryPipelineBackend {
+public:
+    GeometryPipelineBackend(pica::GeometryMode mode, u32 width)
+        : mode(mode), width(width) {}
+
+    bool IsEmpty() const {
+        return mode == pica::GeometryMode::VariablePrimitive ? need_index : cursor == start;
+    }
+
+    pica::GeometryMode mode;
+    u32 width;
+    u32 cursor = 0;
+    u32 start = 0;
+    u32 end = 0;
+    u32 main_remaining = 0;
+    u32 remaining = 0;
+    bool need_index = true;
+    AttributeBuffer attributes{};
+};
 
 namespace {
 
-ShaderInputConfig GsInputConfig(const pica::PicaState& state) {
-    const auto& regs = state.regs;
-    ShaderInputConfig config;
-    config.max_input_attribute_index =
-        BitsOf(regs[reg::kGs + reg::kShaderInputBufferConfig], 0, 4);
-    config.input_attribute_to_register_map =
-        (static_cast<u64>(regs[reg::kGs + 0x0C]) << 32) | regs[reg::kGs + 0x0B];
-    return config;
+using pica::GeometryMode;
+namespace reg = pica::reg;
+
+ShaderInputConfig InputConfig(const pica::PicaState& state) {
+    return {
+        state.regs[reg::kGs + reg::kShaderInputBufferConfig] & 15,
+        state.regs[reg::kGs + 0x0B] | (static_cast<u64>(state.regs[reg::kGs + 0x0C]) << 32),
+    };
 }
 
-Vec4 ToVec4(const pica::Vec4f& v) {
-    Vec4 r;
-    for (int i = 0; i < 4; ++i) {
-        r.c[i] = f24::FromFloat32(v.c[i]);
+bool IsValidMode(GeometryMode mode, u32 format, u32 width, u32 input_count,
+                 bool variable, bool to_uniform) {
+    switch (mode) {
+    case GeometryMode::Point:
+        return (format & 255) == pica::kGsModePoint && !variable && !to_uniform && input_count % width == 0;
+    case GeometryMode::FixedPrimitive:
+        return (format & 255) == pica::kGsModeFixedPrimitive && !variable && to_uniform &&
+               ((format >> 12) & 15) + 1 == width;
+    case GeometryMode::VariablePrimitive:
+        return (format & 255) == pica::kGsModeVariablePrimitive && variable && to_uniform;
+    default:
+        return false;
     }
-    return r;
 }
 
 } // namespace
-
-/// An attribute buffering interface for different pipeline modes
-class GeometryPipelineBackend {
-public:
-    virtual ~GeometryPipelineBackend() = default;
-
-    /// Checks if there is no incomplete data transfer
-    virtual bool IsEmpty() const = 0;
-
-    /// Checks if the pipeline needs a direct input from index buffer
-    virtual bool NeedIndexInput() const = 0;
-
-    /// Submits an index from index buffer
-    virtual bool SubmitIndex(u32 val) = 0;
-
-    /**
-     * Submits vertex attributes
-     * @param input attributes of a vertex output from vertex shader
-     * @param full set when the buffer is full and the geometry shader should be invoked
-     * @return false if the vertex does not fit (Unhandled::GeometryOverflow)
-     */
-    virtual bool SubmitVertex(const AttributeBuffer& input, bool& full) = 0;
-};
-
-// In the Point mode, vertex attributes are sent to the input registers in the geometry shader unit.
-// The size of vertex shader outputs and geometry shader inputs are constants. Geometry shader is
-// invoked upon inputs buffer filled up by vertex shader outputs. For example, if we have a geometry
-// shader that takes 6 inputs, and the vertex shader outputs 2 attributes, it would take 3 vertices
-// for one geometry shader invocation.
-// TODO (Azahar): what happens when the input size is not divisible by the output size?
-class GeometryPipeline_Point : public GeometryPipelineBackend {
-public:
-    GeometryPipeline_Point(const pica::PicaState* const& state, GeometryShaderUnit& unit,
-                           u32 vs_output_num, u32 gs_input_num)
-        : state_(state), unit_(unit), buffer_end_(gs_input_num), vs_output_num_(vs_output_num) {}
-
-    void Adopt(const pica::GeometryPipelineState& g) {
-        buffer_cur_ = std::min<u32>(g.buffer_index, buffer_end_);
-        for (size_t i = 0; i < attribute_buffer_.size(); ++i) {
-            attribute_buffer_[i] = ToVec4(g.attribute_buffer[i]);
-        }
-    }
-
-    bool IsEmpty() const override {
-        return buffer_cur_ == 0;
-    }
-
-    bool NeedIndexInput() const override {
-        return false;
-    }
-
-    bool SubmitIndex(u32) override {
-        return false; // Azahar: UNREACHABLE(); the caller does not submit indices in this mode
-    }
-
-    bool SubmitVertex(const AttributeBuffer& input, bool& full) override {
-        full = false;
-        if (buffer_cur_ + vs_output_num_ > buffer_end_) {
-            return false;
-        }
-        std::copy(input.data(), input.data() + vs_output_num_, attribute_buffer_.data() + buffer_cur_);
-        buffer_cur_ += vs_output_num_;
-        if (buffer_cur_ == buffer_end_) {
-            buffer_cur_ = 0;
-            unit_.LoadInput(GsInputConfig(*state_), attribute_buffer_);
-            full = true;
-        }
-        return true;
-    }
-
-private:
-    const pica::PicaState* const& state_; // the pipeline's: the state of the draw being run
-    GeometryShaderUnit& unit_;
-    AttributeBuffer attribute_buffer_{};
-    u32 buffer_cur_ = 0; // index into attribute_buffer_
-    u32 buffer_end_;     // the number of geometry shader inputs
-    u32 vs_output_num_;
-};
-
-// In VariablePrimitive mode, vertex attributes are buffered into the uniform registers in the
-// geometry shader unit. The number of vertex is variable, which is specified by the first index
-// value in the batch. This mode is usually used for subdivision.
-class GeometryPipeline_VariablePrimitive : public GeometryPipelineBackend {
-public:
-    GeometryPipeline_VariablePrimitive(const pica::PicaState* const& state, Uniforms& setup,
-                                       u32 vs_output_num)
-        : state_(state), setup_(setup), vs_output_num_(vs_output_num) {}
-
-    void Adopt(const pica::GeometryPipelineState& g) {
-        need_index_ = g.need_index;
-        main_vertex_num_ = g.main_vertex_num;
-        total_vertex_num_ = g.total_vertex_num;
-        buffer_cur_ = std::min<u32>(g.buffer_index, static_cast<u32>(setup_.f.size()));
-    }
-
-    bool IsEmpty() const override {
-        return need_index_;
-    }
-
-    bool NeedIndexInput() const override {
-        return need_index_;
-    }
-
-    bool SubmitIndex(u32 val) override {
-        // The number of vertex input is put to the uniform register
-        f24 vertex_num = f24::FromFloat32(static_cast<float>(val));
-        setup_.f[0] = Vec4{{vertex_num, vertex_num, vertex_num, vertex_num}};
-
-        // The second uniform register and so on are used for receiving input vertices
-        buffer_cur_ = 1;
-
-        main_vertex_num_ = state_->regs[reg::kVariableVertexMainNum] + 1;
-        total_vertex_num_ = val;
-        need_index_ = false;
-        return true;
-    }
-
-    bool SubmitVertex(const AttributeBuffer& input, bool& full) override {
-        full = false;
-        const u32 size = static_cast<u32>(setup_.f.size());
-        const u32 room = size - std::min(buffer_cur_, size);
-        if (main_vertex_num_ != 0) {
-            // For main vertices, receive all attributes
-            if (vs_output_num_ > room) {
-                return false;
-            }
-            std::copy(input.data(), input.data() + vs_output_num_, setup_.f.data() + buffer_cur_);
-            buffer_cur_ += vs_output_num_;
-            --main_vertex_num_;
-        } else {
-            // For other vertices, only receive the first attribute (usually the position)
-            if (room < 1) {
-                return false;
-            }
-            setup_.f[buffer_cur_++] = input[0];
-        }
-        --total_vertex_num_;
-
-        if (total_vertex_num_ == 0) {
-            need_index_ = true;
-            full = true;
-        }
-        return true;
-    }
-
-private:
-    const pica::PicaState* const& state_;
-    Uniforms& setup_;
-    bool need_index_ = true;
-    u32 main_vertex_num_ = 0;
-    u32 total_vertex_num_ = 0;
-    u32 buffer_cur_ = 0; // index into the float uniforms
-    u32 vs_output_num_;
-};
-
-// In FixedPrimitive mode, vertex attributes are buffered into the uniform registers in the geometry
-// shader unit. The number of vertex per shader invocation is constant. This is usually used for
-// particle system.
-class GeometryPipeline_FixedPrimitive : public GeometryPipelineBackend {
-public:
-    GeometryPipeline_FixedPrimitive(Uniforms& setup, u32 vs_output_num, u32 buffer_begin, u32 buffer_end)
-        : setup_(setup), buffer_begin_(buffer_begin), buffer_cur_(buffer_begin),
-          buffer_end_(buffer_end), vs_output_num_(vs_output_num) {}
-
-    void Adopt(const pica::GeometryPipelineState& g) {
-        buffer_cur_ = std::clamp<u32>(g.buffer_index, buffer_begin_, buffer_end_);
-    }
-
-    bool IsEmpty() const override {
-        return buffer_cur_ == buffer_begin_;
-    }
-
-    bool NeedIndexInput() const override {
-        return false;
-    }
-
-    bool SubmitIndex(u32) override {
-        return false; // Azahar: UNREACHABLE()
-    }
-
-    bool SubmitVertex(const AttributeBuffer& input, bool& full) override {
-        full = false;
-        if (buffer_cur_ + vs_output_num_ > buffer_end_) {
-            return false;
-        }
-        std::copy(input.data(), input.data() + vs_output_num_, setup_.f.data() + buffer_cur_);
-        buffer_cur_ += vs_output_num_;
-        if (buffer_cur_ == buffer_end_) {
-            buffer_cur_ = buffer_begin_;
-            full = true;
-        }
-        return true;
-    }
-
-private:
-    Uniforms& setup_;
-    u32 buffer_begin_;
-    u32 buffer_cur_;
-    u32 buffer_end_;
-    u32 vs_output_num_;
-};
 
 GeometryPipeline::GeometryPipeline(GeometryShaderUnit& gs_unit, Uniforms& gs_uniforms)
     : gs_unit_(gs_unit), gs_(gs_uniforms) {}
 
 GeometryPipeline::~GeometryPipeline() = default;
 
-bool GeometryPipeline::Reconfigure(bool adopt_cursors) {
-    discarded_partial_input_ = backend_ != nullptr && !backend_->IsEmpty();
-    backend_.reset();
-    error_ = {};
+bool GeometryPipeline::IsEmpty() const {
+    return !backend_ || backend_->IsEmpty();
+}
 
-    const pica::PicaState& state = *state_;
-    const pica::GeometryPipelineState& g = state.geometry;
-    if (g.mode == pica::GeometryMode::None) {
+bool GeometryPipeline::NeedIndexInput() const {
+    return backend_ && backend_->mode == GeometryMode::VariablePrimitive && backend_->need_index;
+}
+
+bool GeometryPipeline::Reconfigure(bool adopt_cursors) {
+    discarded_partial_input_ = !IsEmpty();
+    backend_.reset();
+    error_ = {Unhandled::GeometryConfig};
+
+    const auto& state = *state_;
+    const auto& saved = state.geometry;
+    const u32 stage = state.regs[reg::kGeometryStage];
+    const u32 use_gs = stage & 3;
+    if (use_gs == pica::kUseGsNo && saved.mode == GeometryMode::None) {
+        error_ = {};
+        return true;
+    }
+    const u32 input = state.regs[reg::kGs + reg::kShaderInputBufferConfig];
+    const u32 format = state.regs[reg::kGsConfig];
+    const u32 width = (state.regs[reg::kVsOutmapTotalA] & 15) + 1;
+    const u32 inputs = (input & 15) + 1;
+    if (use_gs != pica::kUseGsYes || (input >> 24) != pica::kShaderModeGs ||
+        width != (state.regs[reg::kVsOutmapTotalB] & 15) + 1 ||
+        saved.vs_output_num != width ||
+        !IsValidMode(saved.mode, format, width, inputs, (stage >> 31) != 0, ((input >> 8) & 255) != 0)) {
+        return false;
+    }
+
+    auto next = std::make_unique<GeometryPipelineBackend>(saved.mode, width);
+    switch (saved.mode) {
+    case GeometryMode::Point:
+        next->end = inputs;
+        if (adopt_cursors) {
+            next->cursor = saved.buffer_index;
+            for (size_t i = 0; i < next->attributes.size(); ++i) {
+                for (u32 lane = 0; lane < 4; ++lane) {
+                    next->attributes[i].c[lane] = f24::FromFloat32(saved.attribute_buffer[i].c[lane]);
+                }
+            }
+        }
+        break;
+    case GeometryMode::FixedPrimitive:
+        next->start = (format >> 16) & 255;
+        next->end = next->start + width * (((format >> 8) & 15) + 1);
+        next->cursor = adopt_cursors ? saved.buffer_index : next->start;
+        if (next->end > gs_.f.size()) {
+            error_ = {Unhandled::GeometryOverflow};
+            return false;
+        }
+        break;
+    case GeometryMode::VariablePrimitive:
+        next->end = static_cast<u32>(gs_.f.size());
+        if (adopt_cursors) {
+            next->cursor = saved.buffer_index;
+            next->need_index = saved.need_index;
+            next->main_remaining = saved.main_vertex_num;
+            next->remaining = saved.total_vertex_num;
+            if (!next->need_index &&
+                (next->cursor == 0 || next->main_remaining > next->remaining || !next->remaining ||
+                 u64{next->cursor} + next->remaining + u64{next->main_remaining} * (width - 1) > next->end)) {
+                error_ = {Unhandled::GeometryOverflow};
+                return false;
+            }
+        }
+        break;
+    default:
+        return false;
+    }
+    if (next->cursor < next->start || next->cursor >= next->end) {
+        error_ = {Unhandled::GeometryOverflow};
+        return false;
+    }
+
+    backend_ = std::move(next);
+    error_ = {};
+    return true;
+}
+
+bool GeometryPipeline::SubmitIndex(u32 value) {
+    if (!NeedIndexInput()) {
+        error_ = {Unhandled::GeometryConfig};
+        return false;
+    }
+
+    auto& buffer = *backend_;
+    const u64 main = u64{state_->regs[reg::kVariableVertexMainNum]} + 1;
+    if (value < main || 1 + u64{value} + main * (buffer.width - 1) > gs_.f.size()) {
+        error_ = {Unhandled::GeometryOverflow};
+        return false;
+    }
+    gs_.f[0].c[0] = f24::FromFloat32(static_cast<float>(value));
+    buffer.cursor = 1;
+    buffer.main_remaining = static_cast<u32>(main);
+    buffer.remaining = value;
+    buffer.need_index = false;
+    return true;
+}
+
+bool GeometryPipeline::SubmitVertex(const AttributeBuffer& input) {
+    if (!backend_) {
+        if (vertex_sink_) {
+            vertex_sink_->SubmitVertex(input);
+        }
         return true;
     }
 
-    gs_unit_.ConfigOutput(BitsOf(state.regs[reg::kGs + reg::kShaderOutputMask], 0, 16));
-
-    const u32 vs_output_num = g.vs_output_num;
-    const u32 uniforms = static_cast<u32>(gs_.f.size());
-    auto bad = [this] {
-        error_ = {Unhandled::GeometryConfig, 0, 0};
-        return false;
-    };
-    // The ASSERTs of GeometryPipeline::Reconfigure and of the backends' constructors (the command
-    // processor only logs them). Azahar's use_gs is No or Yes; the raw values 1 and 3 fail the second.
-    const auto& regs = state.regs;
-    const bool variable_primitive = BitsOf(regs[reg::kGeometryStage], 31, 1) != 0;
-    const bool input_to_uniform = BitsOf(regs[reg::kGs + reg::kShaderInputBufferConfig], 8, 8) != 0;
-    if (BitsOf(regs[reg::kGeometryStage], 0, 2) != pica::kUseGsYes ||                       // use_gs == Yes
-        BitsOf(regs[reg::kGs + reg::kShaderInputBufferConfig], 24, 8) != pica::kShaderModeGs ||  // shader_mode == GS
-        BitsOf(regs[reg::kVsOutmapTotalA], 0, 4) != BitsOf(regs[reg::kVsOutmapTotalB], 0, 4)) {  // outmap a == b
-        return bad();
-    }
-    if (vs_output_num == 0 || vs_output_num > 16) {
-        return bad();
-    }
-    switch (g.mode) {
-    case pica::GeometryMode::Point: {
-        // ASSERT(variable_primitive == 0), ASSERT(input_to_uniform == 0),
-        // ASSERT(gs_input_num % vs_output_num == 0)
-        if (variable_primitive || input_to_uniform || g.buffer_size == 0 || g.buffer_size > 16 ||
-            g.buffer_size % vs_output_num != 0) {
-            return bad();
+    auto& buffer = *backend_;
+    bool ready = false;
+    switch (buffer.mode) {
+    case GeometryMode::Point:
+        if (buffer.width > buffer.end - buffer.cursor) {
+            error_ = {Unhandled::GeometryOverflow};
+            return false;
         }
-        auto point = std::make_unique<GeometryPipeline_Point>(state_, gs_unit_, vs_output_num, g.buffer_size);
-        if (adopt_cursors) {
-            point->Adopt(g);
+        std::copy_n(input.begin(), buffer.width, buffer.attributes.begin() + buffer.cursor);
+        buffer.cursor += buffer.width;
+        ready = buffer.cursor == buffer.end;
+        if (ready) {
+            gs_unit_.LoadInput(InputConfig(*state_), buffer.attributes);
+            buffer.cursor = 0;
         }
-        backend_ = std::move(point);
         break;
-    }
-    case pica::GeometryMode::VariablePrimitive: {
-        // ASSERT(variable_primitive == 1), ASSERT(input_to_uniform == 1)
-        if (!variable_primitive || !input_to_uniform) {
-            return bad();
+    case GeometryMode::FixedPrimitive:
+        if (buffer.width > buffer.end - buffer.cursor) {
+            error_ = {Unhandled::GeometryOverflow};
+            return false;
         }
-        auto variable = std::make_unique<GeometryPipeline_VariablePrimitive>(state_, gs_, vs_output_num);
-        if (adopt_cursors) {
-            variable->Adopt(g);
+        std::copy_n(input.begin(), buffer.width, gs_.f.begin() + buffer.cursor);
+        buffer.cursor += buffer.width;
+        ready = buffer.cursor == buffer.end;
+        if (ready) {
+            buffer.cursor = buffer.start;
         }
-        backend_ = std::move(variable);
         break;
-    }
-    case pica::GeometryMode::FixedPrimitive: {
-        // ASSERT(variable_primitive == 0), ASSERT(input_to_uniform == 1),
-        // ASSERT(vs_output_num == stride_minus_1 + 1)
-        if (variable_primitive || !input_to_uniform ||
-            vs_output_num != BitsOf(regs[reg::kGsConfig], 12, 4) + 1) {
-            return bad();
+    case GeometryMode::VariablePrimitive: {
+        if (buffer.need_index) {
+            error_ = {Unhandled::GeometryNeedsIndex};
+            return false;
         }
-        // The buffer has to fit the float uniforms (Azahar writes past them) and holds a whole
-        // number of vertices (fixed_vertex_num_minus_1 + 1 of them).
-        if (g.buffer_offset > g.buffer_size || g.buffer_size > uniforms ||
-            (g.buffer_size - g.buffer_offset) % vs_output_num != 0) {
-            return bad();
+        const u32 count = buffer.main_remaining ? buffer.width : 1;
+        std::copy_n(input.begin(), count, gs_.f.begin() + buffer.cursor);
+        buffer.cursor += count;
+        if (buffer.main_remaining) {
+            --buffer.main_remaining;
         }
-        auto fixed = std::make_unique<GeometryPipeline_FixedPrimitive>(gs_, vs_output_num, g.buffer_offset,
-                                                                       g.buffer_size);
-        if (adopt_cursors) {
-            fixed->Adopt(g);
+        ready = --buffer.remaining == 0;
+        if (ready) {
+            buffer.need_index = true;
+            buffer.cursor = 0;
         }
-        backend_ = std::move(fixed);
         break;
     }
     default:
-        return bad();
+        error_ = {Unhandled::GeometryConfig};
+        return false;
     }
-    return true;
+
+    if (!ready) {
+        return true;
+    }
+    gs_unit_.ConfigOutput(state_->regs[reg::kGs + reg::kShaderOutputMask]);
+    const ShaderSetup shader{
+        state_->gs.program_code.data(), state_->gs.swizzle_data.data(), &gs_,
+        state_->regs[reg::kGs + reg::kShaderMainOffset] & 0xffff, native_, check_native_,
+    };
+    ++invocations_;
+    const bool ok = engine_->Run(shader, gs_unit_, error_);
+    gs_.b[15] = true;
+    return ok;
 }
 
 void GeometryPipeline::Reset() {
     backend_.reset();
     error_ = {};
     discarded_partial_input_ = false;
-}
-
-bool GeometryPipeline::IsEmpty() const {
-    return backend_ == nullptr || backend_->IsEmpty();
-}
-
-bool GeometryPipeline::NeedIndexInput() const {
-    if (!backend_) {
-        return false;
-    }
-    return backend_->NeedIndexInput();
-}
-
-bool GeometryPipeline::SubmitIndex(u32 val) {
-    return backend_->SubmitIndex(val);
-}
-
-bool GeometryPipeline::SubmitVertex(const AttributeBuffer& input) {
-    if (!backend_) {
-        // No backend means the geometry shader is disabled, so we send the vertex shader output
-        // directly to the primitive assembler.
-        vertex_sink_->SubmitVertex(input);
-        return true;
-    }
-    bool full = false;
-    if (!backend_->SubmitVertex(input, full)) {
-        error_ = {Unhandled::GeometryOverflow, 0, 0};
-        return false;
-    }
-    if (full) {
-        // Setup(): the geometry shader starts at its main offset.
-        ShaderSetup setup;
-        setup.program_code = state_->gs.program_code.data();
-        setup.swizzle_data = state_->gs.swizzle_data.data();
-        setup.uniforms = &gs_;
-        setup.entry_point = BitsOf(state_->regs[reg::kGs + reg::kShaderMainOffset], 0, 16);
-        setup.native = native_;
-        setup.check_native = check_native_;
-        ++invocations_;
-        if (!engine_->Run(setup, gs_unit_, error_)) {
-            return false;
-        }
-
-        // The uniform b15 is set to true after every geometry shader invocation. This is useful
-        // for the shader to know if this is the first invocation in a batch, if the program set
-        // b15 to false first.
-        gs_.b[15] = true;
-    }
-    return true;
 }
 
 } // namespace mh4n::gpu::cpuvertex

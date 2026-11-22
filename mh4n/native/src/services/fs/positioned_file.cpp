@@ -8,6 +8,9 @@
 #include <fmt/format.h>
 
 #include "../../common/utf8.h"
+#include "mh4n/log.h"
+#include "mh4n/stall_stats.h"
+#include <chrono>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -73,7 +76,19 @@ std::size_t PositionedFile::ReadAt(u64 offset, void* buffer, std::size_t length,
     }
     length = static_cast<std::size_t>(std::min<u64>(length, size_ - offset));
     offset += base_;
+    const auto read_start = std::chrono::steady_clock::now();
+    struct Timer {
+        std::chrono::steady_clock::time_point start;
+        const std::size_t& done;
+        u64 at;
+        ~Timer() {
+            const auto us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+            stall::RecordFsRead(us, done);
+            if (us >= 30000) MH4N_LOG(Info, "fs", "slow read: {} KB at offset {} took {:.1f} ms", done >> 10, at, us / 1000.0);
+        }
+    };
     std::size_t done = 0;
+    const Timer timer{read_start, done, offset};
     auto* out = static_cast<u8*>(buffer);
     while (done < length) {
         const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(length - done, 1u << 30));

@@ -1,177 +1,120 @@
-// Derived from Azahar src/core/loader/elf.cpp and src/core/hle/kernel/process.cpp at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later): ElfReader::LoadInto (which
-// PT_LOAD segment becomes text, ro or data), AppLoader_ELF::Load (the defaults of ELF programs)
-// and Process::Set3dsxKernelCaps.
-// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project (elf.cpp)
-// Copyright 2013 Dolphin Emulator Project / 2014 Citra Emulator Project (elf.cpp, second notice:
-// ElfReader comes from Dolphin; GPL-2.0-or-later)
-// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project (process.cpp)
-#include <filesystem>
-#include <fstream>
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: ELF32 program header format, mh4n/loader.h and loader_test.cpp.
 
-#include <fmt/format.h>
+#include "image_fields.h"
+#include "mh4n/loader.h"
 
 #include "../common/utf8.h"
-#include "mh4n/loader.h"
-#include "mh4n/log.h"
 
 namespace mh4n {
-namespace {
-
-constexpr u32 kPtLoad = 1;
-constexpr u32 kPfX = 1, kPfW = 2, kPfR = 4;
-constexpr u16 kEtExec = 2;
-constexpr u16 kEmArm = 40;
-constexpr std::size_t kEhdrSize = 52;
-constexpr std::size_t kPhdrSize = 32;
-
-u16 Le16(const u8* p) {
-    return static_cast<u16>(p[0] | (p[1] << 8));
-}
-u32 Le32(const u8* p) {
-    return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) | (static_cast<u32>(p[2]) << 16) |
-           (static_cast<u32>(p[3]) << 24);
-}
-
-void SetError(std::string* error, std::string message) {
-    if (error) {
-        *error = std::move(message);
-    }
-}
-
-}  // namespace
 
 std::unique_ptr<Loader> Loader::OpenElf(const std::string& path, std::string* error) {
-    // `path` is UTF-8 text (D45): the file is opened and its name taken without the ANSI code page of Windows.
-    const std::filesystem::path host_path = utf8::PathFromUtf8(path);
-    std::ifstream file(host_path, std::ios::binary | std::ios::ate);
-    if (!file) {
-        SetError(error, fmt::format("cannot open {}", path));
+    const auto file = utf8::PathFromUtf8(path);
+    std::vector<u8> bytes;
+    if (!loader_detail::ReadFile(file, path, bytes, error)) {
         return nullptr;
     }
-    const std::streamsize size = file.tellg();
-    file.seekg(0);
-    std::vector<u8> bytes(static_cast<std::size_t>(size));
-    if (size > 0 && !file.read(reinterpret_cast<char*>(bytes.data()), size)) {
-        SetError(error, fmt::format("cannot read {}", path));
-        return nullptr;
-    }
-    return FromElf(std::move(bytes), utf8::PathToUtf8(host_path.filename()), error);
+    return FromElf(std::move(bytes), utf8::PathToUtf8(file.filename()), error);
 }
 
 std::unique_ptr<Loader> Loader::FromElf(std::vector<u8> bytes, std::string name, std::string* error) {
-    if (bytes.size() < kEhdrSize || bytes[0] != 0x7F || bytes[1] != 'E' || bytes[2] != 'L' ||
-        bytes[3] != 'F') {
-        SetError(error, "not an ELF file");
+    using namespace loader_detail;
+    const auto reject = [error](const char* message) {
+        Fail(error, message);
         return nullptr;
+    };
+    if (bytes.size() < 4 || bytes[0] != 0x7F || bytes[1] != 'E' || bytes[2] != 'L' || bytes[3] != 'F') {
+        return reject("not an ELF file");
     }
-    if (bytes[4] != 1 || bytes[5] != 1 || Le16(&bytes[18]) != kEmArm) {
-        SetError(error, "not a 32-bit little-endian ARM ELF file");
-        return nullptr;
+    if (bytes.size() < 52 || bytes[4] != 1 || bytes[5] != 1 || bytes[6] != 1 ||
+        ReadLe(bytes.data() + 18, 2) != 40 || ReadLe(bytes.data() + 20, 4) != 1) {
+        return reject("expected a 32-bit little-endian ARM ELF");
     }
-    const u16 type = Le16(&bytes[16]);
-    const u32 entry = Le32(&bytes[24]);
-    const u32 phoff = Le32(&bytes[28]);
-    const u16 phentsize = Le16(&bytes[42]);
-    const u16 phnum = Le16(&bytes[44]);
-    if (phnum != 0 && (phentsize < kPhdrSize || static_cast<u64>(phoff) + static_cast<u64>(phnum) * phentsize > bytes.size())) {
-        SetError(error, "the ELF program header table is outside the file");
-        return nullptr;
+    const u64 type = ReadLe(bytes.data() + 16, 2);
+    if (type != 2 && type != 3) {
+        return reject("unsupported ELF type");
     }
-    // A relocatable file is loaded at the process image address, as Azahar's ElfReader does.
-    const u32 base = type != kEtExec ? kProcessImageVaddr : 0;
+    const u32 base = type == 3 ? kProcessImageVaddr : 0;
+    const u64 entry = base + ReadLe(bytes.data() + 24, 4);
+    const u64 table = ReadLe(bytes.data() + 28, 4);
+    const u64 stride = ReadLe(bytes.data() + 42, 2);
+    const u64 count = ReadLe(bytes.data() + 44, 2);
+    if (entry >= kManagedEnd || stride < 32 || table + count * stride > bytes.size()) {
+        return reject("invalid ELF entry or program header table");
+    }
 
-    std::unique_ptr<Loader> loader(new Loader);
-    ProcessImage& image = loader->image_;
+    auto loader = std::unique_ptr<Loader>(new Loader);
+    auto& image = loader->image_;
     image.name = std::move(name);
     image.kind = ProgramKind::Elf;
-    image.program_id = 0;
-    image.entry = base + entry;
-    image.stack_size = kDefaultStackSize;
-    image.main_thread_priority = kElfMainThreadPriority;
-    image.ideal_processor = 0;
-    image.memory_mode = kElfMemoryMode;
+    image.entry = static_cast<u32>(entry);
     image.kernel_version = kElfKernelVersion;
-    image.linear_heap_area = LinearHeapAreaForKernelVersion(kElfKernelVersion);
-    image.memory_region = FcramRegion::Application;
-    image.resource_limit_category = 0;
-    image.apply_app_max_cpu = true;
+    image.memory_mode = kElfMemoryMode;
+    image.main_thread_priority = kElfMainThreadPriority;
+    image.linear_heap_area = LinearHeapAreaForKernelVersion(image.kernel_version);
     image.core1_schedule_mode = 1;
     image.core1_max_cpu = 89;
-    // Process::Set3dsxKernelCaps
     image.svc_mask.set();
-    image.address_mappings = {
-        {0x1FF50000, 0x8000, true, false},     // part of DSP RAM
-        {0x1FF70000, 0x8000, true, false},     // part of DSP RAM
-        {0x1F000000, 0x600000, false, false},  // entire VRAM
-    };
+    image.address_mappings = {{0x1FF50000, 0x8000, true, false}, {0x1FF70000, 0x8000, true, false},
+                              {0x1F000000, 0x600000, false, false}};
 
-    bool have[3] = {false, false, false};  // text, ro, data
-    struct Slot {
+    struct Segment {
         SegmentMapping mapping;
         Piece piece;
     };
-    std::optional<Slot> slots[3];
-    for (u16 i = 0; i < phnum; ++i) {
-        const u8* p = &bytes[phoff + static_cast<std::size_t>(i) * phentsize];
-        if (Le32(p) != kPtLoad) {
+    std::array<std::optional<Segment>, 3> segments;
+    for (u64 i = 0; i < count; ++i) {
+        const u8* ph = bytes.data() + table + i * stride;
+        if (ReadLe(ph, 4) != 1) {
             continue;
         }
-        const u32 offset = Le32(p + 4), vaddr = Le32(p + 8), filesz = Le32(p + 16),
-                  memsz = Le32(p + 20), flags = Le32(p + 24) & (kPfR | kPfW | kPfX);
-        int index;
-        MemPerm perm;
-        MemState state;
-        const char* seg_name;
-        if (flags == (kPfR | kPfX)) {
-            index = 0, perm = MemPerm::ReadExecute, state = MemState::Code, seg_name = "text";
-        } else if (flags == kPfR) {
-            index = 1, perm = MemPerm::Read, state = MemState::Code, seg_name = "ro";
-        } else if (flags == (kPfR | kPfW)) {
-            index = 2, perm = MemPerm::ReadWrite, state = MemState::Private, seg_name = "data";
-        } else {
-            MH4N_LOG(Error, "Loader", "unexpected ELF PT_LOAD segment {} with flags {:X}", i, flags);
+        const u64 flags = ReadLe(ph + 24, 4) & 7;
+        const std::size_t index = flags == 5 ? 0 : flags == 4 ? 1 : flags == 6 ? 2 : 3;
+        if (index == 3 || segments[index]) {
             continue;
         }
-        if (have[index]) {
-            MH4N_LOG(Error, "Loader", "ELF has more than one segment of the same type, skipping segment {}", i);
+        const u64 file_offset = ReadLe(ph + 4, 4);
+        const u64 address = base + ReadLe(ph + 8, 4);
+        const u64 file_size = ReadLe(ph + 16, 4);
+        const u64 mem_size = ReadLe(ph + 20, 4);
+        if (file_size > mem_size || file_offset + file_size > bytes.size() ||
+            address + mem_size > kManagedEnd) {
+            return reject("invalid ELF load segment");
+        }
+        if (mem_size == 0) {
             continue;
         }
-        if (filesz > memsz || static_cast<u64>(offset) + filesz > bytes.size()) {
-            SetError(error, fmt::format("ELF segment {} lies outside the file", i));
-            return nullptr;
-        }
-        const u32 aligned = (memsz + kPageMask) & ~kPageMask;
-        const u64 address = static_cast<u64>(base) + vaddr;
-        if (aligned == 0) {
-            continue;  // nothing to map
-        }
-        if (address + aligned > 0x100000000ull) {
-            SetError(error, fmt::format("ELF segment {} wraps around the address space", i));
-            return nullptr;
-        }
-        have[index] = true;
-        slots[index] = Slot{{seg_name, static_cast<u32>(address), aligned, perm, state},
-                            {static_cast<u32>(address), aligned, offset, filesz}};
+
+        const u64 page_offset = address & 0xFFF;
+        const auto vaddr = static_cast<u32>(address - page_offset);
+        const auto size = static_cast<u32>(RoundPage(page_offset + mem_size));
+        const std::array names{"text", "ro", "data"};
+        const std::array perms{MemPerm::ReadExecute, MemPerm::Read, MemPerm::ReadWrite};
+        const auto offset = loader->code_.size();
+        loader->code_.resize(offset + static_cast<std::size_t>(page_offset));
+        loader->code_.insert(loader->code_.end(), bytes.begin() + file_offset,
+                             bytes.begin() + file_offset + file_size);
+        segments[index] = Segment{
+            {names[index], vaddr, size, perms[index], index == 2 ? MemState::Private : MemState::Code},
+            {vaddr, size, offset, static_cast<std::size_t>(page_offset + file_size)}};
         if (index == 0) {
             image.text_base = static_cast<u32>(address);
-            image.text_size = filesz;
+            image.text_size = static_cast<u32>(file_size);
         }
     }
-    if (!slots[0]) {
-        SetError(error, "the ELF file has no executable (R+X) PT_LOAD segment");
-        return nullptr;
+    if (!segments[0]) {
+        return reject("ELF has no executable load segment");
     }
-    for (const auto& slot : slots) {
-        if (slot) {
-            image.segments.push_back(slot->mapping);
-            loader->pieces_.push_back(slot->piece);
+    for (auto& segment : segments) {
+        if (segment) {
+            image.segments.push_back(std::move(segment->mapping));
+            loader->pieces_.push_back(segment->piece);
         }
     }
-    image.segments.push_back({"stack", kStackTop - kDefaultStackSize, kDefaultStackSize,
-                              MemPerm::ReadWrite, MemState::Locked});
-    loader->pieces_.push_back({kStackTop - kDefaultStackSize, kDefaultStackSize, 0, 0});
-    loader->code_ = std::move(bytes);
+    const u32 stack_base = image.stack_top - image.stack_size;
+    image.segments.push_back({"stack", stack_base, image.stack_size, MemPerm::ReadWrite, MemState::Locked});
+    loader->pieces_.push_back({stack_base, image.stack_size, 0, 0});
     return loader;
 }
 

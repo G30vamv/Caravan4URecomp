@@ -15,12 +15,15 @@
 //   mh4u-win [--seconds N] [--vsync on|off] [--mode popup|overlay|stacked|single|side]
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -28,9 +31,13 @@
 #include "net_addresses.h"  // (winsock2.h before windows.h)
 #include "config.h"
 #include "gpu/backend/rhi.h"
+#include "gpu/backend/sync/sync.h"
 #include "gpu/backend/vulkan_access.h"
+#include "discord_presence.h"
 #include "mod_manager.h"
 #include "save_manager.h"
+#include "hid_pads.h"
+#include "hidhide.h"
 #include "input/azahar_rules.h"
 #include "input/input_mapper.h"
 #include "input_live/live_input.h"
@@ -58,6 +65,8 @@ namespace rhi = ::mh4n::gpu::rhi;
 namespace pr = ::mh4n::present;
 namespace sc = ::mh4n::swapchain;
 namespace sl = ::mh4n::screen_layout;
+namespace mh4n::display_mem { std::string Mark(const char* how); }  // display_mem.cpp: a numbered log line with the time
+
 
 namespace {
 
@@ -94,6 +103,7 @@ pr::DisplayFrame TestFrame(std::uint64_t sequence) {
 // ---- the game, when a program is given (mh4u-win [options] -- PROGRAM --code LIB ...) ------------------------------------
 
 std::atomic<mh4n::Runtime*> g_runtime{nullptr};
+std::recursive_mutex g_runtime_mutex;  // held while the shell uses the runtime; the game thread takes the pointer away under it before the runtime dies
 std::atomic<sc::Presenter*> g_presenter{nullptr};
 std::atomic<bool> g_game_done{false};
 
@@ -104,10 +114,13 @@ std::atomic<bool> g_game_done{false};
 // Main thread only.
 mh4n::InputState g_last_state;
 bool g_skip_held = false;
+bool g_skip_pad_held = false;  // MODIFIED: the controller button / trigger chosen for skip (skip_pad); it keeps its own job in the game
 void SendInput(const mh4n::InputState& state) {
     g_last_state = state;
     mh4n::InputState out = state;
-    if (g_skip_held) out.buttons |= mh4n::kPadY;
+    // MODIFIED: the skip key no longer presses Y (the game's Y is 0x8000, the hook's skip button is ZR 0x800: Tab never skipped)
+    Port::Hooks::SetHostSkip(g_skip_held || g_skip_pad_held);
+    const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);
     if (mh4n::Runtime* rt = g_runtime.load()) {
         if (auto live = mh4n::input_live::Find(*rt)) live->Set(out);
     }
@@ -132,9 +145,34 @@ void AttachWindow(mh4n::Runtime& rt) {
     } else {
         std::fprintf(stderr, "mh4u-win: the GPU shows no screens: nothing will be drawn\n");
     }
+    const std::lock_guard<std::recursive_mutex> guard(g_runtime_mutex);
     g_runtime.store(&rt);
 }
 MH4N_REGISTER(mh4n::BootStep, "zz.win.window", mh4n::BootStep{mh4n::Phase::Started, AttachWindow});
+
+// The controllers SDL has plus the HID ones read by hid_pads.h (a DualSense over Bluetooth that SDL does not open...): the mapper
+// lists both. `active` is what the shell decided to use (see pump_hid in main); their buttons arrive as pushed SDL events.
+class HidAugmentedPads final : public mh4n::app::IGamepadLayer {
+public:
+    explicit HidAugmentedPads(std::unique_ptr<mh4n::app::IGamepadLayer> inner) : inner_(std::move(inner)) {}
+    std::vector<mh4n::app::PadInfo> List() override {
+        std::vector<mh4n::app::PadInfo> list = inner_->List();
+        for (const hidpads::Snapshot& pad : active) {
+            mh4n::app::PadInfo info;
+            info.id = pad.id;
+            char guid[32];
+            std::snprintf(guid, sizeof guid, "hid%04x%04x", pad.vendor, pad.product);
+            info.guid = guid;
+            info.name = pad.name;
+            list.push_back(std::move(info));
+        }
+        return list;
+    }
+    std::vector<hidpads::Snapshot> active;
+
+private:
+    std::unique_ptr<mh4n::app::IGamepadLayer> inner_;
+};
 
 // An SDL3 event as the shared sources read it (app_window.h). SDL3 keeps SDL2's numbers for scancodes, mouse buttons,
 // gamepad buttons and gamepad axes, so those pass through unchanged.
@@ -371,6 +409,7 @@ CursorLayer g_cursor;
 
 // The controller's press of the touch screen (the selector's square), through the live input source.
 void PadTouch(bool down, float x, float y) {
+    const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);
     if (mh4n::Runtime* rt = g_runtime.load()) {
         if (auto live = mh4n::input_live::Find(*rt)) {
             if (down) {
@@ -609,7 +648,7 @@ LONG CALLBACK StackWords(PEXCEPTION_POINTERS info) {
 // folder, the code library and the user folder), options (more runner options, e.g. "--room-host 24872 --nick Hunter"; "%EXEDIR%" is the program's folder),
 // scale, volume (0 to 100, 50 by default), vsync (on|off), fullscreen (on|off), width, height, display (-1: the primary display; the first
 // one that is not the primary in a test run),
-// skip_key, circle_pad_pro (on|off), mouse_camera (on|off), fps_counter (on|off: the frame rate over the game, off by default). The shell writes fullscreen, width and height back when it
+// hd_textures (on|off: off reads no HD texture pack), skip_key, circle_pad_pro (on|off), mouse_camera (on|off), fps_counter (on|off: the frame rate over the game, off by default). The shell writes fullscreen, width and height back when it
 // closes.
 struct Ini {
     std::string path;
@@ -632,10 +671,12 @@ struct Ini {
             std::size_t n;
             while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) all.append(buf, n);
             std::fclose(f);
+            if (all.compare(0, 3, "\xEF\xBB\xBF") == 0) all.erase(0, 3);  // a byte order mark
             std::size_t pos = 0;
             while (pos <= all.size()) {
                 const std::size_t end = all.find('\n', pos);
-                lines.push_back(Trim(all.substr(pos, end == std::string::npos ? std::string::npos : end - pos)));
+                const std::string line = Trim(all.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+                if (!line.empty() && line.rfind("# -- ", 0) != 0) lines.push_back(line);
                 if (end == std::string::npos) break;
                 pos = end + 1;
             }
@@ -673,11 +714,60 @@ struct Ini {
         }
         lines.push_back(key + " = " + value);
     }
+    // The file as it is written: the header comment, then the settings in groups ("# -- Video --"...), one blank line between groups,
+    // and whatever is not known (other keys, other comments) at the end in its own order.
+    std::vector<std::string> Tidy() const {
+        struct Group { const char* title; std::vector<std::string> keys; };
+        static const Group kGroups[] = {
+            {"Game", {"game", "code", "user", "options"}},
+            {"Video", {"scale", "fullscreen", "width", "height", "display", "vsync", "fps", "steady", "effects", "aspect", "mode",
+                       "touch_show", "popup_size", "popup_corner", "fps_counter", "pace", "gpu_thread", "hd_textures"}},
+            {"Audio", {"volume"}},
+            {"Controls", {"skip_key", "skip_pad", "circle_pad_pro", "mouse_camera", "hid_pads", "hidhide_ask"}},
+            {"Online", {"nick", "join_address", "host_port", "lobby", "online_touch"}},
+            {"Other", {"language", "discord_presence", "auto_backup", "trace_panels"}},
+        };
+        std::vector<std::string> out;
+        std::size_t first = 0;
+        while (first < lines.size() && lines[first][0] == '#') out.push_back(lines[first++]);
+        std::vector<bool> used(lines.size(), false);
+        for (std::size_t i = 0; i < first; ++i) used[i] = true;
+        const auto group_of = [&](const std::string& key) -> int {
+            for (std::size_t g = 0; g < std::size(kGroups); ++g) {
+                if (std::find(kGroups[g].keys.begin(), kGroups[g].keys.end(), key) != kGroups[g].keys.end()) return static_cast<int>(g);
+            }
+            return key.rfind("key_", 0) == 0 || key.rfind("pad_", 0) == 0 ? 3 : -1;  // the changed controls go with the controls
+        };
+        for (std::size_t g = 0; g < std::size(kGroups); ++g) {
+            std::vector<std::string> block;
+            for (const std::string& key : kGroups[g].keys) {  // in the order of the list
+                for (std::size_t i = first; i < lines.size(); ++i) {
+                    std::string k, v;
+                    if (!used[i] && KeyOf(lines[i], &k, &v) && k == key) { block.push_back(lines[i]); used[i] = true; }
+                }
+            }
+            for (std::size_t i = first; i < lines.size(); ++i) {  // the rest of the group (key_*, pad_*)
+                std::string k, v;
+                if (!used[i] && KeyOf(lines[i], &k, &v) && group_of(k) == static_cast<int>(g)) { block.push_back(lines[i]); used[i] = true; }
+            }
+            if (block.empty()) continue;
+            out.push_back("");
+            out.push_back(std::string("# -- ") + kGroups[g].title + " --");
+            out.insert(out.end(), block.begin(), block.end());
+        }
+        bool any = false;
+        for (std::size_t i = first; i < lines.size(); ++i) {
+            if (used[i]) continue;
+            if (!any) { out.push_back(""); out.push_back("# -- More --"); any = true; }
+            out.push_back(lines[i]);
+        }
+        return out;
+    }
     void Save() const {
         if (path.empty()) return;
         const std::string temp = path + ".tmp";
         if (FILE* f = std::fopen(temp.c_str(), "wb")) {
-            for (const auto& line : lines) std::fprintf(f, "%s\r\n", line.c_str());
+            for (const auto& line : Tidy()) std::fprintf(f, "%s\r\n", line.c_str());
             const bool ok = std::fflush(f) == 0;
             std::fclose(f);
             if (ok && MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return;
@@ -976,6 +1066,9 @@ int main(int argc, char** argv) {
         // pace: frames start on the emulated VBlank (the game's own limiter alone drifts against the VBlank and the
         // display's vsync: now and then a picture is shown twice or never, which feels like stutter at any counter value)
         // (a start-up option: the environment variable the hooks read; ini `pace = limiter` turns it off)
+        if (ini.Get("trace_panels") == "on" && !std::getenv("MH4U_TRACE_PANELS")) _putenv_s("MH4U_TRACE_PANELS", "1");
+        // hd_textures = off: no texture pack is read (the folder stays as it is), to compare with and without
+        if (!on(ini.Get("hd_textures"), true) && !std::getenv("MH4N_HD_TEXTURES")) _putenv_s("MH4N_HD_TEXTURES", "0");
         if (!std::getenv("MH4U_PACE")) _putenv_s("MH4U_PACE", ini.Get("pace").empty() ? "vblank" : ini.Get("pace").c_str());
         if (popup) {  // the touch screen's menus go to the top screen (the game's own single-screen mode)
             game_args.push_back("--set");
@@ -1086,6 +1179,12 @@ int main(int argc, char** argv) {
             overlay.opacity = 1.0f;
             overlay.corner = static_cast<Port::ScreenOverlay::Corner>(g_popup_corner.load());
             request.inputs.overlay = overlay;
+        } else if (request.inputs.mode == sl::Mode::Overlay) {  // MODIFIED: "overlay" = the full top screen with the touch screen always over it (popup_size, popup_corner); popup shows it only when needed
+            Port::ScreenOverlay overlay;
+            overlay.height = static_cast<float>(g_popup_size.load()) / 100.0f;
+            overlay.opacity = 1.0f;
+            overlay.corner = static_cast<Port::ScreenOverlay::Corner>(g_popup_corner.load());
+            request.inputs.overlay = overlay;
         }
         request.options.linear_filter = true;  // bilinear when the window is not a whole multiple of the picture
         return request;
@@ -1107,7 +1206,51 @@ int main(int argc, char** argv) {
     // The input: the keyboard, the mouse and every controller as one 3DS pad (the app's InputMapper), which feeds the
     // runtime's live input source. Audio is the runtime's own SDL sink (--audio sdl).
     bool game = !game_args.empty() && !need_setup;
-    auto pads = mh4n::app::MakeSdlGamepads();
+    auto pads = std::make_unique<HidAugmentedPads>(mh4n::app::MakeSdlGamepads());
+    const char* hid_env = std::getenv("MH4U_HID_PADS");
+    const bool hid_on = on(ini.Get("hid_pads"), true) && !(hid_env && std::string(hid_env) == "0");
+    if (hid_on) hidpads::Start();
+    // HidHide (DSX's leftover) hides a PlayStation pad from every program not on its list: offer to add this one (once; "No" is kept)
+    if (hid_on && game && !std::getenv("MH4U_TEST_SCRIPT") && on(ini.Get("hidhide_ask"), true)) {
+        wchar_t exe_buffer[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe_buffer, MAX_PATH);
+        const std::filesystem::path exe_path(exe_buffer);
+        const std::filesystem::path cli = hidhide::HidingFrom(exe_path, hidpads::XInputConnected());
+        if (!cli.empty()) {
+            std::string lang = ini.Get("language", "auto");
+            if (lang != "es" && lang != "en") {
+                wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+                GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
+                lang = name[0] == L'e' && name[1] == L's' ? "es" : "en";
+            }
+            const bool es = lang == "es";
+            const std::string message =
+                es ? "HidHide (de DSX o DS4Windows) esta ocultando tu mando de PlayStation a los programas que no estan en su lista, "
+                     "asi que Caravan4URecomp no puede leerlo.\n\nPuedo anadir Caravan4URecomp a la lista de HidHide (pide permiso de "
+                     "administrador; se deshace con HidHideCLI --app-unreg). No toco nada mas de HidHide.\n\nSi usas DSX o DS4Windows abiertos "
+                     "no hace falta."
+                   : "HidHide (from DSX or DS4Windows) is hiding your PlayStation controller from programs that are not on its list, so "
+                     "Caravan4URecomp cannot read it.\n\nI can add Caravan4URecomp to HidHide's list (it asks for administrator permission; "
+                     "undo with HidHideCLI --app-unreg). Nothing else of HidHide is touched.\n\nIf you run DSX or DS4Windows it is not needed.";
+            SDL_MessageBoxButtonData buttons[2] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, es ? "Permitir" : "Allow"},
+                                                   {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, es ? "No mas" : "Not again"}};
+            SDL_MessageBoxData box{};
+            box.flags = SDL_MESSAGEBOX_INFORMATION;
+            box.window = window;
+            box.title = "Caravan4URecomp - HidHide";
+            box.message = message.c_str();
+            box.numbuttons = 2;
+            box.buttons = buttons;
+            int chosen = 0;
+            if (SDL_ShowMessageBox(&box, &chosen) && chosen == 1) {
+                const bool done = hidhide::Allow(cli, exe_path);
+                std::fprintf(stderr, "mh4u-win: HidHide: %s\n", done ? "Caravan4URecomp added to its list" : "could not add it (permission refused?)");
+            } else {
+                ini.Set("hidhide_ask", "off");
+                ini.Save();
+            }
+        }
+    }
     mh4n::app::InputMapper mapper(pads.get());
     // The mouse is the stylus (the touch screen) by default. The Azahar app's "auto" mode turns it into the camera as soon
     // as the keyboard is used, and then a click does nothing on the touch screen: --mouse-camera asks for that mode.
@@ -1184,7 +1327,13 @@ int main(int argc, char** argv) {
                 args.emplace_back(value);
             }
         };
-        give("--gpu", "native-display");
+        {   // The GPU on a thread of its own (ini gpu_thread = on|off, or MH4U_GPU_THREAD=1): the game thread only queues
+            // the GPU's work. Off by default until it is proven on every GPU (the MH3U port saw AMD drivers keep memory).
+            const char* env = std::getenv("MH4U_GPU_THREAD");
+            const bool threaded = env != nullptr ? *env == '1' : ini.Get("gpu_thread") == "on";
+            give("--gpu", threaded ? "native-display-queue" : "native-display");
+            give("--async-screens", "on");
+        }
         for (std::string& a : args) {  // fps = display: the refresh rate of the display the window is on
             if (a == "0:fps=display") a = "0:fps=" + std::to_string(DisplayHz(window));
             if (a == "0:fps=unlimited") a = "0:fps=1000";  // no limit in practice: the game runs as fast as it can
@@ -1200,7 +1349,12 @@ int main(int argc, char** argv) {
             // limited by how many pixels that is: ~1e9 pixels a second were measured to be fine on this PC; 2000 reads a second
             // of 3.4 MB (fps unlimited at 3x) starved the game thread and the picture stayed black. Never below 60.
             const int s = std::atoi(scale_arg.c_str());
-            const int max_hz = std::max(60, static_cast<int>(1.0e9 / (172800.0 * s * s)));
+            // (2026-11-20: with the direct screens - the renderer's own images given to the presenter, nothing read back - the
+            // VBlank costs the GPU a copy only, so the ceiling is four times higher; MH4N_SCREEN_DIRECT=0 keeps the old one.)
+            const char* direct_env = std::getenv("MH4N_SCREEN_DIRECT");
+            const bool direct = direct_env == nullptr || *direct_env != '0';
+            const double pixels_per_second = direct ? 4.0e9 : 1.0e9;
+            const int max_hz = std::max(60, std::min(1000, static_cast<int>(pixels_per_second / (172800.0 * s * s))));
             args.emplace_back("--set");
             args.emplace_back("0:max_refresh=" + std::to_string(max_hz));
         }
@@ -1216,6 +1370,8 @@ int main(int argc, char** argv) {
             if (options.ok()) {
                 mh4n::Runtime runtime;
                 status = runtime.Boot(options);
+                const std::lock_guard<std::recursive_mutex> guard(g_runtime_mutex);
+                g_runtime.store(nullptr);  // (before the runtime is destroyed: the shell may still be using it)
             }
             std::printf("mh4u-win: the game ended with status %d\n", status);
             g_game_status.store(status);
@@ -1226,7 +1382,20 @@ int main(int argc, char** argv) {
     if (game) start_game();
 
     KeyboardTyping typing;
-    const SDL_Keycode skip_key = skip_key_name == "none" ? SDLK_UNKNOWN : SDL_GetKeyFromName(skip_key_name.c_str());
+    SDL_Keycode skip_key = skip_key_name == "none" ? SDLK_UNKNOWN : SDL_GetKeyFromName(skip_key_name.c_str());
+    // MODIFIED: skip_pad = "b<N>" (a controller button) or "a<N>+" / "a<N>-" (a trigger or stick axis), chosen in the menu's Controls page; empty = none
+    int skip_pad_kind = 0, skip_pad_index = 0;
+    bool skip_pad_positive = true;
+    const auto set_skip_pad = [&](const std::string& text) {
+        skip_pad_kind = 0;
+        g_skip_pad_held = false;
+        if (text.size() >= 2 && (text[0] == 'b' || text[0] == 'a')) {
+            skip_pad_kind = text[0] == 'b' ? 1 : 2;
+            skip_pad_index = std::atoi(text.c_str() + 1);
+            skip_pad_positive = text.back() != '-';
+        }
+    };
+    set_skip_pad(ini.Get("skip_pad"));
     if (game && skip_key == SDLK_UNKNOWN && skip_key_name != "none") {
         std::fprintf(stderr, "mh4u-win: --skip-key %s is not a key name; the skip key is off\n", skip_key_name.c_str());
     }
@@ -1237,6 +1406,9 @@ int main(int argc, char** argv) {
     std::uint64_t counter_published = 0;
     auto rate_at = std::chrono::steady_clock::now() + std::chrono::seconds(8);  // (the credits show in the title until then)
     std::uint64_t rate_published = 0, rate_presented = 0;
+    // Discord Rich Presence (ini discord_presence = off to turn it off): the game name and the time played, nothing else
+    discord::Presence discord_presence;
+    if (game && on(ini.Get("discord_presence"), true)) discord_presence.Start("Monster Hunter 4 Ultimate", "Playing on Caravan4URecomp");
     const auto start = std::chrono::steady_clock::now();
     const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); };
     std::uint64_t sequence = 0;
@@ -1265,6 +1437,18 @@ int main(int argc, char** argv) {
     }
     ingame::Host menu_host;
     menu_host.value = [&](const std::string& key) -> std::string {
+        if (key == "skip_binding") {  // the keyboard key and the controller's button / axis that skip a cutscene
+            std::string pad = "-";
+            if (skip_pad_kind == 1) {
+                const char* n = SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(skip_pad_index));
+                pad = n ? n : "?";
+            }
+            if (skip_pad_kind == 2) {
+                const char* n = SDL_GetGamepadStringForAxis(static_cast<SDL_GamepadAxis>(skip_pad_index));
+                pad = std::string(n ? n : "?") + (skip_pad_positive ? "+" : "-");
+            }
+            return (skip_key == SDLK_UNKNOWN ? std::string("-") : std::string(SDL_GetKeyName(skip_key))) + "   |   " + pad;
+        }
         if (key == "fullscreen") return fullscreen ? "on" : "off";
         if (key == "vsync") return vsync ? "on" : "off";
         if (key == "mode") return g_popup.load() ? "popup" : sl::ModeName(static_cast<sl::Mode>(g_layout_mode.load()));
@@ -1324,6 +1508,19 @@ int main(int argc, char** argv) {
         return ini.Get(key, key == "fps" || key == "steady" || key == "effects" ? "default" : "");
     };
     menu_host.apply = [&](const std::string& key, const std::string& value) {
+        if (key == "skip_key" || key == "skip_pad") {  // MODIFIED: the skip control, changed in the menu (Backspace there = key Tab, no controller button)
+            if (key == "skip_key") {
+                const std::string name = value.empty() ? "Tab" : value;
+                ini.Set("skip_key", name);
+                skip_key = SDL_GetKeyFromName(name.c_str());
+                g_skip_held = false;
+            } else {
+                ini.Set("skip_pad", value);
+                set_skip_pad(value);
+            }
+            ini.Save();
+            return;
+        }
         if (key.rfind("key_", 0) == 0 || key.rfind("pad_", 0) == 0) {  // a control changed in the menu
             ini.Set(key, value);
             ini.Save();
@@ -1341,6 +1538,7 @@ int main(int argc, char** argv) {
             g_popup.store(value == "popup");
             g_layout_mode.store(static_cast<int>(sl::ParseMode(value)));
             if (was_popup != g_popup.load()) {  // the game's menus follow: on the top screen in popup mode
+                const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);
                 if (mh4n::Runtime* rt = g_runtime.load()) {
                     const std::string v = g_popup.load() ? "on" : "off";
                     rt->GetKernel().Post([v] { Port::Hooks::SetOption("single_screen", v); });
@@ -1367,9 +1565,11 @@ int main(int argc, char** argv) {
             scale_value = value;  // read when the game starts
         } else if (key == "volume") {
             volume_value = value;
+            const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);
             if (mh4n::Runtime* rt = g_runtime.load()) mh4n::app_audio::SetVolume(*rt, std::atoi(value.c_str()));
         } else if (key == "fps" || key == "steady" || key == "effects") {
             // the hooks read these as the game runs; "default" for the other two takes effect at the next start
+            const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);
             if (mh4n::Runtime* rt = g_runtime.load()) {
                 if (key == "fps" || value != "default") {
                     const std::string k = key;
@@ -1516,6 +1716,7 @@ int main(int argc, char** argv) {
     auto size_changed_at = std::chrono::steady_clock::now();
     bool touch_forced = false;  // F2: the popup shows whatever the game does
     auto touch_needed_at = std::chrono::steady_clock::now();
+    auto touch_need_since = std::chrono::steady_clock::time_point{};  // when the (auto) need began; the popup waits for it to last a moment
     auto room_checked_at = std::chrono::steady_clock::now();
     bool in_room = false;  // connected to a room (Joined or Moderator), looked at twice a second
     const bool log_state = std::getenv("MH4U_LOG_STATE") != nullptr;  // prints the game's state when it changes (tuning)
@@ -1632,7 +1833,105 @@ int main(int argc, char** argv) {
         std::stable_sort(script.begin(), script.end(), [](const ScriptStep& a, const ScriptStep& b) { return a.at < b.at; });
     }
 
+    // The moments the player marks (F8, or Share + R3 on a controller): a numbered line in the log with the clock, to find a stutter later
+    auto mark_until = std::chrono::steady_clock::now();
+    bool pad_back_held = false, pad_rs_held = false;
+    const auto do_mark = [&](const char* how) {
+        const std::string text = mh4n::display_mem::Mark(how);
+        std::fprintf(stderr, "mh4u-win: %s (%s)\n", text.c_str(), how);
+        SDL_SetWindowTitle(window, ("Caravan4URecomp - " + text).c_str());
+        mark_until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    };
+    // The HID pads (hid_pads.h) the shell uses: not while an XInput pad is connected nor when SDL already has a gamepad of the same
+    // vendor and product. Each one is announced to the mapper as an SDL gamepad event, and its changes are pushed as button and axis events.
+    std::map<int, hidpads::Snapshot> hid_sent;
+    std::vector<std::pair<std::uint16_t, std::uint16_t>> sdl_pads;
+    bool hid_blocked = false;
+    auto hid_check_at = std::chrono::steady_clock::now();
+    const auto push_pad_event = [](SDL_EventType type, int id, int index, int value) {
+        SDL_Event e;
+        SDL_zero(e);
+        e.type = type;
+        if (type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+            e.gbutton.which = static_cast<SDL_JoystickID>(id);
+            e.gbutton.button = static_cast<Uint8>(index);
+            e.gbutton.down = type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+        } else if (type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+            e.gaxis.which = static_cast<SDL_JoystickID>(id);
+            e.gaxis.axis = static_cast<Uint8>(index);
+            e.gaxis.value = static_cast<Sint16>(value);
+        } else {
+            e.gdevice.which = static_cast<SDL_JoystickID>(id);
+        }
+        SDL_PushEvent(&e);
+    };
+    const auto pump_hid = [&] {
+        if (!hid_on) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= hid_check_at) {
+            hid_check_at = now + std::chrono::seconds(1);
+            hid_blocked = hidpads::XInputConnected();
+            sdl_pads.clear();
+            int count = 0;
+            if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
+                for (int i = 0; i < count; ++i) sdl_pads.emplace_back(SDL_GetGamepadVendorForID(ids[i]), SDL_GetGamepadProductForID(ids[i]));
+                SDL_free(ids);
+            }
+        }
+        std::vector<hidpads::Snapshot> use;
+        for (hidpads::Snapshot& snap : hidpads::Get()) {
+            const bool seen_by_sdl = std::find(sdl_pads.begin(), sdl_pads.end(), std::make_pair(snap.vendor, snap.product)) != sdl_pads.end();
+            if (!hid_blocked && !seen_by_sdl) use.push_back(std::move(snap));
+        }
+        bool changed = false;
+        for (auto it = hid_sent.begin(); it != hid_sent.end();) {  // a pad that is gone or no longer used
+            if (std::none_of(use.begin(), use.end(), [&](const hidpads::Snapshot& s) { return s.id == it->first; })) {
+                std::fprintf(stderr, "mh4u-win: HID pad %04x:%04x no longer used\n", it->second.vendor, it->second.product);
+                for (int b = 0; b < 15; ++b) {
+                    if (it->second.buttons & (1u << b)) push_pad_event(SDL_EVENT_GAMEPAD_BUTTON_UP, it->first, b, 0);
+                }
+                push_pad_event(SDL_EVENT_GAMEPAD_REMOVED, it->first, 0, 0);
+                it = hid_sent.erase(it);
+                changed = true;
+            } else {
+                ++it;
+            }
+        }
+        std::vector<int> added;
+        for (const hidpads::Snapshot& snap : use) {
+            if (hid_sent.count(snap.id)) continue;
+            std::fprintf(stderr, "mh4u-win: using the HID pad %s (%04x:%04x): SDL does not give it to the game\n", snap.name.c_str(), snap.vendor,
+                         snap.product);
+            hidpads::Snapshot blank = snap;
+            blank.buttons = 0;
+            std::fill(blank.axes, blank.axes + hidpads::kAxisCount, std::int16_t{0});
+            hid_sent[snap.id] = blank;
+            added.push_back(snap.id);
+            changed = true;
+        }
+        if (changed) {  // the list first, then the events: the mapper reads the list when it gets them
+            pads->active.clear();
+            for (const auto& entry : hid_sent) pads->active.push_back(entry.second);
+            for (int id : added) push_pad_event(SDL_EVENT_GAMEPAD_ADDED, id, 0, 0);
+        }
+        for (const hidpads::Snapshot& snap : use) {
+            hidpads::Snapshot& sent = hid_sent[snap.id];
+            for (int b = 0; b < 15; ++b) {
+                const bool now_held = snap.buttons & (1u << b), was = sent.buttons & (1u << b);
+                if (now_held != was) push_pad_event(now_held ? SDL_EVENT_GAMEPAD_BUTTON_DOWN : SDL_EVENT_GAMEPAD_BUTTON_UP, snap.id, b, 0);
+            }
+            for (int a = 0; a < hidpads::kAxisCount; ++a) {
+                if (std::abs(snap.axes[a] - sent.axes[a]) >= 256 || (snap.axes[a] == 0) != (sent.axes[a] == 0)) {
+                    push_pad_event(SDL_EVENT_GAMEPAD_AXIS_MOTION, snap.id, a, snap.axes[a]);
+                    sent.axes[a] = snap.axes[a];
+                }
+            }
+            sent.buttons = snap.buttons;
+        }
+    };
+
     while (running) {
+        pump_hid();
         while (script_next < script.size() && elapsed() >= script[script_next].at) {
             for (SDL_Event e : script[script_next].events) SDL_PushEvent(&e);
             ++script_next;
@@ -1675,6 +1974,7 @@ int main(int argc, char** argv) {
                     }
                     if (input.type == App::InputEvent::Type::MouseButton || input.type == App::InputEvent::Type::MouseMotion ||
                         input.type == App::InputEvent::Type::FocusLost) {
+                        const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);
                         if (mh4n::Runtime* rt = g_runtime.load()) {
                             if (auto live = mh4n::input_live::Find(*rt)) {
                                 const auto point = tracker.Point();
@@ -1686,9 +1986,27 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            if (game && skip_pad_kind != 0 && !typing.active && !menu_open) {  // the controller's skip button: the game still gets it too
+                bool now = g_skip_pad_held;
+                bool seen = false;
+                if (skip_pad_kind == 1 && (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) &&
+                    event.gbutton.button == skip_pad_index) {
+                    now = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+                    seen = true;
+                } else if (skip_pad_kind == 2 && event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && event.gaxis.axis == skip_pad_index) {
+                    now = skip_pad_positive ? event.gaxis.value > 16000 : event.gaxis.value < -16000;
+                    seen = true;
+                }
+                if (seen && now != g_skip_pad_held) {
+                    g_skip_pad_held = now;
+                    std::fprintf(stderr, "mh4u-win: skip pad %s\n", now ? "down" : "up");
+                    SendInput(g_last_state);
+                }
+            }
             if (game && skip_key != SDLK_UNKNOWN && (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
                 event.key.key == skip_key && !event.key.repeat && !typing.active && !menu_open) {
                 g_skip_held = event.type == SDL_EVENT_KEY_DOWN;
+                std::fprintf(stderr, "mh4u-win: skip key %s\n", g_skip_held ? "down" : "up");
                 SendInput(g_last_state);
             }
             if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && !typing.active &&
@@ -1708,6 +2026,16 @@ int main(int argc, char** argv) {
                 g_popup.load()) {
                 touch_forced = !touch_forced;  // show or let go of the touch popup by hand
             }
+            if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F8) do_mark("F8");
+            if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {  // Share (Back) + R3
+                const bool down = event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
+                if (event.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) pad_back_held = down;
+                if (event.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) pad_rs_held = down;
+                if (down && pad_back_held && pad_rs_held &&
+                    (event.gbutton.button == SDL_GAMEPAD_BUTTON_BACK || event.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK)) {
+                    do_mark("Share+R3");
+                }
+            }
             typing.OnEvent(event, window);
             if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
                 running = false;
@@ -1718,6 +2046,7 @@ int main(int argc, char** argv) {
                                      static_cast<std::uint32_t>(event.window.data2));
             } else if (event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED && ini.Get("fps") == "display") {
                 // fps = display follows the window to the screen it is on (a 144 Hz cap on a 165 Hz screen is uneven)
+                const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);
                 if (mh4n::Runtime* rt = g_runtime.load()) {
                     const std::string hz = std::to_string(DisplayHz(window));
                     rt->GetKernel().Post([hz] { Port::Hooks::SetOption("fps", hz); });
@@ -1751,6 +2080,7 @@ int main(int argc, char** argv) {
                 touching = false;
                 PadTouch(false, 0.0f, 0.0f);
                 g_skip_held = false;
+                g_skip_pad_held = false;
             }
         }
         if (size_dirty && std::chrono::steady_clock::now() - size_changed_at > std::chrono::seconds(1)) {
@@ -1787,8 +2117,17 @@ int main(int argc, char** argv) {
                 }
             }
             if (touch_show == "hidden" && !touch_forced && !typing.active) need = false;
-            if (need) touch_needed_at = now;
-            const bool show = need || (now - touch_needed_at < std::chrono::milliseconds(1200) && g_touch_visible.load());
+            // MODIFIED: the game's state flickers for a few frames while it changes screens (the touch screen showed for an instant):
+            // the popup comes up only once the need has lasted 300 ms, unless the player asks for it (mouse, F2, "always", the keyboard).
+            const bool asked = touch_show == "always" || touch_forced || touching || typing.active;
+            if (!need) {
+                touch_need_since = {};
+            } else if (touch_need_since == std::chrono::steady_clock::time_point{}) {
+                touch_need_since = now;
+            }
+            const bool lasting = need && (asked || g_touch_visible.load() || now - touch_need_since >= std::chrono::milliseconds(300));
+            if (lasting) touch_needed_at = now;
+            const bool show = lasting || (now - touch_needed_at < std::chrono::milliseconds(1200) && g_touch_visible.load());
             if (show != g_touch_visible.load()) {
                 g_touch_visible.store(show);
                 (*presenter)->RequestRedraw();
@@ -1809,12 +2148,15 @@ int main(int argc, char** argv) {
         if (show_fps && std::chrono::steady_clock::now() - counter_at >= std::chrono::seconds(1)) {
             const sc::Stats counter_stats = (*presenter)->GetStats();
             const double counter_dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - counter_at).count();
-            g_cursor.fps.store(static_cast<int>(std::lround(static_cast<double>(counter_stats.presented - counter_published) / counter_dt)));  // what is shown, not what the game made
+            (void)counter_stats;
+            const std::uint64_t game_frames = Port::Hooks::GameFrameCount();  // MODIFIED: the game's own frames (a 30 fps cap shows 30; the screen refreshes 60)
+            g_cursor.fps.store(static_cast<int>(std::lround(static_cast<double>(game_frames - counter_published) / counter_dt)));
             counter_at = std::chrono::steady_clock::now();
-            counter_published = counter_stats.presented;
+            counter_published = game_frames;
             (*presenter)->RequestRedraw();  // the counter changed while the game may show nothing new
         }
-        if (game && !typing.active && std::chrono::steady_clock::now() >= rate_at + std::chrono::seconds(1)) {
+        if (game && !typing.active && std::chrono::steady_clock::now() >= rate_at + std::chrono::seconds(1) &&
+            std::chrono::steady_clock::now() >= mark_until) {
             const sc::Stats now_stats = (*presenter)->GetStats();
             const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - rate_at).count();
             char title[128];
@@ -1839,9 +2181,12 @@ int main(int argc, char** argv) {
         }
     }
     if (game_thread.joinable()) {
-        if (mh4n::Runtime* rt = g_runtime.load()) {
-            rt->RequestExit(0, "the window is closing");
-        }
+        {
+            const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);
+            if (mh4n::Runtime* rt = g_runtime.load()) {
+                rt->RequestExit(0, "the window is closing");
+            }
+        }  // (released before the join: the game thread takes the same lock to let the runtime go)
         game_thread.join();
         pr::SetSharedBackend({});
         g_presenter.store(nullptr);
@@ -1859,6 +2204,7 @@ int main(int argc, char** argv) {
     (*presenter)->Stop();
     menu_overlay.ResetGui();  // the menu's renderer waits for the device and lets its Vulkan objects go
     presenter->reset();
+    rhi::sync::ReleaseRetired(**backend);  // the images of the last frames still hold the device (WP89 M1)
     SDL_Vulkan_DestroySurface(rhi::NativeInstance(**instance), vk_surface, nullptr);
     backend->reset();
     if (!ini.path.empty()) {

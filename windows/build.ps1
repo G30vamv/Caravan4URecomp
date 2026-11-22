@@ -16,7 +16,8 @@ param(
     [string]$BuildDir = "",
     [string]$DistDir = "",
     [string]$Sdl3Dir = "",
-    [string]$Sdl3Version = "3.4.20"
+    [string]$Sdl3Version = "3.4.20",
+    [switch]$Launcher   # also build Caravan4URecomp-Launcher.exe (PyInstaller) into the dist folder
 )
 $ErrorActionPreference = "Stop"
 
@@ -92,6 +93,15 @@ $copies = @(
 foreach ($c in $copies) {
     if (Test-Path $c[0]) { Copy-Item $c[0] (Join-Path $lic $c[1]) -Force } else { Write-Warning "license file not found: $($c[0])" }
 }
+# the licence texts of the libraries built into the program (plume, volk, VMA, ENet, fmt, glslang, ImGui, LodePNG, xxHash, bc7enc,
+# inih, CityHash, Vulkan headers, the system archives and their fonts): the tree already keeps them for the Android app
+$third = Join-Path $lic "third-party"
+New-Item -ItemType Directory -Force $third | Out-Null
+$thirdSrc = Join-Path $repo "android\app\src\main\assets\licenses"
+foreach ($n in "plume","volk","VulkanMemoryAllocator","Vulkan-Headers","ENet","fmt","glslang","DearImGui","LodePNG","xxHash","bc7enc","inih","CityHash","SystemArchives","Fonts","HIDAPI") {
+    $f = Join-Path $thirdSrc "$n.txt"
+    if (Test-Path $f) { Copy-Item $f (Join-Path $third "$n.txt") -Force } else { Write-Warning "license text not found: $f" }
+}
 $ini = Join-Path $DistDir "Caravan4URecomp.ini"
 if (-not (Test-Path $ini)) {
     @"
@@ -108,5 +118,9 @@ skip_key = Tab
 circle_pad_pro = on
 fps_counter = off
 "@ | Set-Content $ini -Encoding ascii
+}
+if ($Launcher) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $source ("launcher" + [IO.Path]::DirectorySeparatorChar + "build_launcher.ps1")) -OutDir $DistDir
+    if ($LASTEXITCODE -ne 0) { throw "build_launcher.ps1 failed" }
 }
 Write-Host "done: $DistDir\Caravan4URecomp.exe"

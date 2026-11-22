@@ -11,6 +11,7 @@
 //     dropped. It copies, then publishes read_ (release), which frees the slots for Queue.
 // Queue never writes read_, so it never takes frames from a Pull in progress.
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include "audio_out/audio_out.h"
@@ -22,6 +23,14 @@ StreamSink::StreamSink(std::size_t target_frames) : ring_(kRingFrames * 2, 0), t
 void StreamSink::Queue(const s16* stereo, std::size_t frames) {
     if (frames == 0) {
         return;
+    }
+    {   // MODIFIED: the gap since the previous Queue (diagnostic)
+        const s64 now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const s64 before = last_queue_ns_.exchange(now_ns, std::memory_order_relaxed);
+        if (before != 0) {
+            const u64 gap = static_cast<u64>(now_ns - before) / 1000;
+            if (gap > max_gap_us_.load(std::memory_order_relaxed)) max_gap_us_.store(gap, std::memory_order_relaxed);
+        }
     }
     const u64 w = write_.load(std::memory_order_relaxed);
     const u64 r = read_.load(std::memory_order_acquire);
@@ -68,6 +77,7 @@ std::size_t StreamSink::Pull(s16* out, std::size_t frames) {
     }
     const u64 available = w - r;
 
+    const bool was_priming = priming_;
     if (priming_) {
         const std::size_t need =
             std::min(std::max(target_.load(std::memory_order_relaxed), frames), kOverflowFrames);
@@ -110,6 +120,9 @@ std::size_t StreamSink::Pull(s16* out, std::size_t frames) {
     // opens before the game has made any sound has nothing to interrupt.
     if (started_ && !in_short_run_) {
         underruns_.fetch_add(1, std::memory_order_relaxed);
+        ur_wanted_.store(frames, std::memory_order_relaxed);
+        ur_available_.store(available, std::memory_order_relaxed);
+        ur_priming_.store(was_priming, std::memory_order_relaxed);
     }
     in_short_run_ = true;
 

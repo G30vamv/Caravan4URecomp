@@ -1,98 +1,289 @@
-// The word positions of the framebuffer and colour fill registers are Azahar's, from
-// src/video_core/pica/regs_external.h and regs_lcd.h at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6
-// (GPL-2.0-or-later), as gpu_capture/image.cpp has them; see native/THIRD_PARTY.md. The rest is ours.
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (regs_external.h)
-// Copyright 2023-2024 Citra Emulator Project / Azahar Emulator Project (regs_lcd.h)
-#include "display_mem/display_mem.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: 3dbrew GPU External Registers and LCD Registers, display_mem.h, display_mem_test.cpp and the ScaledScreens, DisplayShadow and Runtime contracts.
+
+#include "display_mem.h"
 
 #include <algorithm>
+#include <chrono>
+#include "mh4n/stall_stats.h"
+#include <cstdio>
+#include <ctime>
+#include <string>
+#include <array>
+#include <atomic>
+#include <cstdlib>
+#include <limits>
+#include <string_view>
 #include <utility>
 
-#include "gpu/native/scaled_screens.h"
 #define XXH_INLINE_ALL
 #include <xxhash.h>
+
+#include "gpu/native/scaled_screens.h"
+#if __has_include("../gpu_queue/queue_gpu.h")
+#include "../gpu_queue/queue_gpu.h"
+#else
 #include "gpu/queue/queue_gpu.h"
-#include "mh4n/options.h"
-#include "mh4n/pacing_trace.h"
-#include "mh4n/gpu_debug.h"
+#endif
 #include "mh4n/log.h"
-
-#include <cstdlib>
-#include <cstring>
-#include "mh4n/registry.h"
-
+#include "mh4n/pacing_trace.h"
+#include "mh4n/scheduler.h"
 #if MH4N_DISPLAY_MEM_PLATFORM
 #include "platform/platform_native.h"
 #endif
 
 namespace mh4n::display_mem {
-
 namespace {
 
-constexpr const char* kLog = "GPU.DisplayMem";
+using Shadow = gpu_capture::DisplayShadow;
+using Read = gpu::ScaledScreens::ScreenRead;
+constexpr auto kLog = "display_mem";
 
+// The player's marks (F8 / Share + R3): the same clock as "frame gap ... at t=" (t from the first VBlank) and the VBlank count.
+std::atomic<std::int64_t> g_origin_ns{0};  // steady_clock ticks of the first VBlank (0 = none yet)
+std::atomic<u64> g_vblanks{0};
+
+constexpr std::array<u32, 2> kPdcBase{0x1EF00400, 0x1EF00500};
+constexpr std::array<u32, 2> kLcdFill{0x1ED02204, 0x1ED02A04};
+constexpr u32 kLeftFramebuffer = 0x68;
+constexpr u32 kFormat = 0x70;
+constexpr u32 kFramebufferSelect = 0x78;
+constexpr u32 kStride = 0x90;
+constexpr u32 kFillEnabled = 1u << 24;
+
+DisplayMemGpu::FrameInfo SampleFrame(const RuntimeLink* link) {
+    DisplayMemGpu::FrameInfo frame{};
+    if (!link) return frame;
+    frame.game_frame = link->game_frame.load(std::memory_order_relaxed);
+    if (!link->runtime) return frame;
+    frame.tick = link->runtime->Clock().Now();
 #if MH4N_DISPLAY_MEM_PLATFORM
-// The top screen's framebuffer size register (word 0x17 of the first framebuffer block, which starts
-// at word 0x100 of the GPU registers): the high half is the number of columns stored, the width the
-// top screen shows (400, or what the hooks make of it).
-constexpr u32 kTopSizeRegister = gpu_capture::DisplayShadow::kGpuBase + 4 * (0x100 + 0x17);
-#endif
-
-// Word indices of a screen's framebuffer registers (framebuffer_config[screen] of the GPU register
-// array, as image.cpp reads them) and of the colour fill registers in the LCD array.
-constexpr u32 kFbConfigBase = 0x100;
-constexpr u32 kFbConfigWords = 0x40;
-constexpr u32 kFbSize = 0x17;
-constexpr u32 kFbAddressLeft1 = 0x1A;
-constexpr u32 kFbAddressLeft2 = 0x1B;
-constexpr u32 kFbFormat = 0x1C;
-constexpr u32 kFbActive = 0x1E;
-constexpr u32 kFbStride = 0x24;
-constexpr u32 kLcdColorFillTop = 0x81;
-constexpr u32 kLcdColorFillBottom = 0x281;
-
-// The RGBA8 `pixels` (width x height) enlarged `scale` times, nearest.
-std::shared_ptr<std::vector<u8>> Enlarge(const std::vector<u8>& pixels, u32 width, u32 height, u32 scale) {
-    const std::size_t out_width = static_cast<std::size_t>(width) * scale;
-    auto out = std::make_shared<std::vector<u8>>(out_width * height * scale * 4);
-    for (u32 y = 0; y < height; ++y) {
-        u8* row = out->data() + static_cast<std::size_t>(y) * scale * out_width * 4;
-        const u8* in = pixels.data() + static_cast<std::size_t>(y) * width * 4;
-        for (u32 x = 0; x < width; ++x) {
-            for (u32 i = 0; i < scale; ++i) {
-                std::memcpy(row + (static_cast<std::size_t>(x) * scale + i) * 4, in + static_cast<std::size_t>(x) * 4, 4);
-            }
-        }
-        for (u32 i = 1; i < scale; ++i) {
-            std::memcpy(row + i * out_width * 4, row, out_width * 4);
-        }
+    if (const auto platform = platform::NativePlatform::Find(*link->runtime)) {
+        if (const u32 rows = platform->TopScreenRows()) frame.top_columns = rows;
     }
-    return out;
+#endif
+    return frame;
 }
 
-}  // namespace
+u32 Fill(const Shadow& state, u32 screen) {
+    return state.LcdReg((kLcdFill[screen] - Shadow::kLcdBase) / 4);
+}
+
+struct Framebuffer {
+    u32 address;
+    u32 other_address;
+    u32 format;
+    u32 stride;
+    u32 bytes_per_pixel;
+};
+
+Framebuffer Buffer(const Shadow& state, u32 screen) {
+    const auto reg = [&](u32 offset) {
+        return state.GpuReg((kPdcBase[screen] + offset - Shadow::kGpuBase) / 4);
+    };
+    const u32 selected = reg(kFramebufferSelect) & 1u;
+    const u32 format = reg(kFormat) & 7u;
+    return {reg(kLeftFramebuffer + 4 * selected), reg(kLeftFramebuffer + 4 * (1 - selected)),
+            format, reg(kStride), gpu_capture::BytesPerPixel(format)};
+}
+
+present::ScreenImage CpuImage(u32 width, u32 height, std::shared_ptr<std::vector<u8>> pixels) {
+    present::ScreenImage image{};
+    image.width = width;
+    image.height = height;
+    image.region = {0, 0, width, height};
+    image.pixels = std::move(pixels);
+    return image;
+}
+
+std::optional<std::size_t> RgbaSize(u32 width, u32 height, u32 scale) {
+    const u64 w = u64{width} * scale;
+    const u64 h = u64{height} * scale;
+    constexpr auto max_size = std::numeric_limits<std::size_t>::max();
+    if (!w || !h || w > std::numeric_limits<u32>::max() || h > std::numeric_limits<u32>::max() ||
+        w > max_size / 4 / h) return std::nullopt;
+    return static_cast<std::size_t>(w * h * 4);
+}
+
+void Store(u8* output, gpu_capture::Rgb color) {
+    output[0] = color.r;
+    output[1] = color.g;
+    output[2] = color.b;
+    output[3] = 255;
+}
+
+void ReadCpuScreen(const present::ScreenImage& screen, std::function<void(present::RgbImage)> done) {
+    if (!screen.Valid() || !screen.IsCpu()) {
+        done({});
+        return;
+    }
+    present::RgbImage result{};
+    result.width = screen.width;
+    result.height = screen.height;
+    const auto& pixels = *screen.pixels;
+    result.rgb.resize(pixels.size() / 4 * 3);
+    for (std::size_t src = 0, dst = 0; src < pixels.size(); src += 4, dst += 3) {
+        std::copy_n(pixels.data() + src, 3, result.rgb.data() + dst);
+    }
+    done(std::move(result));
+}
+
+class QueuedDisplayTarget final : public DisplayMemGpu, public gpu::GpuDebug {
+public:
+    QueuedDisplayTarget(gpu::Host& host, std::unique_ptr<gpu::Gpu> inner)
+        : DisplayMemGpu(host, std::move(inner)), debug_(dynamic_cast<gpu::GpuDebug*>(&Inner())) {}
+
+    void RenderVBlank(u32 screen, const FrameInfo& frame) { PublishVBlank(screen, &frame); }
+
+    void LoadInitState(const gpu::InitState& state) override {
+        if (!debug_) return;
+        debug_->LoadInitState(state);
+        RefreshDisplayRegisters();
+    }
+    std::optional<std::vector<gpu::RegisterWrite>> TakeRegisterWrites() override {
+        return debug_ ? debug_->TakeRegisterWrites() : std::nullopt;
+    }
+    void WriteBackColorBuffers() override {
+        if (debug_) debug_->WriteBackColorBuffers();
+    }
+    std::vector<gpu::Counter> TakeFrameCounters() override {
+        return debug_ ? debug_->TakeFrameCounters() : std::vector<gpu::Counter>{};
+    }
+    std::optional<u64> TakeFrameGpuTimeNs() override {
+        return debug_ ? debug_->TakeFrameGpuTimeNs() : std::nullopt;
+    }
+
+private:
+    gpu::GpuDebug* const debug_;
+};
+
+class QueuedDisplayGpu final : public gpu::queue::QueueGpu, public present::Display {
+public:
+    QueuedDisplayGpu(gpu::Host& host, const InnerMaker& make_inner)
+        : QueueGpu(host, make_inner, {.lockstep = false, .max_frames_in_flight = 1, .max_frames_queued = 2}) {}
+
+    void Attach(std::shared_ptr<RuntimeLink> link) { link_ = std::move(link); }
+
+    u32 ReadReg(u32 addr) override {
+        if ((addr & 3) != 0) return 0;
+        // LCD controls other than the fill registers only change through explicit writes.
+        // GX and PICA registers can also change as commands complete, so read the ordered value.
+        constexpr u32 lcd_begin = 0x1ED02000;
+        constexpr u32 lcd_end = lcd_begin + 0x1000;
+        if (addr >= lcd_begin && addr < lcd_end && addr != kLcdFill[0] && addr != kLcdFill[1]) {
+            return QueueGpu::ReadReg(addr);
+        }
+        u32 value = 0;
+        RunSync([&] { value = ForwardTarget("ReadReg").ReadReg(addr); }, true);
+        return value;
+    }
+
+    void InvalidateRegion(u32 addr, u32 size) override {
+        if (size) QueueGpu::InvalidateRegion(addr, size);
+    }
+
+    void VBlank(u32 screen) override {
+        if (finished_) return;
+        const auto frame = screen == 0 ? SampleFrame(link_.get()) : DisplayMemGpu::FrameInfo{};
+        EnqueueVBlank(screen, [screen, frame](gpu::Gpu& target) {
+            static_cast<QueuedDisplayTarget&>(target).RenderVBlank(screen, frame);
+        }, true);
+    }
+
+    void AddScreenSink(present::ScreenSink* sink) override {
+        RunSync([&] { static_cast<QueuedDisplayTarget&>(ForwardTarget("AddScreenSink")).AddScreenSink(sink); });
+    }
+    void RemoveScreenSink(present::ScreenSink* sink) override {
+        RunSync([&] { static_cast<QueuedDisplayTarget&>(ForwardTarget("RemoveScreenSink")).RemoveScreenSink(sink); });
+    }
+    void ReadScreen(const present::ScreenImage& screen,
+                    std::function<void(present::RgbImage)> done) override {
+        ReadCpuScreen(screen, std::move(done));
+    }
+
+    std::vector<gpu::Counter> TakeFrameCounters() override {
+        auto counters = QueueGpu::TakeFrameCounters();
+        const auto busy = std::find_if(counters.rbegin(), counters.rend(), [](const gpu::Counter& counter) {
+            return counter.name == "translate_us";
+        });
+        if (busy != counters.rend() && std::none_of(counters.begin(), counters.end(), [](const gpu::Counter& counter) {
+                return counter.name == "render_thread_busy_us";
+            })) {
+            counters.push_back({"render_thread_busy_us", busy->value});
+        }
+        return counters;
+    }
+
+    void Finish(Runtime& runtime) {
+        finished_ = true;
+        // Only the posted work, until none of it queues more render work (no timer fires: it could queue a new swap)
+        do {
+            WaitIdle();
+        } while (runtime.Scheduler().RunPending(false));
+    }
+
+private:
+    std::shared_ptr<RuntimeLink> link_;
+    bool finished_ = false;
+};
+
+void AttachRuntime(Runtime& runtime) {
+    auto* gpu = runtime.Interfaces().gpu;
+    auto* queued = gpu::FindGpu<QueuedDisplayGpu>(gpu);
+    auto* display = queued ? nullptr : gpu::FindGpu<DisplayMemGpu>(gpu);
+    if (!queued && !display) return;
+    auto link = std::make_shared<RuntimeLink>();
+    link->runtime = &runtime;
+    if (queued) {
+        queued->Attach(link);
+        runtime.OnFinish([&runtime] {
+            if (auto* current = gpu::FindGpu<QueuedDisplayGpu>(runtime.Interfaces().gpu)) {
+                current->Finish(runtime);
+            }
+        });
+    } else {
+        display->Attach(link);
+    }
+    runtime.OnFrame([link](u32 frame, u64) {
+        link->game_frame.store(frame, std::memory_order_relaxed);
+    });
+}
+
+std::unique_ptr<gpu::Gpu> MakeDisplay(std::string_view name, gpu::Host& host, const Options& options) {
+    const auto* factory = Registry<gpu::GpuFactory>::Instance().Find(name);
+    if (!factory) return nullptr;
+    auto inner = (*factory)(host, options);
+    if (!inner) return nullptr;
+    return std::make_unique<DisplayMemGpu>(host, std::move(inner));
+}
+
+std::unique_ptr<gpu::Gpu> MakeQueuedDisplay(gpu::Host& host, const Options& options) {
+    const auto* factory = Registry<gpu::GpuFactory>::Instance().Find("native");
+    if (!factory) return nullptr;
+    return std::make_unique<QueuedDisplayGpu>(host, [&](gpu::Host& queue_host) -> std::unique_ptr<gpu::Gpu> {
+        auto inner = (*factory)(queue_host, options);
+        if (!inner) return nullptr;
+        return std::make_unique<QueuedDisplayTarget>(queue_host, std::move(inner));
+    });
+}
+
+} // namespace
 
 DisplayMemGpu::DisplayMemGpu(gpu::Host& host, std::unique_ptr<gpu::Gpu> inner)
-    : host_(host), inner_(std::move(inner)) {
-    // Load takes the registers as little-endian bytes: read them from the inner GPU's register file.
-    std::vector<u8> gpu_regs(4 * gpu_capture::DisplayShadow::kGpuRegWords);
-    std::vector<u8> lcd_regs(4 * gpu_capture::DisplayShadow::kLcdRegWords);
-    const auto put = [](std::vector<u8>& bytes, u32 index, u32 value) {
-        for (u32 i = 0; i < 4; ++i) {
-            bytes[4 * index + i] = static_cast<u8>(value >> (8 * i));
+    : host_(host), inner_(std::move(inner)), scaled_(dynamic_cast<gpu::ScaledScreens*>(inner_.get())),
+      scale_(scaled_ ? std::max(1u, scaled_->ScreenScale()) : 1u) {
+    RefreshDisplayRegisters();
+}
+
+void DisplayMemGpu::RefreshDisplayRegisters() {
+    for (u32 screen = 0; screen < kPdcBase.size(); ++screen) {
+        for (u32 offset = 0; offset < 0x100; offset += 4) {
+            const u32 address = kPdcBase[screen] + offset;
+            shadow_.WriteReg(address, inner_->ReadReg(address));
         }
-    };
-    for (u32 i = 0; i < gpu_capture::DisplayShadow::kGpuRegWords; ++i) {
-        put(gpu_regs, i, inner_->ReadReg(gpu_capture::DisplayShadow::kGpuBase + 4 * i));
-    }
-    for (u32 i = 0; i < gpu_capture::DisplayShadow::kLcdRegWords; ++i) {
-        put(lcd_regs, i, inner_->ReadReg(gpu_capture::DisplayShadow::kLcdBase + 4 * i));
-    }
-    shadow_.Load(gpu_regs.data(), lcd_regs.data());
-    scaled_ = dynamic_cast<gpu::ScaledScreens*>(inner_.get());
-    scale_ = scaled_ != nullptr ? std::max<u32>(scaled_->ScreenScale(), 1) : 1;
-    if (scaled_ != nullptr && !scaled_->HasScreens()) {
-        scaled_ = nullptr;  // (a scale of 1 without asynchronous screens: the screens come from guest memory)
+        const u32 fill = kLcdFill[screen];
+        shadow_.WriteReg(fill, inner_->ReadReg(fill));
     }
 }
 
@@ -111,18 +302,10 @@ u32 DisplayMemGpu::ReadReg(u32 addr) {
 
 void DisplayMemGpu::SetBufferSwap(u32 screen, const gpu::FrameBufferInfo& info) {
     inner_->SetBufferSwap(screen, info);
-    if (screen == 0) {
-        ++top_swaps_;
-    }
-    // GPU::VirtualToPhysicalAddress: 0 stays 0, an address in no window is kept.
-    const auto physical = [this](u32 vaddr) {
-        if (vaddr == 0) {
-            return 0u;
-        }
-        const auto converted = host_.VirtualToPhysical(vaddr);
-        return converted ? *converted : vaddr;
-    };
-    shadow_.ApplySwap(screen, info, physical(info.address_left), physical(info.address_right));
+    if (screen >= kPdcBase.size()) return;
+    shadow_.ApplySwap(screen, info, host_.VirtualToPhysical(info.address_left).value_or(0),
+                      host_.VirtualToPhysical(info.address_right).value_or(0));
+    if (screen == 0) ++top_swaps_;
 }
 
 void DisplayMemGpu::SetColorFill(u32 fill) {
@@ -138,568 +321,311 @@ void DisplayMemGpu::InvalidateRegion(u32 vaddr, u32 size) {
     inner_->InvalidateRegion(vaddr, size);
 }
 
-namespace {
-// The pacing trace (MH4N_PACING_TRACE): a renderer frame counter worth a mark (the times need MH4N_GPU_COUNTERS too:
-// the renderer reads its clock only then).
-void MarkCounter(const gpu::Counter& c) {
-    const std::string& n = c.name;
-    const pacing::Kind kind = n == "pipeline_sync_us" ? pacing::kRenderSync
-                              : n == "tex_us"         ? pacing::kRenderTex
-                              : n == "pace_us"        ? pacing::kRenderPace
-                              : n == "draw_us"        ? pacing::kRenderDraw
-                              : n == "writeback_us"   ? pacing::kRenderWriteback
-                              : n == "ring_wait_us"   ? pacing::kRenderRing
-                              : n == "pipeline_skipped" ? pacing::kRenderSkipped
-                              : n == "cpu_us"         ? pacing::kRenderCpu
-                              : n == "materialize_us" ? pacing::kRenderMaterialize
-                              : n == "compose_us"     ? pacing::kRenderCompose
-                              : n == "vtx_us"         ? pacing::kRenderVertex
-                              : n == "prep_us"        ? pacing::kRenderPrep
-                              : n == "tgt_us"         ? pacing::kRenderTarget
-                              : n == "fallback_draws" ? pacing::kRenderFallback
-                              : n == "pipeline_async_builds" ? pacing::kRenderAsyncBuilds
-                              : n == "texture_uploads" ? pacing::kRenderUploads
-                              : n == "gpu_us"         ? pacing::kRenderGpu
-                              : n == "decode_us"      ? pacing::kRenderDecode
-                              : n == "upload_us"      ? pacing::kRenderUpload
-                              : n == "load_us"        ? pacing::kRenderLoad
-                              : n == "create_us"      ? pacing::kRenderCreate
-                              : n == "writebacks_cpu" ? pacing::kRenderWbCpu
-                              : n == "writebacks_texture" ? pacing::kRenderWbTexture
-                              : n == "writebacks_gx"  ? pacing::kRenderWbGx
-                              : n == "writebacks_overlap" ? pacing::kRenderWbOverlap
-                              : n == "writebacks_other" ? pacing::kRenderWbOther
-                              : n == "ab_phase"       ? pacing::kRenderAbPhase
-                                                      : pacing::Kind{0};
-    if (kind != 0 && c.value != 0) {
-        pacing::Mark(kind, static_cast<u32>(std::min<u64>(c.value, 0xFFFFFFFFu)));
-    }
-}
-}  // namespace
-
-void DisplayMemGpu::VBlank(u32 screen) {
-    inner_->VBlank(screen);
-    // MH4N_GPU_COUNTERS=N: every N top-screen VBlanks, the inner GPU's non-zero frame counters (a debugging aid)
-    static const int counters_every = [] { const char* v = std::getenv("MH4N_GPU_COUNTERS"); return v ? std::atoi(v) : 0; }();
-    if (screen == 0 && counters_every > 0) {
-        if (auto* debug = dynamic_cast<gpu::GpuDebug*>(inner_.get())) {
-            std::string line;
-            for (const gpu::Counter& c : debug->TakeFrameCounters()) {
-                MarkCounter(c);
-                if (c.value != 0) {
-                    line += fmt::format(" {}={}", c.name, c.value);
-                }
-            }
-            // MH4N_GPU_TIME=1: the GPU's time for the frame's work (timestamps; it waits for the GPU at every VBlank)
-            static const bool gpu_time = [] { const char* v = std::getenv("MH4N_GPU_TIME"); return v != nullptr && *v == '1'; }();
-            if (gpu_time) {
-                if (const std::optional<u64> ns = debug->TakeFrameGpuTimeNs()) {
-                    line += fmt::format(" gpu_us={}", *ns / 1000);
-                }
-            }
-            if (++counter_vblanks_ % counters_every == 0) {
-                MH4N_LOG(Info, kLog, "vblank {}:{}", counter_vblanks_, line);
-            }
-        }
-    }
-    // the pacing trace (MH4N_PACING_TRACE, without MH4N_GPU_COUNTERS: it takes them): where the renderer's frame went
-    if (screen == 0 && counters_every <= 0 && pacing::Trace::Get().On()) {
-        if (auto* debug = dynamic_cast<gpu::GpuDebug*>(inner_.get())) {
-            for (const gpu::Counter& c : debug->TakeFrameCounters()) {
-                MarkCounter(c);
-            }
-        }
-    }
-    if (screen != 0 || sinks_.empty()) {
-        return;
-    }
-    if (scaled_ != nullptr) {
-        const bool hidden = std::any_of(sinks_.begin(), sinks_.end(), [](const present::ScreenSink* s) {
-            return s->ScreenHidden(1);
-        });
-        if (hidden != touch_hidden_) {
-            touch_hidden_ = hidden;
-            scaled_->SetTouchScreenShown(!hidden);
-        }
-    }
-    present::DisplayFrame frame;
-    frame.sequence = next_sequence_++;
-    if (link_ != nullptr) {
-        frame.game_frame = link_->game_frame.load();
-        if (link_->runtime != nullptr) {
-            frame.tick = link_->runtime->Clock().Now();
-        }
-    }
-    frame.top = BuildScreen(0);
-    // the touch screen while it is hidden: not built (the renderer draws neither it nor its picture then, and
-    // building it from its framebuffer's memory would wait for the GPU)
-    const bool bottom_hidden = scaled_ != nullptr && touch_hidden_;
-    if (!bottom_hidden) {
-        frame.bottom = BuildScreen(1);
-    }
-    pacing::Mark(pacing::kPublish, frame.game_frame);
-    pacing::Mark(pacing::kPublishSwap, top_swaps_);
-    for (present::ScreenSink* sink : sinks_) {
-        sink->Publish(frame);
-    }
-}
-
-// MH4N_SCALE_LOG=<n> (gpu/native's measurement aid, its display side): a screen built from guest memory at 1x while the
-// renderer draws at a higher scale (no shared picture and no scaled one for its framebuffer), when it starts after 60
-// frames without, with the framebuffer's registers; n lines at most.
-void DisplayMemGpu::LogMemoryScreen(u32 screen) {
-    static const u32 limit = [] {
-        const char* v = std::getenv("MH4N_SCALE_LOG");
-        return v != nullptr ? static_cast<u32>(std::max(0, std::atoi(v))) : 0u;
-    }();
-    if (memory_screen_logs_ >= limit) {
-        return;
-    }
-    const u32 frame = link_ != nullptr ? link_->game_frame.load() : static_cast<u32>(next_sequence_);
-    const bool again = !memory_screen_seen_[screen] || frame - memory_screen_frame_[screen] > 60;
-    memory_screen_seen_[screen] = true;
-    memory_screen_frame_[screen] = frame;
-    if (!again) {
-        return;
-    }
-    ++memory_screen_logs_;
-    const u32 fb = kFbConfigBase + kFbConfigWords * screen;
-    const bool first_buffer = shadow_.GpuReg(fb + kFbActive) == 0;
-    MH4N_LOG(Info, kLog, "scale f{}: display: the {} screen built from guest memory at 1x (framebuffer {:08x}, format {}, stride {}, "
-             "rows {}, colour fill {:08x})",
-             frame, screen == 0 ? "top" : "touch", shadow_.GpuReg(fb + (first_buffer ? kFbAddressLeft1 : kFbAddressLeft2)),
-             shadow_.GpuReg(fb + kFbFormat) & 7, shadow_.GpuReg(fb + kFbStride), shadow_.GpuReg(fb + kFbSize) >> 16,
-             shadow_.LcdReg(screen == 0 ? kLcdColorFillTop : kLcdColorFillBottom));
-}
-
-std::optional<present::ScreenImage> DisplayMemGpu::BuildScreen(u32 screen) {
-#if MH4N_DISPLAY_MEM_PLATFORM
-    if (screen == 0 && link_ != nullptr && link_->runtime != nullptr) {
-        // The reference's hooks write the top framebuffer's size register; here the platform keeps
-        // what they asked for.
-        if (const auto platform = platform::NativePlatform::Find(*link_->runtime)) {
-            const u32 rows = std::min<u32>(platform->TopScreenRows(), 0xFFFF);
-            if (rows != 0) {
-                const u32 old = shadow_.GpuReg((kTopSizeRegister - gpu_capture::DisplayShadow::kGpuBase) / 4);
-                shadow_.WriteReg(kTopSizeRegister, (old & 0xFFFF) | (rows << 16));
-            }
-        }
-    }
-#endif
-    if (scaled_ != nullptr) {
-        // (the app's side may have refused them since: present::SharedPicturesRefused, then pixels from now on)
-        const bool wanted = shared_wanted_ && !present::SharedPicturesRefused();
-        if (shared_asked_ != wanted) {  // (asked here, on the renderer's own thread)
-            MH4N_LOG(Info, kLog, "shared screens asked of the renderer: {}{}", wanted ? "on" : "off",
-                     shared_wanted_ && !wanted ? " (the app's side can't show them: the screens as pixels)" : "");
-            scaled_->SetSharedScreens(wanted);
-            shared_asked_ = wanted;
-        }
-        if (wanted) {
-            if (std::optional<present::ScreenImage> shared = BuildSharedScreen(screen)) {
-                last_error_[screen].clear();
-                last_scaled_[screen] = LastScaled{};
-                return shared;
-            }
-        }
-        if (std::optional<present::ScreenImage> scaled = BuildScaledScreen(screen)) {
-            last_error_[screen].clear();
-            return scaled;
-        }
-        last_scaled_[screen] = LastScaled{};
-        PrepareScreenMemory(screen);  // a framebuffer the renderer still owes (asynchronous screens) is written first
-        if (scale_ > 1) {
-            LogMemoryScreen(screen);
-        }
-    }
-    static const bool check = [] {
-        const char* v = std::getenv("MH4N_DISPLAY_CHECK");
-        return v != nullptr && *v == '1';
-    }();
-    std::optional<present::ScreenImage> fast = BuildMemoryScreen(screen);
-    if (fast && !check) {
-        last_error_[screen].clear();
-        return fast;
-    }
-    gpu_capture::Image image;
-    std::string error;
-    const gpu_capture::PhysicalPointerFn memory = [this](u32 paddr, u32 size) -> const u8* {
-        return host_.PhysicalPointer(paddr, size);
-    };
-    if (!shadow_.BuildScreen(screen, memory, image, &error)) {
-        if (error != last_error_[screen]) {
-            MH4N_LOG(Warning, kLog, "screen {} is not shown: {}", screen, error);
-            last_error_[screen] = error;
-        }
-        return std::nullopt;
-    }
-    last_error_[screen].clear();
-    present::ScreenImage result;
-    result.width = image.width;
-    result.height = image.height;
-    auto pixels = std::make_shared<std::vector<u8>>(static_cast<std::size_t>(image.width) * image.height * 4);
-    for (std::size_t i = 0; i < static_cast<std::size_t>(image.width) * image.height; ++i) {
-        (*pixels)[4 * i + 0] = image.rgb[3 * i + 0];
-        (*pixels)[4 * i + 1] = image.rgb[3 * i + 1];
-        (*pixels)[4 * i + 2] = image.rgb[3 * i + 2];
-        (*pixels)[4 * i + 3] = 0xFF;
-    }
-    if (scale_ > 1) {
-        // The renderer has no picture of this framebuffer at its scale: the 1x one, as large.
-        pixels = Enlarge(*pixels, result.width, result.height, scale_);
-        result.width *= scale_;
-        result.height *= scale_;
-    }
-    result.pixels = std::move(pixels);
-    result.region = {0, 0, result.width, result.height};
-    if (fast) {  // MH4N_DISPLAY_CHECK=1: the fast path against this one
-        const bool same = fast->width == result.width && fast->height == result.height &&
-                          *fast->pixels == *result.pixels;
-        static int reported = 0;
-        if (!same && reported++ < 5) {
-            MH4N_LOG(Error, kLog, "screen {}: the fast picture differs from the reference one", screen);
-        }
-    }
-    return result;
-}
-
-namespace {
-
-// One framebuffer pixel as RGBA (gpu_capture::DecodeDisplayPixel, alpha 0xFF).
-template <u32 Format>
-inline void PutPixel(const u8* p, u8* out) {
-    const auto c5 = [](u32 v) { return static_cast<u8>((v << 3) | (v >> 2)); };
-    const auto c6 = [](u32 v) { return static_cast<u8>((v << 2) | (v >> 4)); };
-    const auto c4 = [](u32 v) { return static_cast<u8>(v * 17); };
-    if constexpr (Format == 0) {  // RGBA8
-        out[0] = p[3], out[1] = p[2], out[2] = p[1];
-    } else if constexpr (Format == 1) {  // RGB8
-        out[0] = p[2], out[1] = p[1], out[2] = p[0];
-    } else {
-        const u32 v = static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8);
-        if constexpr (Format == 2) {  // RGB565
-            out[0] = c5((v >> 11) & 0x1F), out[1] = c6((v >> 5) & 0x3F), out[2] = c5(v & 0x1F);
-        } else if constexpr (Format == 3) {  // RGB5A1
-            out[0] = c5((v >> 11) & 0x1F), out[1] = c5((v >> 6) & 0x1F), out[2] = c5((v >> 1) & 0x1F);
-        } else {  // RGBA4
-            out[0] = c4((v >> 12) & 0xF), out[1] = c4((v >> 8) & 0xF), out[2] = c4((v >> 4) & 0xF);
-        }
-    }
-    out[3] = 0xFF;
-}
-
-// DisplayShadow::BuildScreen's picture (RendererSoftware's reading order, Azahar's index y * stride + stride - x:
-// for x = 0 the first pixel of the next column, past the buffer for the last one), as RGBA.
-template <u32 Format, u32 Bpp>
-void DecodeFramebuffer(const u8* data, const u8* extra, u32 stride, u32 columns, u8* out) {
-    static const u8 kZero[4] = {0, 0, 0, 0};
-    const u64 stored = static_cast<u64>(columns) * stride;
-    for (u32 y = 0; y < columns; ++y) {
-        // MODIFIED for the Windows port: pixel x of a column is at stride - 1 - x (Azahar's software renderer read
-        // stride - x, one pixel too far: a wrong line along the top of the picture)
-        (void)extra, (void)kZero, (void)stored;
-        const u8* column = data + static_cast<u64>(y) * stride * Bpp;
-        for (u32 x = 0; x < stride; ++x) {
-            PutPixel<Format>(column + static_cast<size_t>(stride - 1 - x) * Bpp,
-                             out + (static_cast<size_t>(x) * columns + y) * 4);
-        }
-    }
-}
-
-}  // namespace
-
-std::optional<present::ScreenImage> DisplayMemGpu::BuildMemoryScreen(u32 screen) {
-    const u32 fb = kFbConfigBase + kFbConfigWords * screen;
-    const u32 fill = shadow_.LcdReg(screen == 0 ? kLcdColorFillTop : kLcdColorFillBottom);
-    if (((fill >> 24) & 1) != 0) {
-        return std::nullopt;  // a colour fill: the slow path makes it (rare)
-    }
-    const u32 address = shadow_.GpuReg(fb + kFbActive) == 0 ? shadow_.GpuReg(fb + kFbAddressLeft1)
-                                                             : shadow_.GpuReg(fb + kFbAddressLeft2);
-    const u32 format = shadow_.GpuReg(fb + kFbFormat) & 7;
-    const u32 bpp = gpu_capture::BytesPerPixel(format);
-    if (bpp == 0 || format > 4) {
-        return std::nullopt;
-    }
-    const u32 stride = shadow_.GpuReg(fb + kFbStride) / bpp;
-    const u32 columns = shadow_.GpuReg(fb + kFbSize) >> 16;
-    const u64 stored = static_cast<u64>(columns) * stride * bpp;
-    if (stride == 0 || columns == 0 || stored > 0xFFFFFFFFull) {
-        return std::nullopt;
-    }
-    const u8* data = host_.PhysicalPointer(address, static_cast<u32>(stored));
-    if (data == nullptr) {
-        return std::nullopt;
-    }
-    const u8* extra = host_.PhysicalPointer(address + static_cast<u32>(stored), bpp);
-    // what the picture is made of: the registers and the bytes (the extra pixel too)
-    u64 key = XXH3_64bits(data, static_cast<size_t>(stored));
-    const u32 params[6] = {address, format, stride, columns, scale_, extra != nullptr ? 1u : 0u};
-    key = XXH3_64bits_withSeed(params, sizeof(params), key);
-    if (extra != nullptr) {
-        key = XXH3_64bits_withSeed(extra, bpp, key);
-    }
-    LastScreen& last = last_screen_[screen];
-    if (last.valid && last.key == key) {
-        return last.image;  // unchanged: the same pixels, nothing decoded
-    }
-    present::ScreenImage result;
-    result.width = columns;
-    result.height = stride;
-    const size_t bytes = static_cast<size_t>(columns) * stride * 4;
-    std::shared_ptr<std::vector<u8>> pixels;
-    last.image.pixels.reset();
-    if (last.storage != nullptr && last.storage.use_count() == 1 && scale_ == 1 && last.storage->size() == bytes) {
-        pixels = std::move(last.storage);  // nobody holds the old picture any more: its storage again
-    } else {
-        pixels = std::make_shared<std::vector<u8>>(bytes);
-    }
-    last.storage.reset();
-    switch (format) {
-    case 0: DecodeFramebuffer<0, 4>(data, extra, stride, columns, pixels->data()); break;
-    case 1: DecodeFramebuffer<1, 3>(data, extra, stride, columns, pixels->data()); break;
-    case 2: DecodeFramebuffer<2, 2>(data, extra, stride, columns, pixels->data()); break;
-    case 3: DecodeFramebuffer<3, 2>(data, extra, stride, columns, pixels->data()); break;
-    default: DecodeFramebuffer<4, 2>(data, extra, stride, columns, pixels->data()); break;
-    }
-    if (scale_ > 1) {
-        pixels = Enlarge(*pixels, result.width, result.height, scale_);
-        result.width *= scale_;
-        result.height *= scale_;
-    }
-    last.storage = pixels;
-    result.pixels = std::move(pixels);
-    result.region = {0, 0, result.width, result.height};
-    last.key = key;
-    last.valid = true;
-    last.image = result;
-    return result;
-}
-
-std::optional<present::ScreenImage> DisplayMemGpu::BuildScaledScreen(u32 screen) {
-    // The framebuffer the shadow shows (RendererSoftware::LoadFBToScreenInfo, as DisplayShadow::BuildScreen reads it).
-    const u32 fb = kFbConfigBase + kFbConfigWords * screen;
-    const u32 fill = shadow_.LcdReg(screen == 0 ? kLcdColorFillTop : kLcdColorFillBottom);
-    if (((fill >> 24) & 1) != 0) {
-        return std::nullopt;  // a colour fill: the 1x path makes it
-    }
-    const bool first_buffer = shadow_.GpuReg(fb + kFbActive) == 0;
-    const u32 address = shadow_.GpuReg(fb + (first_buffer ? kFbAddressLeft1 : kFbAddressLeft2));
-    const u32 other = shadow_.GpuReg(fb + (first_buffer ? kFbAddressLeft2 : kFbAddressLeft1));
-    const u32 format = shadow_.GpuReg(fb + kFbFormat) & 7;
-    const u32 bpp = gpu_capture::BytesPerPixel(format);
-    const u32 stride = shadow_.GpuReg(fb + kFbStride);
-    const u32 rows = shadow_.GpuReg(fb + kFbSize) >> 16;
-    if (bpp == 0 || stride / bpp == 0 || rows == 0) {
-        return std::nullopt;
-    }
-    present::ScreenImage result;
-    result.width = rows * scale_;
-    result.height = stride / bpp * scale_;
-    LastScaled& last = last_scaled_[screen];
-    const bool last_fits = last.image && last.image->width == result.width && last.image->height == result.height;
-    auto pixels = std::make_shared<std::vector<u8>>();
-    u64 sequence = 0;
-    using Read = gpu::ScaledScreens::ScreenRead;
-    Read read = scaled_->ReadScaledScreen(address, format, stride, rows, *pixels, /*wait=*/false, &sequence);
-    if (read == Read::Pending) {
-        // The GPU has not finished this picture (it may be frames behind the game): the screen's other framebuffer, the
-        // frame before, when its picture is done and not older than the last one shown; else the last one again, for
-        // kMaxRepeats VBlanks at most, so that a GPU that stays behind is waited for rather than the screen frozen.
-        // (8: a phone's GPU often finishes a frame 3 to 5 VBlanks after the game made it; a wait there stops the
-        // renderer, and the game behind it, every few frames: a Moto g06 showed one frame in five at 110-170 ms.)
-        constexpr u64 kMaxRepeats = 8;
-        if (other != 0 && other != address &&
-            scaled_->ReadScaledScreen(other, format, stride, rows, *pixels, /*wait=*/false, &sequence) == Read::Ready &&
-            (!last_fits || sequence >= last.sequence)) {
-            read = Read::Ready;
-        } else if (last_fits && next_sequence_ - last.made < kMaxRepeats) {
-            return last.image;
-        } else {
-            read = scaled_->ReadScaledScreen(address, format, stride, rows, *pixels, /*wait=*/true, &sequence);
-        }
-    }
-    if (read != Read::Ready || pixels->size() != static_cast<std::size_t>(result.width) * result.height * 4) {
-        return std::nullopt;
-    }
-    result.pixels = std::move(pixels);
-    result.region = {0, 0, result.width, result.height};
-    last.image = result;
-    last.sequence = sequence;
-    last.made = next_sequence_;
-    return result;
-}
-
-std::optional<present::ScreenImage> DisplayMemGpu::BuildSharedScreen(u32 screen) {
-    // (the registers as BuildScaledScreen reads them)
-    const u32 fb = kFbConfigBase + kFbConfigWords * screen;
-    const u32 fill = shadow_.LcdReg(screen == 0 ? kLcdColorFillTop : kLcdColorFillBottom);
-    if (((fill >> 24) & 1) != 0) {
-        return std::nullopt;
-    }
-    const u32 address = shadow_.GpuReg(fb + (shadow_.GpuReg(fb + kFbActive) == 0 ? kFbAddressLeft1 : kFbAddressLeft2));
-    const u32 format = shadow_.GpuReg(fb + kFbFormat) & 7;
-    const u32 bpp = gpu_capture::BytesPerPixel(format);
-    const u32 stride = shadow_.GpuReg(fb + kFbStride);
-    const u32 rows = shadow_.GpuReg(fb + kFbSize) >> 16;
-    if (bpp == 0 || stride / bpp == 0 || rows == 0) {
-        return std::nullopt;
-    }
-    gpu::ScaledScreens::SharedScreen got;
-    if (scaled_->ReadSharedScreen(address, format, stride, rows, got) != gpu::ScaledScreens::ScreenRead::Ready ||
-        got.picture == nullptr) {
-        return std::nullopt;
-    }
-    present::ScreenImage result;
-    result.shared = std::move(got.picture);
-    result.region = got.region;
-    result.width = got.region.width;  // (the size at the renderer's scale, as the CPU form of these screens has it)
-    result.height = got.region.height;
-    if (!result.Valid()) {
-        return std::nullopt;
-    }
-    return result;
-}
-
-void DisplayMemGpu::PrepareScreenMemory(u32 screen) {
-    const u32 fb = kFbConfigBase + kFbConfigWords * screen;
-    const u32 address = shadow_.GpuReg(fb + kFbActive) == 0 ? shadow_.GpuReg(fb + kFbAddressLeft1)
-                                                             : shadow_.GpuReg(fb + kFbAddressLeft2);
-    const u32 bpp = std::max<u32>(gpu_capture::BytesPerPixel(shadow_.GpuReg(fb + kFbFormat) & 7), 1);
-    const u64 bytes = u64{shadow_.GpuReg(fb + kFbStride)} * (shadow_.GpuReg(fb + kFbSize) >> 16) + bpp;  // (the extra pixel too)
-    scaled_->PrepareMemory(address, static_cast<u32>(std::min<u64>(bytes, 0xFFFFFFFFull - address)));
-}
-
-void DisplayMemGpu::AddScreenSink(present::ScreenSink* sink) {
-    sinks_.push_back(sink);
-    shared_wanted_ = std::all_of(sinks_.begin(), sinks_.end(), [](const present::ScreenSink* s) {
-        return s->WantsSharedPictures();
-    });
-    MH4N_LOG(Info, kLog, "a screen sink: {} sink(s), shared pictures {}", sinks_.size(), shared_wanted_ ? "wanted" : "not wanted");
-}
-
-void DisplayMemGpu::RemoveScreenSink(present::ScreenSink* sink) {
-    std::erase(sinks_, sink);
-}
-
-void DisplayMemGpu::ReadScreen(const present::ScreenImage& screen, std::function<void(present::RgbImage)> done) {
-    present::RgbImage out;
-    if (screen.Valid() && screen.IsCpu()) {
-        out.width = screen.width;
-        out.height = screen.height;
-        const std::size_t count = static_cast<std::size_t>(screen.width) * screen.height;
-        out.rgb.resize(count * 3);
-        for (std::size_t i = 0; i < count; ++i) {
-            std::copy_n(screen.pixels->data() + 4 * i, 3, out.rgb.data() + 3 * i);
-        }
-    }
-    done(std::move(out));
-}
-
 void DisplayMemGpu::Attach(std::shared_ptr<RuntimeLink> link) {
     link_ = std::move(link);
 }
 
-namespace {
-
-std::unique_ptr<gpu::Gpu> MakeDisplayMem(gpu::Host& host, const Options& options) {
-    const gpu::GpuFactory* null_factory = Registry<gpu::GpuFactory>::Instance().Find("null");
-    if (null_factory == nullptr) {
-        MH4N_LOG(Error, kLog, "the null GPU is not registered");
-        return nullptr;
-    }
-    return std::make_unique<DisplayMemGpu>(host, (*null_factory)(host, options));
+void DisplayMemGpu::AddScreenSink(present::ScreenSink* sink) {
+    if (!sink || std::find(sinks_.begin(), sinks_.end(), sink) != sinks_.end()) return;
+    sinks_.push_back(sink);
+    shared_wanted_ = std::all_of(sinks_.begin(), sinks_.end(),
+                                 [](auto* item) { return item->WantsSharedPictures(); });
+    direct_wanted_ = std::all_of(sinks_.begin(), sinks_.end(), [](auto* item) { return item->WantsBackendImages(); });
 }
 
-// The native renderer (gpu/native) with its screens shown from guest memory: it writes every target
-// back before a display transfer, so at VBlank the framebuffers hold what it drew. Its GX engine
-// starts with zeroed registers, so they are seeded with the values the null GPU starts with
-// (PicaCore::InitializeRegs: the framebuffer defaults of nn::gx, the IRQ mask, ...).
-std::unique_ptr<gpu::Gpu> MakeNativeDisplayOn(gpu::Host& host, const Options& options) {
-    const auto& registry = Registry<gpu::GpuFactory>::Instance();
-    const gpu::GpuFactory* native_factory = registry.Find("native");
-    const gpu::GpuFactory* null_factory = registry.Find("null");
-    if (native_factory == nullptr || null_factory == nullptr) {
-        MH4N_LOG(Error, kLog, "the native or the null GPU is not registered");
-        return nullptr;
-    }
-    std::unique_ptr<gpu::Gpu> inner = (*native_factory)(host, options);
-    std::unique_ptr<gpu::Gpu> seed = (*null_factory)(host, options);
-    if (inner == nullptr || seed == nullptr) {
-        return nullptr;
-    }
-    using Shadow = gpu_capture::DisplayShadow;
-    for (u32 i = 0; i < Shadow::kGpuRegWords; ++i) {
-        const u32 addr = Shadow::kGpuBase + 4 * i;
-        if (const u32 value = seed->ReadReg(addr); value != 0 && inner->ReadReg(addr) == 0) {
-            inner->WriteReg(addr, value);
+void DisplayMemGpu::RemoveScreenSink(present::ScreenSink* sink) {
+    std::erase(sinks_, sink);
+    shared_wanted_ = !sinks_.empty() && std::all_of(sinks_.begin(), sinks_.end(),
+                                                   [](auto* item) { return item->WantsSharedPictures(); });
+    direct_wanted_ = !sinks_.empty() && std::all_of(sinks_.begin(), sinks_.end(),
+                                                   [](auto* item) { return item->WantsBackendImages(); });
+}
+
+void DisplayMemGpu::VBlank(u32 screen) {
+    PublishVBlank(screen, nullptr);
+}
+
+void DisplayMemGpu::PublishVBlank(u32 screen, const FrameInfo* frame_info) {
+    if (screen == 0 && scaled_) {
+        const bool shared = shared_wanted_ && !present::SharedPicturesRefused();
+        if (shared != shared_asked_) {
+            scaled_->SetSharedScreens(shared);
+            shared_asked_ = shared;
+        }
+        static const bool direct_allowed = [] {
+            const char* v = std::getenv("MH4N_SCREEN_DIRECT");
+            return v == nullptr || *v != '0';
+        }();
+        const bool direct = direct_allowed && direct_wanted_ && !shared && present::SharedBackend() != nullptr;
+        if (direct != direct_asked_) {
+            scaled_->SetDirectScreens(direct);
+            direct_asked_ = direct;
+        }
+        const bool hidden = std::any_of(sinks_.begin(), sinks_.end(),
+                                        [](auto* sink) { return sink->ScreenHidden(1); });
+        if (touch_hidden_ != hidden) {
+            scaled_->SetTouchScreenShown(!hidden);
+            touch_hidden_ = hidden;
         }
     }
-    for (u32 i = 0; i < Shadow::kLcdRegWords; ++i) {
-        const u32 addr = Shadow::kLcdBase + 4 * i;
-        if (const u32 value = seed->ReadReg(addr); value != 0 && inner->ReadReg(addr) == 0) {
-            inner->WriteReg(addr, value);
+
+    inner_->VBlank(screen);
+    if (screen != 0) return;
+    ++counter_vblanks_;
+    {
+        // A stall (the game thread took long between two VBlanks): say what it was busy with (the first 200)
+        const auto now = std::chrono::steady_clock::now();
+        if (g_origin_ns.load() == 0) g_origin_ns.store(now.time_since_epoch().count());  // (the first VBlank)
+        const auto origin = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(g_origin_ns.load()));
+        g_vblanks.store(counter_vblanks_);
+        const double gap = std::chrono::duration<double, std::milli>(now - last_vblank_time_).count();
+        const auto [fs_us, fs_bytes] = stall::TakeFsReads();
+        if (last_vblank_time_.time_since_epoch().count() != 0 && gap > 30.0 && stall_logs_ < 200) {
+            ++stall_logs_;
+            MH4N_LOG(Info, kLog, "frame gap {:.1f} ms at t={:.2f} s, vblank {} (file reads {:.1f} ms, {} KB)", gap,
+                     std::chrono::duration<double>(now - origin).count(), counter_vblanks_, fs_us / 1000.0, fs_bytes >> 10);
+        }
+        if (last_vblank_time_.time_since_epoch().count() != 0) {
+            // Pacing of the vblanks themselves: how even the game's own beat is (the log shows it every 600)
+            static double sum = 0, worst = 0;
+            static u32 n = 0, over_1_5x = 0, over_2x = 0, over_12 = 0;
+            static double prev = 0;
+            sum += gap;
+            worst = std::max(worst, gap);
+            ++n;
+            if (prev > 0 && gap > prev * 1.5) ++over_1_5x;
+            if (prev > 0 && gap > prev * 2.0) ++over_2x;
+            if (gap > 12.0) ++over_12;
+            prev = gap;
+            if (n == 600) {
+                const double avg = sum / n;
+                MH4N_LOG(Info, kLog, "vblank pacing: avg {:.2f} ms ({:.0f}/s), worst {:.1f} ms; {} jumps >1.5x the previous, {} >2x, {} over 12 ms (of 600)",
+                         avg, 1000.0 / avg, worst, over_1_5x, over_2x, over_12);
+                sum = worst = 0;
+                n = over_1_5x = over_2x = over_12 = 0;
+            }
+        }
+        last_vblank_time_ = now;
+    }
+    if (sinks_.empty()) return;
+    const FrameInfo info = frame_info ? *frame_info : SampleFrame(link_.get());
+    present::DisplayFrame frame{};
+    frame.sequence = next_sequence_;
+    frame.game_frame = info.game_frame;
+    frame.tick = info.tick;
+    // A big picture (a high internal resolution) can cost more to build than a vblank lasts, and the building runs on the
+    // emulation thread: the game would never catch up. Past a few ms every second vblank is skipped (the screens stay as
+    // they were published) so the game keeps its time.
+    if (build_ms_ > 5.0 && (counter_vblanks_ & 1)) { ++skipped_builds_; return; }
+    const auto build_start = std::chrono::steady_clock::now();
+    frame.top = BuildScreen(0, info.top_columns, info.game_frame);
+    if (!touch_hidden_) frame.bottom = BuildScreen(1, present::kBottomWidth, info.game_frame);
+    build_ms_ = 0.9 * build_ms_ + 0.1 * std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - build_start).count();
+    ++next_sequence_;
+    if (counter_vblanks_ % 600 == 0) {
+        MH4N_LOG(Info, kLog, "screens: building both takes {:.2f} ms on the {} thread (average); {} of {} vblanks skipped so far",
+                 build_ms_, frame_info ? "renderer" : "game", skipped_builds_, counter_vblanks_);
+    }
+
+    pacing::Mark(pacing::kPublish, frame.game_frame);
+    pacing::Mark(pacing::kPublishSwap, top_swaps_);
+    for (auto* sink : sinks_) sink->Publish(frame);
+}
+
+std::optional<present::ScreenImage> DisplayMemGpu::BuildScreen(u32 screen, u32 columns, u32 game_frame) {
+    const u32 fill = Fill(shadow_, screen);
+    if (fill & kFillEnabled) {
+        last_scaled_[screen] = {};
+        const auto size = RgbaSize(columns, present::kTopHeight, scale_);
+        if (!size) return std::nullopt;
+        const gpu_capture::Rgb color{static_cast<u8>(fill), static_cast<u8>(fill >> 8),
+                                     static_cast<u8>(fill >> 16)};
+        auto pixels = std::make_shared<std::vector<u8>>(*size);
+        for (std::size_t index = 0; index < *size; index += 4) Store(pixels->data() + index, color);
+        return CpuImage(columns * scale_, present::kTopHeight * scale_, std::move(pixels));
+    }
+    if (scaled_ && scaled_->HasScreens()) {
+        if (shared_asked_) {
+            if (auto image = BuildSharedScreen(screen, columns)) return image;
+        }
+        if (direct_asked_) {
+            if (auto image = BuildBackendScreen(screen, columns)) return image;
+        }
+        if (auto image = BuildScaledScreen(screen, columns)) return image;
+    }
+    last_scaled_[screen] = {};
+    PrepareScreenMemory(screen, columns);
+    return BuildMemoryScreen(screen, columns, game_frame);
+}
+
+std::optional<present::ScreenImage> DisplayMemGpu::BuildMemoryScreen(u32 screen, u32 width, u32 game_frame) {
+    const auto fb = Buffer(shadow_, screen);
+    const u32 height = fb.bytes_per_pixel ? fb.stride / fb.bytes_per_pixel : 0;
+    const u64 length = u64{fb.stride} * width;
+    const auto size = RgbaSize(width, height, scale_);
+    const u8* memory = nullptr;
+    if (size && fb.address && fb.stride % fb.bytes_per_pixel == 0 && length <= std::numeric_limits<u32>::max()) {
+        memory = host_.PhysicalPointer(fb.address, static_cast<u32>(length));
+    }
+    if (!memory) {
+        if (last_error_[screen].empty()) {
+            MH4N_LOG(Debug, kLog, "Screen {} framebuffer unavailable at {:#010x}", screen, fb.address);
+            last_error_[screen] = "framebuffer_unavailable";
+        }
+        return std::nullopt;
+    }
+    last_error_[screen].clear();
+    LogMemoryScreen(screen, game_frame);
+
+    const std::array config{fb.address, fb.stride, fb.format, width};
+    const u64 key = XXH3_64bits_withSeed(memory, static_cast<std::size_t>(length),
+                                         XXH3_64bits(config.data(), sizeof(config)));
+    auto& last = last_screen_[screen];
+    if (last.valid && last.key == key) return last.image;
+    last.image = {};
+    if (!last.storage || last.storage.use_count() != 1) last.storage = std::make_shared<std::vector<u8>>();
+    last.storage->resize(*size);
+
+    const u32 output_width = width * scale_;
+    const u32 output_height = height * scale_;
+    const std::size_t row_size = std::size_t{output_width} * 4;
+    for (u32 y = 0; y < height; ++y) {
+        auto* row = last.storage->data() + std::size_t{y} * scale_ * row_size;
+        auto* output = row;
+        const u32 source_row = height - 1 - y;
+        for (u32 x = 0; x < width; ++x) {
+            const auto offset = std::size_t{x} * fb.stride + source_row * fb.bytes_per_pixel;
+            const auto color = gpu_capture::DecodeDisplayPixel(fb.format, memory + offset);
+            for (u32 i = 0; i < scale_; ++i, output += 4) Store(output, color);
+        }
+        for (u32 i = 1; i < scale_; ++i) std::copy_n(row, row_size, row + i * row_size);
+    }
+    last.key = key;
+    last.valid = true;
+    last.image = CpuImage(output_width, output_height, last.storage);
+    return last.image;
+}
+
+void DisplayMemGpu::LogMemoryScreen(u32 screen, u32 game_frame) {
+    static const bool log = [] {
+        const char* value = std::getenv("MH4N_SCALE_LOG");
+        return value && std::string_view(value) == "1";
+    }();
+    if (!log || scale_ == 1 || memory_screen_logs_ >= 20) return;
+    if (memory_screen_seen_[screen] && memory_screen_frame_[screen] == game_frame) return;
+    memory_screen_seen_[screen] = true;
+    memory_screen_frame_[screen] = game_frame;
+    ++memory_screen_logs_;
+    MH4N_LOG(Info, kLog, "Screen {} frame {} built from guest memory at {}x", screen, game_frame, scale_);
+}
+
+std::optional<present::ScreenImage> DisplayMemGpu::BuildScaledScreen(u32 screen, u32 width) {
+    const auto fb = Buffer(shadow_, screen);
+    if (!fb.address || !fb.bytes_per_pixel) return std::nullopt;
+    const u32 height = fb.stride / fb.bytes_per_pixel;
+    const auto size = RgbaSize(width, height, scale_);
+    if (!size) return std::nullopt;
+    auto pixels = std::make_shared<std::vector<u8>>();
+    auto& last = last_scaled_[screen];
+    u64 sequence = 0;
+    const auto read = [&](u32 address, bool wait) {
+        return scaled_->ReadScaledScreen(address, fb.format, fb.stride, width, *pixels, wait, &sequence);
+    };
+    Read status = read(fb.address, false);
+    if (status == Read::Pending) {
+        constexpr u64 max_repeat = 3;
+        const bool recent = last.image && next_sequence_ - last.made <= max_repeat;
+        if (fb.other_address && fb.other_address != fb.address &&
+            read(fb.other_address, false) == Read::Ready && (!last.image || sequence > last.sequence)) {
+            status = Read::Ready;
+        } else if (recent) {
+            return last.image;
+        } else {
+            status = read(fb.address, true);
         }
     }
-    return std::make_unique<DisplayMemGpu>(host, std::move(inner));
+    if (status != Read::Ready || pixels->size() != *size) return std::nullopt;
+    last = {CpuImage(width * scale_, height * scale_, std::move(pixels)), sequence, next_sequence_};
+    return last.image;
 }
 
-// `--render-thread on` (or MH4N_RENDER_THREAD=1): the renderer and the screens' publication run on a thread of their
-// own (gpu/queue, N2-22), so the game's thread only queues the GPU's work. Everything the renderer does, it does
-// in the order the game asked, and InvalidateRegion waits for it: the guest sees the same memory, one frame later
-// at most. Default off until each device has been measured.
-bool RenderThreadWanted(const Options& options) {
-    if (const char* env = std::getenv("MH4N_RENDER_THREAD")) {
-        return *env == '1';
-    }
-    const std::string value = options.GetString("--render-thread", "off");
-    return value == "on" || value == "1";
+std::optional<present::ScreenImage> DisplayMemGpu::BuildBackendScreen(u32 screen, u32 width) {
+    const auto fb = Buffer(shadow_, screen);
+    if (!fb.address || !fb.bytes_per_pixel) return std::nullopt;
+    const u32 height = fb.stride / fb.bytes_per_pixel;
+    if (!RgbaSize(width, height, scale_)) return std::nullopt;
+    gpu::ScaledScreens::BackendScreen result;
+    if (scaled_->ReadBackendScreen(fb.address, fb.format, fb.stride, width, result) != Read::Ready) return std::nullopt;
+    if (result.width != width * scale_ || result.height != height * scale_) return std::nullopt;
+    present::ScreenImage image{};
+    image.image = std::move(result.image);
+    image.region = result.region;
+    image.scale = 1;
+    image.orientation = result.orientation;
+    image.timeline_value = result.timeline_value;
+    image.width = result.width;
+    image.height = result.height;
+    if (!image.Valid()) return std::nullopt;
+    last_scaled_[screen] = {};
+    return image;
 }
 
-std::unique_ptr<gpu::Gpu> MakeNativeDisplay(gpu::Host& host, const Options& options) {
-    if (!RenderThreadWanted(options)) {
-        return MakeNativeDisplayOn(host, options);
+std::optional<present::ScreenImage> DisplayMemGpu::BuildSharedScreen(u32 screen, u32 width) {
+    const auto fb = Buffer(shadow_, screen);
+    if (!fb.address || !fb.bytes_per_pixel) return std::nullopt;
+    const u32 height = fb.stride / fb.bytes_per_pixel;
+    if (!RgbaSize(width, height, scale_)) return std::nullopt;
+    gpu::ScaledScreens::SharedScreen result;
+    if (scaled_->ReadSharedScreen(fb.address, fb.format, fb.stride, width, result) != Read::Ready) {
+        return std::nullopt;
     }
-    // How many frames the game may run ahead of the renderer before its VBlank waits (`--render-queue N`, 2 to 4,
-    // default 2): the queue's own default (4) let a GPU-bound phone run in bursts, a frame shown quickly and the next
-    // late, with the input as many frames behind the picture.
-    gpu::queue::QueueConfig config;
-    u64 queued = 2;
-    try {
-        queued = options.GetUInt("--render-queue", 2);
-    } catch (const OptionError& e) {
-        MH4N_LOG(Error, kLog, "--render-queue: {}", e.what());
-    }
-    config.max_frames_queued = static_cast<u32>(std::clamp<u64>(queued, 2, 4));
-    MH4N_LOG(Info, kLog, "the renderer runs on its own thread ({} frames queued at most)", config.max_frames_queued);
-    // The wrapped GPU is made on the renderer thread (it owns every image it makes); `options` outlives the call.
-    return std::make_unique<gpu::queue::QueueGpu>(
-        host, [&options](gpu::Host& queue_host) { return MakeNativeDisplayOn(queue_host, options); }, config);
+    present::ScreenImage image{};
+    image.width = width * scale_;
+    image.height = height * scale_;
+    image.region = result.region;
+    image.shared = std::move(result.picture);
+    if (!image.Valid()) return std::nullopt;
+    return image;
 }
 
-// The GPU factory gets no runtime: once the `devices` step has made the GPU, this step tells it
-// which runtime it belongs to and follows the frame counter.
-void AttachStep(Runtime& rt) {
-    auto* gpu = gpu::FindGpu<DisplayMemGpu>(rt.Interfaces().gpu);
-    if (gpu == nullptr) {
-        return;
+void DisplayMemGpu::PrepareScreenMemory(u32 screen, u32 columns) {
+    if (!scaled_ || !scaled_->HasScreens()) return;
+    const auto fb = Buffer(shadow_, screen);
+    const u64 size = u64{fb.stride} * columns;
+    if (fb.address && size && size <= std::numeric_limits<u32>::max()) {
+        scaled_->PrepareMemory(fb.address, static_cast<u32>(size));
     }
-    auto link = std::make_shared<RuntimeLink>();
-    link->runtime = &rt;
-    rt.OnFrame([link](u32 frame, u64) { link->game_frame.store(frame); });
-    gpu->Attach(std::move(link));
 }
 
-}  // namespace
+void DisplayMemGpu::ReadScreen(const present::ScreenImage& screen,
+                               std::function<void(present::RgbImage)> done) {
+    ReadCpuScreen(screen, std::move(done));
+}
 
-MH4N_REGISTER(gpu::GpuFactory, "null-display", MakeDisplayMem);
+MH4N_REGISTER(BootStep, "display_mem.attach", BootStep{Phase::Services, AttachRuntime});
 MH4N_REGISTER(present::DisplayGpu, "null-display", {});
-MH4N_REGISTER(gpu::GpuFactory, "native-display", MakeNativeDisplay);
-MH4N_OPTION("runner", "--render-queue", "N",
-            "--render-thread on: the frames the game may run ahead of the renderer, 2 to 4 (default 2)");
-MH4N_OPTION("runner", "--render-thread", "on|off",
-            "--gpu native-display: run the renderer on a thread of its own (default off; MH4N_RENDER_THREAD=1 too)");
 MH4N_REGISTER(present::DisplayGpu, "native-display", {});
-MH4N_REGISTER(BootStep, "display_mem.attach", BootStep{Phase::Services, AttachStep});
+MH4N_REGISTER(present::DisplayGpu, "native-display-queue", {});
+MH4N_REGISTER(gpu::GpuFactory, "null-display",
+              [](gpu::Host& host, const Options& options) { return MakeDisplay("null", host, options); });
+MH4N_REGISTER(gpu::GpuFactory, "native-display",
+              [](gpu::Host& host, const Options& options) {
+                  return MakeDisplay("native", host, options);
+              });
+MH4N_REGISTER(gpu::GpuFactory, "native-display-queue", MakeQueuedDisplay);
 
-}  // namespace mh4n::display_mem
+// MODIFIED for the Windows port: a moment the player marks as it happens, so a log line can be found by its time.
+std::string Mark(const char* how) {
+    static std::atomic<u32> n{0};
+    const auto now = std::chrono::steady_clock::now();
+    const std::int64_t o = g_origin_ns.load();
+    const double t = o == 0 ? 0.0 : std::chrono::duration<double>(now - std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(o))).count();
+    const std::time_t wall = std::time(nullptr);
+    char clock[16] = {};
+    std::strftime(clock, sizeof clock, "%H:%M:%S", std::localtime(&wall));
+    const u32 number = ++n;
+    MH4N_LOG(Info, kLog, "[mark] #{} ({}) at {} (clock), t={:.2f} s, vblank {}", number, how, clock, t, g_vblanks.load());
+    return "mark #" + std::to_string(number) + " at " + clock;
+}
+
+} // namespace mh4n::display_mem

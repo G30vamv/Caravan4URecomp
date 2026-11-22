@@ -1,1484 +1,740 @@
-// Derived from Azahar src/video_core/shader/generator/glsl_shader_decompiler.cpp, glsl_shader_decompiler.h,
-// src/video_core/shader/shader_interpreter.cpp (the reference semantics of every instruction and of the
-// loop, call and if stacks) and src/video_core/pica_types.h (the multiplication rule) at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later; each of those files says "Licensed under
-// GPLv2 or any later version").
-// Copyright 2017-2025 Citra Emulator Project / Azahar Emulator Project (glsl_shader_decompiler.cpp)
-// Copyright 2017 Citra Emulator Project (glsl_shader_decompiler.h)
-// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project (shader_interpreter.cpp)
-// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project (pica_types.h)
-//
-// The PICA program to GLSL translator (N2-06). A port of Azahar's decompiler: the control-flow
-// analysis into subroutines, and one GLSL function per subroutine; what is different, and why:
-//
-//  * Vulkan GLSL (`#version 450`, glslang with Vulkan rules), not GL or either: nothing here depends
-//    on the dialect except the uniform block members the caller declares as `uint`.
-//  * The multiplication rule of the PICA is always on (Azahar's `sanitize_mul` true): MUL, DP3, DP4,
-//    DPH, MAD and the first product of DST give +0 for 0 x +-inf and keep NaN when a factor is NaN;
-//    MAX and MIN order as the hardware (`src1 > src2 ? src1 : src2`, `src1 < src2 ? src1 : src2`). The
-//    NaN tests and the selections are done on the bits (see the prelude), because a compiler that
-//    assumes there is no NaN is allowed to fold `isnan` and to turn `a > b ? a : b` into a fmax.
-//  * RCP and RSQ are rounded as the interpreter computes them (1.0f / x and 1.0f / sqrtf(x), each step to
-//    nearest), whatever the device's own reciprocal and inverse square root give (see the prelude): the
-//    RX 6700 XT's are off by one ulp in about one input in nine, and a program that subtracts nearly equal
-//    numbers after a normalization turns that into more than the 2^-16 of the comparison.
-//  * BREAK and BREAKC are translated (Azahar's decompiler rejects the program): the loop body is a
-//    function, so a break sets a flag that the callers return through, and the loop checks it.
-//  * LOOP follows the interpreter where Azahar's decompiler differs: a loop also adds its increment to aL
-//    after a break, and a loop that ends inside another loop sets aL to its own initial value y (the
-//    interpreter's previous_aL; Azahar's decompiler leaves aL as the inner loop left it).
-//  * A subroutine that contains JMPC / JMPU dispatches its labels in a loop bounded by
-//    kMaxJumpIterations, so a backward jump that never ends ends the shader instead of the device.
-//  * Code the program does not hold is not executed: a program whose reachable code runs past the
-//    words that were loaded is rejected (Azahar's interpreter would run the zero words to the last
-//    word of the buffer).
-//  * DST, DSTI and LIT are translated (vs_3_0 definitions, nihstro's comment on DST says it is the
-//    same as vs_3_0's). Azahar implements none of them: its decompiler rejects the program and its
-//    interpreter and JIT skip the instruction. Not verified on hardware: DecompileResult says so.
-//  * Where the interpreter and the structured readings disagree (DecompileResult::differs_from_interpreter,
-//    a HINT: it flags the shapes known to differ, with an over-approximation, so it may flag a program on
-//    which the two agree; a mismatch with the interpreter in a flagged program is first read as the
-//    interpreter's quirk, a mismatch in an unflagged program is a translator bug until shown otherwise).
-//    The interpreter ends a scope by comparing the program counter with `old_program_counter + 1` after
-//    each instruction (shader_interpreter.cpp: the call-stack check against next_program_counter, then the
-//    if-stack check, which pops ONE entry and overwrites the program counter, then the loop-stack check
-//    against old_program_counter + 1, again one entry). A jump over the else branch, or over the rest of a
-//    scope, therefore lands where the next scope's test does not fire. The shapes: (1) a LOOP or CALL body
-//    that ends with an IF/ELSE: after the then-branch the interpreter jumps to the IF's end (the scope's
-//    end) without testing the loop, so the loop does not iterate again (the loop stack keeps a stale entry);
-//    the else branch ends at the loop end and iterates; (2) a LOOP or CALL body that ends with an IF WITHOUT
-//    else: when the condition is false the jump goes to the scope's end and the end test (against the IF's
-//    own address + 1) does not fire: the loop does not iterate, the call does not return; (3) an IF, with or
-//    without else, at the tail of the THEN-branch of an IF that has an else: the inner pop leaves the outer
-//    entry, the program counter lands on the outer else address and the else branch runs as well; (4) two
-//    loops that end on the same instruction: one loop is repeated or popped per instruction, so the outer
-//    loop does not iterate; (5) a CALL or a jump that is the last instruction of an IF, CALL or LOOP scope: the
-//    scope-end handling overwrites the program counter it set, so it is never taken. Azahar's x64 JIT
-//    (Compile_LOOP and the structural IF/CALL) and its decompiler follow the structure and so does this
-//    translation; the port of the interpreter in the tests is the same code as Azahar's here, so the oracle
-//    shows the interpreter's behaviour, and gpu_shader_test.cpp pins both sides. Which one the hardware
-//    does is not known. Not flagged on purpose: an IF or IF/ELSE in the middle of a body, an IF/ELSE at the
-//    tail of the ELSE branch of an outer IF, nested loops whose inner loop is not the last statement.
-//  * EMIT and SETEMIT generate nothing, as in Azahar's decompiler (it logs "Geometry shader operation
-//    detected in vertex shader"): the vertex program of a draw with a geometry shader is an ordinary
-//    vertex program; a program that does use them as a geometry shader would is not translated by this
-//    module (the interpreter, run on a vertex unit with no emitter, does nothing for them either).
-//  * Temporaries start as (0, 0, 0, 1), as in Azahar's generated shader (the interpreter keeps the
-//    previous vertex's values).
-#include "gpu/shader/glsl_decompiler.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: 3dbrew GPU/Shader Instruction Set, shader contract headers, gpu_shader_test.cpp test cases and golden/gpu.
 
-#include <cstdlib>
+#include "glsl_decompiler.h"
+
 #include <algorithm>
+#include <array>
+#include <deque>
 #include <map>
-#include <optional>
-#include <set>
-#include <stdexcept>
 #include <string_view>
-#include <tuple>
 #include <utility>
 
-#include <fmt/format.h>
-
-#include "gpu/shader/pica_isa.h"
+#include "pica_isa.h"
 
 namespace mh4n::gpu::shader {
-
 namespace {
 
 using isa::Instruction;
 using isa::Opcode;
-using isa::SourceKind;
-using isa::SourceRegister;
-using isa::Swizzle;
 
-constexpr u32 PROGRAM_END = kMaxProgramWords;
+constexpr std::string_view kLanes = "xyzw";
+constexpr int kNone = -1;
 
-// A rejection: the message for people, and a category and a word offset that name the cause without
-// quoting the program (the dump check prints only those two for a real program).
-class DecompileFail : public std::runtime_error {
-public:
-    explicit DecompileFail(const std::string& message, std::string category_ = "other", int word_ = -1)
-        : std::runtime_error(message), category(std::move(category_)), word(word_) {}
-    std::string category;
+constexpr std::string_view kPrelude = R"glsl(
+// MAX and MIN as the PICA does them (src1 > src2 ? src1 : src2): a NaN second operand stays; the branch keeps drivers from using fmax/fmin,
+// which return the other operand
+float mh4n_fmax(float a, float b) { if (b != b) return b; return a > b ? a : b; }
+float mh4n_fmin(float a, float b) { if (b != b) return b; return a < b ? a : b; }
+vec4 mh4n_max(vec4 a, vec4 b) { return vec4(mh4n_fmax(a.x, b.x), mh4n_fmax(a.y, b.y), mh4n_fmax(a.z, b.z), mh4n_fmax(a.w, b.w)); }
+vec4 mh4n_min(vec4 a, vec4 b) { return vec4(mh4n_fmin(a.x, b.x), mh4n_fmin(a.y, b.y), mh4n_fmin(a.z, b.z), mh4n_fmin(a.w, b.w)); }
+vec4 pica_read(int base, int offset) {
+    int index = (base + (offset >= -128 && offset <= 127 ? offset : 0)) & 127;
+    return index < 96 ? uniforms.f[index] : vec4(1.0);
+}
+
+vec4 pica_mul(vec4 left, vec4 right) {
+    uvec4 a = floatBitsToUint(left) & uvec4(0x7fffffffu);
+    uvec4 b = floatBitsToUint(right) & uvec4(0x7fffffffu);
+    bvec4 zero = bvec4((a.x == 0u && b.x == 0x7f800000u) || (b.x == 0u && a.x == 0x7f800000u),
+                      (a.y == 0u && b.y == 0x7f800000u) || (b.y == 0u && a.y == 0x7f800000u),
+                      (a.z == 0u && b.z == 0x7f800000u) || (b.z == 0u && a.z == 0x7f800000u),
+                      (a.w == 0u && b.w == 0x7f800000u) || (b.w == 0u && a.w == 0x7f800000u));
+    precise vec4 product = left * right;
+    return mix(product, vec4(0.0), zero);
+}
+
+int pica_address(float value) {
+    // Only signed-byte offsets affect relative reads.
+    return value > -129.0 && value < 128.0 ? int(value) : 0;
+}
+
+)glsl";
+
+// For a normalized binary32 significand m, the reciprocal significand is 2^47 / m.
+// A square root uses sqrt(m * 2^(23 + parity)), with parity taken from the unbiased exponent.
+// Compare exact integer midpoints to round both operations without a float64 capability.
+constexpr std::string_view kExactScalars = R"glsl(
+uvec2 pica_product(uint a, uint b) {
+    uvec2 product;
+    umulExtended(a, b, product.y, product.x);
+    return product;
+}
+
+bool pica_less(uvec2 a, uvec2 b) {
+    return a.y == b.y ? a.x < b.x : a.y < b.y;
+}
+
+bool pica_round_up(uint m, uvec2 target, uint lower, bool root) {
+    // For sqrt, compare 4*m*2^(23+parity) with (2*lower+1)^2.
+    // For division, compare twice the numerator with m*(2*lower+1).
+    uint midpoint = 2u * lower + 1u;
+    uvec2 limit = pica_product(midpoint, root ? midpoint : m);
+    return pica_less(limit, target) || (all(equal(limit, target)) && (lower & 1u) != 0u);
+}
+
+uint pica_nearest(uint m, uvec2 target, uint guess, bool root) {
+    uint lo = max(guess, 4u) - 4u;
+    uint hi = guess + 4u;
+    if (pica_round_up(m, target, hi, root) ||
+        (lo > 0u && !pica_round_up(m, target, lo - 1u, root))) {
+        lo = 0u;
+        hi = 0x1000000u;
+    }
+    while (lo < hi) {
+        uint mid = (lo + hi) / 2u;
+        if (pica_round_up(m, target, mid, root)) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo;
+}
+
+float pica_rcp(float value) {
+    uint bits = floatBitsToUint(value);
+    uint sign_bit = bits & 0x80000000u;
+    uint magnitude = bits ^ sign_bit;
+    uint exponent = magnitude >> 23;
+    if (magnitude == 0u) return uintBitsToFloat(sign_bit | 0x7f800000u);
+    if (exponent == 255u) return magnitude == 0x7f800000u ? uintBitsToFloat(sign_bit) : value;
+    uint m = (magnitude & 0x7fffffu) | (exponent == 0u ? 0u : 0x800000u);
+    int e = int(exponent);
+    if (exponent == 0u) {
+        int shift = 23 - findMSB(m);
+        m <<= shift;
+        e = 1 - shift;
+    }
+    if (e < -1) return uintBitsToFloat(sign_bit | 0x7f800000u);
+    int shift = max(e - 252, 0);
+    float normalized = uintBitsToFloat(0x3f000000u | (m & 0x7fffffu));
+    uint guess = uint((1.0 / normalized) * float(0x800000u >> shift));
+    uint rounded = pica_nearest(m, uvec2(0u, 0x10000u >> shift), guess, false);
+    uint base = uint(max(252 - e, 0)) << 23;
+    return uintBitsToFloat(sign_bit | (base + rounded));
+}
+
+float pica_rsq(float value) {
+    uint bits = floatBitsToUint(value);
+    uint magnitude = bits & 0x7fffffffu;
+    if (magnitude == 0u) return pica_rcp(value);
+    if (bits != magnitude) return uintBitsToFloat(0x7fc00000u);
+    int exponent = int(magnitude >> 23);
+    if (exponent == 255) return magnitude == 0x7f800000u ? 0.0 : value;
+    uint m = (magnitude & 0x7fffffu) | (exponent == 0 ? 0u : 0x800000u);
+    if (exponent == 0) {
+        int shift = 23 - findMSB(m);
+        m <<= shift;
+        exponent = 1 - shift;
+    }
+    int power = exponent - 127;
+    int parity = power & 1;
+    float normalized = uintBitsToFloat((uint(127 + parity) << 23) | (m & 0x7fffffu));
+    uint guess = uint(sqrt(normalized) * 8388608.0);
+    uint shift = uint(25 + parity);
+    uvec2 target = uvec2(m << shift, m >> (32u - shift));
+    uint rounded = pica_nearest(m, target, guess, true);
+    uint base = uint(126 + (power - parity) / 2) << 23;
+    return pica_rcp(uintBitsToFloat(base + rounded));
+}
+)glsl";
+
+enum class ScopeKind { Main, Subroutine, Then, Else, Loop };
+
+struct Scope {
+    ScopeKind kind;
+    u32 begin;
+    u32 end;
+    int parent = kNone;
+    int exit = kNone;
+    int break_target = kNone;
+    bool has_else = false;
+};
+
+struct Node {
+    int scope = kNone;
+    u32 word = 0;
+    std::string code;
+    std::string condition;
+    int next = kNone;
+    int taken = kNone;
+    int callee = kNone;
+    int result = kNone;
+    bool backwards = false;
+    bool reachable = false;
+};
+
+struct Procedure {
+    u32 begin;
+    u32 end;
+    std::vector<Scope> scopes;
+    std::vector<Node> nodes;
+    std::map<std::pair<int, u32>, int> positions;
+    std::vector<int> callees;
+    std::vector<int> loops;
+    int entry = kNone;
+    bool guarded = false;
+};
+
+struct Refusal {
+    const char* category;
+    const char* message;
     int word;
 };
 
-/// Describes the behaviour of code path of a given entry point and a return point.
-enum class ExitMethod {
-    Undetermined, ///< Internal value. Only occur when analyzing JMP loop.
-    AlwaysReturn, ///< All code paths reach the return point.
-    Conditional,  ///< Code path reaches the return point or an END instruction conditionally.
-    AlwaysEnd,    ///< All code paths reach a END instruction.
-};
-
-/// A subroutine is a range of code refereced by a CALL, IF or LOOP instruction.
-struct Subroutine {
-    Subroutine(u32 b, u32 e) : begin(b), end(e), exit_method(ExitMethod::Undetermined) {}
-
-    /// Generates a name suitable for GLSL source code.
-    std::string GetName() const {
-        return "sub_" + std::to_string(begin) + "_" + std::to_string(end);
-    }
-
-    u32 begin;              ///< Entry point of the subroutine.
-    u32 end;                ///< Return point of the subroutine.
-    ExitMethod exit_method; ///< Exit method of the subroutine.
-    std::set<u32> labels;   ///< Addresses refereced by JMP instructions.
-    bool has_break = false; ///< A BREAK or BREAKC can run in it, outside any loop it contains.
-
-    bool operator<(const Subroutine& rhs) const {
-        return std::tie(begin, end) < std::tie(rhs.begin, rhs.end);
-    }
-};
-
-// The program as the analysis and the generator read it. A word that was never loaded is not code.
-class Program {
-public:
-    explicit Program(const DecompileInput& input) : in_(input) {}
-
-    Instruction Fetch(u32 offset) const {
-        if (offset >= in_.program.size()) {
-            throw DecompileFail(fmt::format(
-                "the code runs to word {} but only {} words are loaded (a jump, call or the end of the "
-                "program leaves the loaded code)",
-                offset, in_.program.size()),
-                "code-outside-loaded-words", static_cast<int>(offset));
-        }
-        return Instruction{in_.program[offset]};
-    }
-    Swizzle SwizzleOf(u32 id) const {
-        return Swizzle{id < in_.swizzle.size() ? in_.swizzle[id] : 0u};
-    }
-
-private:
-    const DecompileInput& in_;
-};
-
-// The addresses at which a scope of the program ends: for the shapes in which the interpreter and the
-// structured readings (this translation, Azahar's decompiler and x64 JIT) disagree. `any` holds the end
-// of every CALL, LOOP and IF scope and the else address of every IF; `call_loop` the ends of CALL and LOOP
-// scopes only.
-struct ScopeEnds {
-    std::set<u32> any;
-    std::set<u32> call_loop;
-    std::map<u32, std::set<u32>> loops_by_end; // LOOP instructions by the end address of their scope
-    std::set<u32> else_addresses;              // the else address of every IF that has an else branch
-};
-
-/// Analyzes shader code and produces a set of subroutines.
-class ControlFlowAnalyzer {
-public:
-    ControlFlowAnalyzer(const Program& program, u32 main_offset) : program_(program) {
-        // Recursively finds all subroutines.
-        const Subroutine& program_main = AddSubroutine(main_offset, PROGRAM_END, true);
-        if (program_main.exit_method != ExitMethod::AlwaysEnd)
-            throw DecompileFail("Program does not always end", "program-does-not-end");
-    }
-
-    std::set<Subroutine> MoveSubroutines() {
-        return std::move(subroutines);
-    }
-    const ScopeEnds& Scopes() const {
-        return scope_ends;
-    }
-
-private:
-    const Program& program_;
-    std::set<Subroutine> subroutines;
-    ScopeEnds scope_ends;
-    std::map<std::pair<u32, u32>, ExitMethod> exit_method_map;
-    std::map<std::pair<u32, u32>, bool> break_map;
-    std::set<std::pair<u32, u32>> break_visiting;
-
-    /// Adds and analyzes a new subroutine if it is not added yet.
-    const Subroutine& AddSubroutine(u32 begin, u32 end, bool is_main = false) {
-        auto iter = subroutines.find(Subroutine(begin, end));
-        if (iter != subroutines.end())
-            return *iter;
-
-        if (subroutines.size() >= 4096) {
-            throw DecompileFail("Too many subroutines", "too-large");
-        }
-        Subroutine subroutine(begin, end);
-        subroutine.exit_method = Scan(begin, end, subroutine.labels);
-        if (subroutine.exit_method == ExitMethod::Undetermined)
-            throw DecompileFail("Recursive function detected", "recursion");
-        subroutine.has_break = HasBreak(begin, end);
-        if (!is_main && subroutine.has_break && subroutine.exit_method == ExitMethod::AlwaysEnd) {
-            // Every path ends, but one of them breaks out of the enclosing loop first (the break returns
-            // from the function): the caller must go on after the loop, so the exit is conditional.
-            subroutine.exit_method = ExitMethod::Conditional;
-        }
-        return *subroutines.insert(std::move(subroutine)).first;
-    }
-
-    /// Whether a BREAK / BREAKC can run in the instructions of [begin, end), following the structure
-    /// (an IF / CALL body counts, a LOOP body does not: the loop takes the break).
-    bool HasBreak(u32 begin, u32 end) {
-        const std::pair<u32, u32> key{begin, end};
-        if (auto it = break_map.find(key); it != break_map.end()) {
-            return it->second;
-        }
-        if (!break_visiting.insert(key).second) {
-            return false;
-        }
-        bool result = false;
-        for (u32 offset = begin; offset != end && offset < PROGRAM_END && !result;) {
-            const Instruction instr = program_.Fetch(offset);
-            u32 next = offset + 1;
-            switch (static_cast<Opcode>(instr.opcode())) {
-            case Opcode::END:
-                next = end; // the rest is unreachable
-                break;
-            case Opcode::BREAK:
-            case Opcode::BREAKC:
-                result = true;
-                break;
-            case Opcode::CALL:
-            case Opcode::CALLC:
-            case Opcode::CALLU:
-                result = HasBreak(instr.dest_offset(), instr.dest_offset() + instr.num_instructions());
-                break;
-            case Opcode::IFU:
-            case Opcode::IFC: {
-                result = HasBreak(offset + 1, instr.dest_offset());
-                if (!result && instr.num_instructions() != 0) {
-                    result = HasBreak(instr.dest_offset(), instr.dest_offset() + instr.num_instructions());
-                }
-                next = instr.dest_offset() + instr.num_instructions();
-                break;
-            }
-            case Opcode::LOOP:
-                next = instr.dest_offset() + 1;
-                break;
-            default:
-                break;
-            }
-            if (next <= offset) {
-                break; // a malformed backward range: do not loop
-            }
-            offset = next;
-        }
-        break_visiting.erase(key);
-        break_map[key] = result;
-        return result;
-    }
-
-    void NoteScope(u32 end, bool call_or_loop) {
-        scope_ends.any.insert(end);
-        if (call_or_loop) {
-            scope_ends.call_loop.insert(end);
-        }
-    }
-
-    /// Merges exit method of two parallel branches.
-    static ExitMethod ParallelExit(ExitMethod a, ExitMethod b) {
-        if (a == ExitMethod::Undetermined) {
-            return b;
-        }
-        if (b == ExitMethod::Undetermined) {
-            return a;
-        }
-        if (a == b) {
-            return a;
-        }
-        return ExitMethod::Conditional;
-    }
-
-    /// Cascades exit method of two blocks of code.
-    static ExitMethod SeriesExit(ExitMethod a, ExitMethod b) {
-        // This should be handled before evaluating b.
-        if (a == ExitMethod::Undetermined) {
-            return ExitMethod::Undetermined;
-        }
-
-        if (a == ExitMethod::AlwaysReturn) {
-            return b;
-        }
-
-        if (b == ExitMethod::Undetermined || b == ExitMethod::AlwaysEnd) {
-            return ExitMethod::AlwaysEnd;
-        }
-
-        return ExitMethod::Conditional;
-    }
-
-    /// Scans a range of code for labels and determines the exit method.
-    ExitMethod Scan(u32 begin, u32 end, std::set<u32>& labels) {
-        auto [iter, inserted] =
-            exit_method_map.emplace(std::make_pair(begin, end), ExitMethod::Undetermined);
-        ExitMethod& exit_method = iter->second;
-        if (!inserted)
-            return exit_method;
-
-        for (u32 offset = begin; offset != end && offset != PROGRAM_END; ++offset) {
-            const Instruction instr = program_.Fetch(offset);
-            switch (instr.opcode()) {
-            case static_cast<u32>(Opcode::END): {
-                return exit_method = ExitMethod::AlwaysEnd;
-            }
-            case static_cast<u32>(Opcode::JMPC):
-            case static_cast<u32>(Opcode::JMPU): {
-                labels.insert(instr.dest_offset());
-                ExitMethod no_jmp = Scan(offset + 1, end, labels);
-                ExitMethod jmp = Scan(instr.dest_offset(), end, labels);
-                return exit_method = ParallelExit(no_jmp, jmp);
-            }
-            case static_cast<u32>(Opcode::CALL): {
-                NoteScope(instr.dest_offset() + instr.num_instructions(), true);
-                auto& call = AddSubroutine(instr.dest_offset(),
-                                           instr.dest_offset() + instr.num_instructions());
-                if (call.exit_method == ExitMethod::AlwaysEnd)
-                    return exit_method = ExitMethod::AlwaysEnd;
-                ExitMethod after_call = Scan(offset + 1, end, labels);
-                return exit_method = SeriesExit(call.exit_method, after_call);
-            }
-            case static_cast<u32>(Opcode::LOOP): {
-                NoteScope(instr.dest_offset() + 1, true);
-                scope_ends.loops_by_end[instr.dest_offset() + 1].insert(offset);
-                auto& loop = AddSubroutine(offset + 1, instr.dest_offset() + 1);
-                if (loop.exit_method == ExitMethod::AlwaysEnd)
-                    return exit_method = ExitMethod::AlwaysEnd;
-                ExitMethod after_loop = Scan(instr.dest_offset() + 1, end, labels);
-                return exit_method = SeriesExit(loop.exit_method, after_loop);
-            }
-            case static_cast<u32>(Opcode::CALLC):
-            case static_cast<u32>(Opcode::CALLU): {
-                NoteScope(instr.dest_offset() + instr.num_instructions(), true);
-                auto& call = AddSubroutine(instr.dest_offset(),
-                                           instr.dest_offset() + instr.num_instructions());
-                ExitMethod after_call = Scan(offset + 1, end, labels);
-                return exit_method = SeriesExit(
-                           ParallelExit(call.exit_method, ExitMethod::AlwaysReturn), after_call);
-            }
-            case static_cast<u32>(Opcode::IFU):
-            case static_cast<u32>(Opcode::IFC): {
-                NoteScope(instr.dest_offset(), false);
-                NoteScope(instr.dest_offset() + instr.num_instructions(), false);
-                if (instr.num_instructions() != 0) {
-                    scope_ends.else_addresses.insert(instr.dest_offset());
-                }
-                auto& if_sub = AddSubroutine(offset + 1, instr.dest_offset());
-                ExitMethod else_method;
-                if (instr.num_instructions() != 0) {
-                    auto& else_sub = AddSubroutine(instr.dest_offset(),
-                                                   instr.dest_offset() + instr.num_instructions());
-                    else_method = else_sub.exit_method;
-                } else {
-                    else_method = ExitMethod::AlwaysReturn;
-                }
-
-                ExitMethod both = ParallelExit(if_sub.exit_method, else_method);
-                if (both == ExitMethod::AlwaysEnd)
-                    return exit_method = ExitMethod::AlwaysEnd;
-                ExitMethod after_call =
-                    Scan(instr.dest_offset() + instr.num_instructions(), end, labels);
-                return exit_method = SeriesExit(both, after_call);
-            }
-            default:
-                break;
-            }
-        }
-        return exit_method = ExitMethod::AlwaysReturn;
-    }
-};
-
-class ShaderWriter {
-public:
-    // Forwards all arguments directly to libfmt.
-    // Note that all formatting requirements for fmt must be
-    // obeyed when using this function. (e.g. {{ must be used
-    // printing the character '{' is desirable. Ditto for }} and '}',
-    // etc).
-    template <typename... Args>
-    void AddLine(fmt::format_string<Args...> text, Args&&... args) {
-        AddExpression(fmt::format(text, std::forward<Args>(args)...));
-        AddNewLine();
-    }
-
-    void AddNewLine() {
-        shader_source += '\n';
-    }
-
-    std::string MoveResult() {
-        return std::move(shader_source);
-    }
-
-    int scope = 0;
-
-private:
-    void AddExpression(std::string_view text) {
-        if (!text.empty()) {
-            shader_source.append(static_cast<std::size_t>(scope) * 4, ' ');
-        }
-        shader_source += text;
-    }
-
-    std::string shader_source;
-};
-
-/// The four lanes of source `source` (1-3) as a swizzle string.
-std::string GetSelectorSrc(const Swizzle& pattern, u32 source) {
-    std::string out;
-    for (u32 i = 0; i < 4; ++i) {
-        out += "xyzw"[pattern.selector(source, i)];
-    }
-    return out;
+std::string ProcedureName(int id) {
+    return "pica_body_" + std::to_string(id);
 }
 
-class GLSLGenerator {
+class Translator {
 public:
-    GLSLGenerator(const std::set<Subroutine>& subroutines, const ScopeEnds& scope_ends, const Program& program,
-                  u32 main_offset, const RegGetter& inputreg_getter, const RegGetter& outputreg_getter,
-                  DecompileResult& result, bool exact_arithmetic = true)
-        : subroutines(subroutines), scope_ends(scope_ends), program(program), main_offset(main_offset),
-          inputreg_getter(inputreg_getter), outputreg_getter(outputreg_getter), result(result),
-          exact(exact_arithmetic) {
+    Translator(const DecompileInput& input, const RegGetter& inputs, const RegGetter& outputs)
+        : input_(input), inputs_(inputs), outputs_(outputs) {}
 
-        Generate();
-    }
-
-    std::string MoveShaderCode() {
-        return shader.MoveResult();
-    }
+    DecompileResult Run();
 
 private:
-    /// Gets the Subroutine object corresponding to the specified address.
-    const Subroutine& GetSubroutine(u32 begin, u32 end) const {
-        auto iter = subroutines.find(Subroutine(begin, end));
-        if (iter == subroutines.end()) {
-            throw DecompileFail(fmt::format("Internal error: no subroutine {}..{}", begin, end));
-        }
-        return *iter;
+    int AddProcedure(u32 begin, u32 end);
+    int AddScope(Procedure& proc, Scope scope);
+    int AddNode(Procedure& proc, Node node);
+    int Position(Procedure& proc, int scope, u32 pc);
+    int ScopeExit(Procedure& proc, int scope, u32 pc);
+    int FindLoop(const Procedure& proc, int scope) const;
+    void Decode(Procedure& proc, Node& node);
+    void Arithmetic(Node& node, Instruction instruction);
+    std::string Source(isa::SourceRegister reg, u32 address, isa::Swizzle swizzle, u32 operand);
+    void CheckCallGraph() const;
+    void EmitProcedure(std::string& glsl, const Procedure& proc, int id) const;
+    void EmitNode(std::string& glsl, const Node& node, bool dispatch) const;
+
+    const DecompileInput& input_;
+    const RegGetter& inputs_;
+    const RegGetter& outputs_;
+    std::deque<Procedure> procedures_;
+    std::map<std::pair<u32, u32>, int> entries_;
+    DecompileResult result_;
+    u32 instruction_count_ = 0;
+    bool ignored_geometry_ = false;
+    bool uses_scalar_rounding_ = false;
+};
+
+std::string Condition(Instruction instruction) {
+    const std::string x = instruction.refx() ? "conditional_code.x" : "!conditional_code.x";
+    const std::string y = instruction.refy() ? "conditional_code.y" : "!conditional_code.y";
+    switch (instruction.condition_op()) {
+    case isa::ConditionOp::Or: return x + " || " + y;
+    case isa::ConditionOp::And: return x + " && " + y;
+    case isa::ConditionOp::JustX: return x;
+    case isa::ConditionOp::JustY: return y;
     }
+    return {};
+}
 
-    /// Generates condition evaluation code for the flow control instruction.
-    static std::string EvaluateCondition(const Instruction& instr) {
-        using Op = isa::ConditionOp;
+std::string UniformCondition(Instruction instruction, bool inverted = false) {
+    return "(uniforms.b & " + std::to_string(1u << instruction.bool_uniform_id()) + "u) " +
+           (inverted ? "== 0u" : "!= 0u");
+}
 
-        const std::string_view result_x = instr.refx() ? "conditional_code.x" : "!conditional_code.x";
-        const std::string_view result_y = instr.refy() ? "conditional_code.y" : "!conditional_code.y";
-
-        switch (instr.condition_op()) {
-        case Op::JustX:
-            return std::string(result_x);
-        case Op::JustY:
-            return std::string(result_y);
-        case Op::Or:
-        case Op::And: {
-            const std::string_view and_or = instr.condition_op() == Op::Or ? "any" : "all";
-            std::string bvec;
-            if (instr.refx() && instr.refy()) {
-                bvec = "conditional_code";
-            } else if (!instr.refx() && !instr.refy()) {
-                bvec = "not(conditional_code)";
-            } else {
-                bvec = fmt::format("bvec2({}, {})", result_x, result_y);
-            }
-            return fmt::format("{}({})", and_or, bvec);
-        }
-        }
-        return "false";
-    }
-
-    /// Generates code representing a source register.
-    std::string GetSourceRegister(const SourceRegister& source_reg,
-                                  u32 address_register_index) const {
-        const u32 index = source_reg.index();
-
-        switch (source_reg.kind()) {
-        case SourceKind::Input:
-            return inputreg_getter(index);
-        case SourceKind::Temporary:
-            return fmt::format("reg_tmp{}", index);
-        case SourceKind::FloatUniform:
-            if (address_register_index != 0) {
-                return fmt::format("get_offset_register({}, address_registers.{})", index,
-                                   "xyz"[address_register_index - 1]);
-            }
-            return fmt::format("uniforms.f[{}]", index);
-        }
-        return "vec4(0.0)";
-    }
-
-    /// Generates code representing a destination register; "" for one that names nothing.
-    std::string GetDestRegister(const isa::DestRegister& dest_reg) const {
-        if (dest_reg.is_output()) {
-            return outputreg_getter(dest_reg.index());
-        }
-        if (dest_reg.is_temporary()) {
-            return fmt::format("reg_tmp{}", dest_reg.index());
-        }
-        return "";
-    }
-
-    /// Generates code representing a bool uniform
-    std::string GetUniformBool(u32 index, bool invert_test = false) const {
-        return fmt::format("(uniforms.b & {}u) {} 0u", 1 << index, invert_test ? "==" : "!=");
-    }
-
-    /**
-     * Adds code that calls a subroutine.
-     * @param subroutine the subroutine to call.
-     */
-    void CallSubroutine(const Subroutine& subroutine, bool propagate_break = true) {
-        calls[current_sub].insert(subroutine.GetName());
-        if (subroutine.exit_method == ExitMethod::AlwaysEnd) {
-            shader.AddLine("{}();", subroutine.GetName());
-            shader.AddLine("return true;");
-        } else if (subroutine.exit_method == ExitMethod::Conditional) {
-            shader.AddLine("if ({}()) {{ return true; }}", subroutine.GetName());
+std::string Translator::Source(isa::SourceRegister reg, u32 address, isa::Swizzle swizzle, u32 operand) {
+    std::string expression;
+    const std::string index = std::to_string(reg.index());
+    switch (reg.kind()) {
+    case isa::SourceKind::Input: expression = inputs_(reg.index()); break;
+    case isa::SourceKind::Temporary: expression = "reg_tmp" + index; break;
+    case isa::SourceKind::FloatUniform:
+        if (address != 0) {
+            constexpr std::string_view offsets[] = {"address_registers.x", "address_registers.y", "address_registers.z"};
+            expression = "pica_read(" + index + ", " + std::string(offsets[address - 1]) + ")";
         } else {
-            shader.AddLine("{}();", subroutine.GetName());
+            expression = "uniforms.f[" + index + "]";
         }
-        if (subroutine.has_break && propagate_break) {
-            // A BREAK / BREAKC ran in it: the callers return until the loop that takes it.
-            shader.AddLine("if (loop_break) {{ return false; }}");
+        break;
+    }
+    std::string selection;
+    for (u32 component = 0; component < 4; ++component) {
+        selection += kLanes[swizzle.selector(operand, component)];
+    }
+    return (swizzle.negate(operand) ? "-(" : "(") + expression + ")." + selection;
+}
+
+void Translator::Arithmetic(Node& node, Instruction instruction) {
+    const Opcode opcode = instruction.Effective();
+    const bool mad = instruction.info().format == isa::Format::MultiplyAdd;
+    const bool inverted = instruction.info().src_inversed;
+    const u32 descriptor = mad ? instruction.mad_operand_desc_id() : instruction.operand_desc_id();
+    const isa::Swizzle swizzle{descriptor < input_.swizzle.size() ? input_.swizzle[descriptor] : 0};
+    std::string mask;
+    for (u32 component = 0; component < 4; ++component) {
+        if (swizzle.DestEnabled(component)) {
+            mask += kLanes[component];
         }
     }
-
-    /**
-     * Writes code that does an assignment operation.
-     * @param swizzle the swizzle data of the current instruction.
-     * @param reg the destination register code.
-     * @param value the code representing the value to assign.
-     * @param dest_num_components number of components of the destination register.
-     * @param value_num_components number of components of the value to assign.
-     */
-    void SetDest(const Swizzle& swizzle, std::string_view reg, std::string_view value,
-                 u32 dest_num_components, u32 value_num_components) {
-        u32 dest_mask_num_components = 0;
-        std::string dest_mask_swizzle = ".";
-
-        for (u32 i = 0; i < dest_num_components; ++i) {
-            if (swizzle.DestEnabled(i)) {
-                dest_mask_swizzle += "xyzw"[i];
-                ++dest_mask_num_components;
-            }
+    const bool lit = opcode == Opcode::LIT;
+    if (lit || opcode == Opcode::DST || opcode == Opcode::DSTI) {
+        result_.uses_unverified_instructions = true;
+    }
+    std::string destination;
+    if (opcode != Opcode::MOVA && opcode != Opcode::CMP) {
+        const isa::DestRegister dest = mad ? instruction.mad_dest() : instruction.dest();
+        if (dest.is_output()) {
+            destination = outputs_(dest.index());
+        } else if (dest.is_temporary()) {
+            destination = "reg_tmp" + std::to_string(dest.index());
         }
-
-        if (reg.empty() || dest_mask_num_components == 0) {
+        if (!lit && (destination.empty() || mask.empty())) {
             return;
         }
-
-        const std::string dest =
-            fmt::format("{}{}", reg, dest_num_components != 1 ? dest_mask_swizzle : "");
-
-        std::string src{value};
-        if (value_num_components == 1) {
-            if (dest_mask_num_components != 1) {
-                src = fmt::format("vec{}({})", dest_mask_num_components, value);
-            }
-        } else if (value_num_components != dest_mask_num_components) {
-            src = fmt::format("({}){}", value, dest_mask_swizzle);
-        }
-
-        shader.AddLine("{} = {};", dest, src);
     }
-
-    // A CALL or a jump that is the last instruction of a scope: the interpreter lets the end of the scope
-    // override the program counter that the instruction set, so it is never taken there.
-    void NoteIfLastOfScope(u32 offset) {
-        if (scope_ends.any.count(offset + 1) != 0) {
-            differs_from_interpreter = true;
-        }
+    const u32 address = mad ? instruction.mad_address_register_index() : instruction.address_register_index();
+    const auto first = mad ? instruction.mad_src1(inverted) : instruction.src1(inverted);
+    const auto second = mad ? instruction.mad_src2(inverted) : instruction.src2(inverted);
+    const bool unary = opcode == Opcode::MOV || opcode == Opcode::MOVA || opcode == Opcode::FLR || lit ||
+                       opcode == Opcode::EX2 || opcode == Opcode::LG2 || opcode == Opcode::RCP || opcode == Opcode::RSQ;
+    node.code += "{\nvec4 a = " + Source(first, mad || inverted ? 0 : address, swizzle, 1) + ";\n";
+    if (!unary) {
+        node.code += "vec4 b = " + Source(second, (mad != inverted) ? address : 0, swizzle, 2) + ";\n";
     }
-
-    /// The comparison operator of a CMP half, or "" for the two undefined ones.
-    static std::pair<std::string_view, std::string_view> CompareOperator(isa::CompareOp op) {
-        switch (op) {
-        case isa::CompareOp::Equal:
-            return {"==", "equal"};
-        case isa::CompareOp::NotEqual:
-            return {"!=", "notEqual"};
-        case isa::CompareOp::LessThan:
-            return {"<", "lessThan"};
-        case isa::CompareOp::LessEqual:
-            return {"<=", "lessThanEqual"};
-        case isa::CompareOp::GreaterThan:
-            return {">", "greaterThan"};
-        case isa::CompareOp::GreaterEqual:
-            return {">=", "greaterThanEqual"};
-        default:
-            return {"", ""};
+    std::string expr;
+    switch (opcode) {
+    case Opcode::MOV: expr = "a"; break;
+    case Opcode::FLR: expr = "floor(a)"; break;
+    case Opcode::ADD: expr = "a + b"; break;
+    case Opcode::MUL: expr = "pica_mul(a, b)"; break;
+    case Opcode::MAD:
+    case Opcode::MADI:
+        node.code += "vec4 c = " + Source(instruction.mad_src3(inverted), inverted ? address : 0, swizzle, 3) + ";\n";
+        expr = "pica_mul(a, b) + c";
+        break;
+    case Opcode::DPH:
+    case Opcode::DPHI:
+        node.code += "a.w = 1.0;\n";
+        [[fallthrough]];
+    case Opcode::DP3:
+    case Opcode::DP4: {
+        const bool three = opcode == Opcode::DP3;
+        node.code += "vec4 product = pica_mul(a, b);\n";
+        if (input_.exact_arithmetic) {
+            expr = three ? "vec4((product.x + product.y) + product.z)"
+                         : "vec4(((product.x + product.y) + product.z) + product.w)";
+        } else {
+            expr = three ? "vec4(dot(product.xyz, vec3(1.0)))" : "vec4(dot(product, vec4(1.0)))";
         }
+        break;
     }
-
-    /**
-     * Compiles a single instruction from PICA to GLSL.
-     * @param offset the offset of the PICA shader instruction.
-     * @return the offset of the next instruction to execute. Usually it is the current offset + 1.
-     * If the current instruction is IF or LOOP, the next instruction is after the IF or LOOP block.
-     * If the current instruction always terminates the program, returns PROGRAM_END.
-     */
-    u32 CompileInstr(u32 offset) {
-        if (++compiled_instructions > kMaxCompiledInstructions) {
-            throw DecompileFail("The program is too large to translate", "too-large");
+    case Opcode::DST:
+    case Opcode::DSTI: expr = "vec4(1.0, pica_mul(a, b).y, a.z, b.w)"; break;
+    case Opcode::LIT:
+        node.code += "conditional_code = greaterThanEqual(a.xw, vec2(0.0));\n";
+        expr = "vec4(1.0, max(a.x, 0.0), a.x > 0.0 && a.y > 0.0 ? pow(a.y, clamp(a.w, -128.0, 128.0)) : 0.0, 1.0)";
+        break;
+    case Opcode::MAX: expr = "mh4n_max(a, b)"; break;
+    case Opcode::MIN: expr = "mh4n_min(a, b)"; break;
+    case Opcode::SGE:
+    case Opcode::SGEI: expr = "vec4(greaterThanEqual(a, b))"; break;
+    case Opcode::SLT:
+    case Opcode::SLTI: expr = "vec4(lessThan(a, b))"; break;
+    case Opcode::EX2: expr = "vec4(exp2(a.x))"; break;
+    case Opcode::LG2: expr = "vec4(log2(a.x))"; break;
+    case Opcode::RCP:
+    case Opcode::RSQ:
+        uses_scalar_rounding_ |= input_.exact_arithmetic;
+        if (opcode == Opcode::RCP) {
+            expr = input_.exact_arithmetic ? "vec4(pica_rcp(a.x))" : "vec4(1.0 / a.x)";
+        } else {
+            expr = input_.exact_arithmetic ? "vec4(pica_rsq(a.x))" : "vec4(inversesqrt(a.x))";
         }
-        const Instruction instr = program.Fetch(offset);
-        const isa::OpInfo& info = instr.info();
-
-        const Swizzle swizzle = program.SwizzleOf(
-            info.format == isa::Format::MultiplyAdd ? instr.mad_operand_desc_id() : instr.operand_desc_id());
-
-        shader.AddLine("// {}: {}", offset, info.name);
-
-        switch (info.format) {
-        case isa::Format::Arithmetic: {
-            const bool is_inverted = info.src_inversed;
-
-            std::string src1 = swizzle.negate(1) ? "-" : "";
-            src1 += GetSourceRegister(instr.src1(is_inverted),
-                                      !is_inverted * instr.address_register_index());
-            src1 += "." + GetSelectorSrc(swizzle, 1);
-
-            // The single-source instructions do not read the second field (it holds whatever): the
-            // register it names is not an input of the program.
-            std::string src2;
-            switch (instr.Effective()) {
-            case Opcode::FLR:
-            case Opcode::RCP:
-            case Opcode::RSQ:
-            case Opcode::EX2:
-            case Opcode::LG2:
-            case Opcode::LIT:
-            case Opcode::MOV:
-            case Opcode::MOVA:
-                break;
-            default:
-                src2 = swizzle.negate(2) ? "-" : "";
-                src2 += GetSourceRegister(instr.src2(is_inverted), is_inverted * instr.address_register_index());
-                src2 += "." + GetSelectorSrc(swizzle, 2);
-                break;
+        break;
+    case Opcode::MOVA:
+        for (u32 component = 0; component < 2; ++component) {
+            if (swizzle.DestEnabled(component)) {
+                const std::string lane(1, kLanes[component]);
+                node.code += "address_registers." + lane + " = pica_address(a." + lane + ");\n";
             }
+        }
+        break;
+    case Opcode::CMP: {
+        constexpr std::string_view ops[] = {"==", "!=", "<", "<=", ">", ">="};
+        const auto x = static_cast<u32>(instruction.compare_x());
+        const auto y = static_cast<u32>(instruction.compare_y());
+        if (x < std::size(ops)) node.code += "conditional_code.x = a.x " + std::string(ops[x]) + " b.x;\n";
+        if (y < std::size(ops)) node.code += "conditional_code.y = a.y " + std::string(ops[y]) + " b.y;\n";
+        break;
+    }
+    default: throw Refusal{"unhandled-instruction", "Unhandled instruction", static_cast<int>(node.word)};
+    }
+    if (!expr.empty() && !destination.empty() && !mask.empty()) {
+        node.code += "precise vec4 value = " + expr + ";\n" + destination + "." + mask + " = value." + mask + ";\n";
+    }
+    node.code += "}\n";
+}
 
-            std::string dest_reg = GetDestRegister(instr.dest());
+int Translator::AddProcedure(u32 begin, u32 end) {
+    const int id = static_cast<int>(procedures_.size());
+    const auto [entry, inserted] = entries_.try_emplace({begin, end}, id);
+    if (inserted) {
+        auto& proc = procedures_.emplace_back();
+        proc.begin = begin;
+        proc.end = end;
+    }
+    return entry->second;
+}
 
-            switch (instr.Effective()) {
-            case Opcode::ADD: {
-                SetDest(swizzle, dest_reg, fmt::format("{} + {}", src1, src2), 4, 4);
-                break;
-            }
+int Translator::AddScope(Procedure& proc, Scope scope) {
+    proc.scopes.push_back(scope);
+    return static_cast<int>(proc.scopes.size()) - 1;
+}
 
-            case Opcode::MUL: {
-                SetDest(swizzle, dest_reg, fmt::format("sanitize_mul({}, {})", src1, src2), 4, 4);
-                break;
-            }
+int Translator::AddNode(Procedure& proc, Node node) {
+    proc.nodes.push_back(std::move(node));
+    return static_cast<int>(proc.nodes.size()) - 1;
+}
 
-            case Opcode::FLR: {
-                SetDest(swizzle, dest_reg, fmt::format("floor({})", src1), 4, 4);
-                break;
-            }
+int Translator::Position(Procedure& proc, int scope, u32 pc) {
+    const Scope& region = proc.scopes[scope];
+    if (pc == region.end && region.exit != kNone) {
+        return region.exit;
+    }
+    const auto [position, inserted] = proc.positions.try_emplace({scope, pc}, static_cast<int>(proc.nodes.size()));
+    if (inserted) {
+        Node node;
+        node.scope = scope;
+        node.word = pc;
+        AddNode(proc, std::move(node));
+    }
+    return position->second;
+}
 
-            case Opcode::MAX: {
-                SetDest(swizzle, dest_reg, fmt::format("pica_max({}, {})", src1, src2), 4, 4);
-                break;
-            }
-
-            case Opcode::MIN: {
-                SetDest(swizzle, dest_reg, fmt::format("pica_min({}, {})", src1, src2), 4, 4);
-                break;
-            }
-
-            case Opcode::DP3:
-            case Opcode::DP4:
-            case Opcode::DPH:
-            case Opcode::DPHI: {
-                Opcode opcode = instr.Effective();
-                std::string dot;
-                if (opcode == Opcode::DP3) {
-                    dot = fmt::format("pica_dp3(vec3(sanitize_mul({}, {})))", src1, src2);
-                } else {
-                    const std::string src1_ = (opcode == Opcode::DPH || opcode == Opcode::DPHI)
-                                                  ? fmt::format("vec4(({}).xyz, 1.0)", src1)
-                                                  : std::move(src1);
-
-                    dot = fmt::format("pica_dp4(sanitize_mul({}, {}))", src1_, src2);
-                }
-
-                SetDest(swizzle, dest_reg, dot, 4, 1);
-                break;
-            }
-
-            case Opcode::DST:
-            case Opcode::DSTI: {
-                result.uses_unverified_instructions = true;
-                SetDest(swizzle, dest_reg,
-                        fmt::format("vec4(1.0, sanitize_mul({0}, {1}).y, ({0}).z, ({1}).w)", src1, src2), 4,
-                        4);
-                break;
-            }
-
-            case Opcode::LIT: {
-                result.uses_unverified_instructions = true;
-                SetDest(swizzle, dest_reg, fmt::format("pica_lit({})", src1), 4, 4);
-                break;
-            }
-
-            case Opcode::RCP: {
-                SetDest(swizzle, dest_reg, fmt::format("pica_rcp({}.x)", src1), 4, 1);
-                break;
-            }
-
-            case Opcode::RSQ: {
-                SetDest(swizzle, dest_reg, fmt::format("pica_rsq({}.x)", src1), 4, 1);
-                break;
-            }
-
-            case Opcode::MOVA: {
-                SetDest(swizzle, "address_registers", fmt::format("ivec2({})", src1), 2, 2);
-                break;
-            }
-
-            case Opcode::MOV: {
-                SetDest(swizzle, dest_reg, src1, 4, 4);
-                break;
-            }
-
-            case Opcode::SGE:
-            case Opcode::SGEI: {
-                SetDest(swizzle, dest_reg,
-                        fmt::format("vec4(greaterThanEqual({}, {}))", src1, src2), 4, 4);
-                break;
-            }
-
-            case Opcode::SLT:
-            case Opcode::SLTI: {
-                SetDest(swizzle, dest_reg, fmt::format("vec4(lessThan({}, {}))", src1, src2), 4, 4);
-                break;
-            }
-
-            case Opcode::CMP: {
-                const auto op_x = CompareOperator(instr.compare_x());
-                const auto op_y = CompareOperator(instr.compare_y());
-
-                // An undefined compare mode leaves that half of the condition code as it was (the
-                // interpreter logs it and does the same).
-                if (instr.compare_x() == instr.compare_y() && !op_x.first.empty()) {
-                    shader.AddLine("conditional_code = {}(vec2({}), vec2({}));", op_x.second, src1, src2);
-                } else {
-                    if (!op_x.first.empty()) {
-                        shader.AddLine("conditional_code.x = {}.x {} {}.x;", src1, op_x.first, src2);
-                    }
-                    if (!op_y.first.empty()) {
-                        shader.AddLine("conditional_code.y = {}.y {} {}.y;", src1, op_y.first, src2);
-                    }
-                }
-                break;
-            }
-
-            case Opcode::EX2: {
-                SetDest(swizzle, dest_reg, fmt::format("exp2({}.x)", src1), 4, 1);
-                break;
-            }
-
-            case Opcode::LG2: {
-                SetDest(swizzle, dest_reg, fmt::format("log2({}.x)", src1), 4, 1);
-                break;
-            }
-
-            default: {
-                throw DecompileFail(fmt::format("Unhandled instruction at word {} (arithmetic format)", offset),
-                                    "unhandled-instruction", static_cast<int>(offset));
-            }
-            }
-
+int Translator::ScopeExit(Procedure& proc, int scope, u32 pc) {
+    for (int current = scope; current != kNone; current = proc.scopes[current].parent) {
+        const Scope& region = proc.scopes[current];
+        if (pc >= region.begin && pc <= region.end) {
+            return Position(proc, current, pc);
+        }
+        if (region.kind == ScopeKind::Loop) {
             break;
         }
-
-        case isa::Format::MultiplyAdd: {
-            if ((instr.Effective() == Opcode::MAD) || (instr.Effective() == Opcode::MADI)) {
-                bool is_inverted = (instr.Effective() == Opcode::MADI);
-
-                std::string src1 = swizzle.negate(1) ? "-" : "";
-                src1 += GetSourceRegister(instr.mad_src1(is_inverted), 0);
-                src1 += "." + GetSelectorSrc(swizzle, 1);
-
-                std::string src2 = swizzle.negate(2) ? "-" : "";
-                src2 += GetSourceRegister(instr.mad_src2(is_inverted),
-                                          !is_inverted * instr.mad_address_register_index());
-                src2 += "." + GetSelectorSrc(swizzle, 2);
-
-                std::string src3 = swizzle.negate(3) ? "-" : "";
-                src3 += GetSourceRegister(instr.mad_src3(is_inverted),
-                                          is_inverted * instr.mad_address_register_index());
-                src3 += "." + GetSelectorSrc(swizzle, 3);
-
-                const std::string dest_reg = GetDestRegister(instr.mad_dest());
-
-                SetDest(swizzle, dest_reg, fmt::format("sanitize_mul({}, {}) + {}", src1, src2, src3), 4,
-                        4);
-            } else {
-                throw DecompileFail(fmt::format("Unhandled instruction at word {} (multiply-add format)", offset),
-                                    "unhandled-instruction", static_cast<int>(offset));
-            }
-            break;
-        }
-
-        default: {
-            switch (static_cast<Opcode>(instr.opcode())) {
-            case Opcode::END: {
-                shader.AddLine("return true;");
-                offset = PROGRAM_END - 1;
-                break;
-            }
-
-            case Opcode::BREAK:
-            case Opcode::BREAKC: {
-                std::string condition = "loop_depth > 0";
-                if (static_cast<Opcode>(instr.opcode()) == Opcode::BREAKC) {
-                    condition = fmt::format("loop_depth > 0 && ({})", EvaluateCondition(instr));
-                }
-                shader.AddLine("if ({}) {{", condition);
-                ++shader.scope;
-                shader.AddLine("loop_break = true;");
-                shader.AddLine("return false;");
-                --shader.scope;
-                shader.AddLine("}}");
-                break;
-            }
-
-            case Opcode::JMPC:
-            case Opcode::JMPU: {
-                NoteIfLastOfScope(offset);
-                std::string condition;
-                if (static_cast<Opcode>(instr.opcode()) == Opcode::JMPC) {
-                    condition = EvaluateCondition(instr);
-                } else {
-                    const bool invert_test = instr.num_instructions() & 1;
-                    condition = GetUniformBool(instr.bool_uniform_id(), invert_test);
-                }
-                if (instr.dest_offset() <= offset) {
-                    backward_jump_offset = offset;
-                }
-
-                shader.AddLine("if ({}) {{", condition);
-                ++shader.scope;
-                shader.AddLine("{{ jmp_to = {}u; break; }}", instr.dest_offset());
-
-                --shader.scope;
-                shader.AddLine("}}");
-                break;
-            }
-
-            case Opcode::CALL:
-            case Opcode::CALLC:
-            case Opcode::CALLU: {
-                NoteIfLastOfScope(offset);
-                const Opcode opcode = static_cast<Opcode>(instr.opcode());
-                std::string condition;
-                if (opcode == Opcode::CALLC) {
-                    condition = EvaluateCondition(instr);
-                } else if (opcode == Opcode::CALLU) {
-                    condition = GetUniformBool(instr.bool_uniform_id());
-                }
-
-                if (condition.empty()) {
-                    shader.AddLine("{{");
-                } else {
-                    shader.AddLine("if ({}) {{", condition);
-                }
-                ++shader.scope;
-
-                auto& call_sub =
-                    GetSubroutine(instr.dest_offset(), instr.dest_offset() + instr.num_instructions());
-
-                CallSubroutine(call_sub);
-                if (opcode == Opcode::CALL && call_sub.exit_method == ExitMethod::AlwaysEnd) {
-                    offset = PROGRAM_END - 1;
-                }
-
-                --shader.scope;
-                shader.AddLine("}}");
-                break;
-            }
-
-            case Opcode::NOP: {
-                break;
-            }
-
-            case Opcode::IFC:
-            case Opcode::IFU: {
-                std::string condition;
-                if (static_cast<Opcode>(instr.opcode()) == Opcode::IFC) {
-                    condition = EvaluateCondition(instr);
-                } else {
-                    condition = GetUniformBool(instr.bool_uniform_id());
-                }
-
-                const u32 if_offset = offset + 1;
-                const u32 else_offset = instr.dest_offset();
-                const u32 endif_offset = instr.dest_offset() + instr.num_instructions();
-                // An IF (with or without else) that is the last statement of a loop or call body, or of the
-                // THEN-branch of an IF that has an else: its end is the end of that scope. The interpreter
-                // tests one scope end per instruction (see the header comment), and the jump of the IF
-                // lands where the other scope's test does not fire.
-                if (scope_ends.call_loop.count(endif_offset) != 0 || scope_ends.else_addresses.count(endif_offset) != 0) {
-                    differs_from_interpreter = true;
-                }
-
-                shader.AddLine("if ({}) {{", condition);
-                ++shader.scope;
-
-                auto& if_sub = GetSubroutine(if_offset, else_offset);
-                CallSubroutine(if_sub);
-                offset = else_offset - 1;
-
-                if (instr.num_instructions() != 0) {
-                    --shader.scope;
-                    shader.AddLine("}} else {{");
-                    ++shader.scope;
-
-                    auto& else_sub = GetSubroutine(else_offset, endif_offset);
-                    CallSubroutine(else_sub);
-                    offset = endif_offset - 1;
-
-                    if (if_sub.exit_method == ExitMethod::AlwaysEnd &&
-                        else_sub.exit_method == ExitMethod::AlwaysEnd) {
-                        offset = PROGRAM_END - 1;
-                    }
-                }
-
-                --shader.scope;
-                shader.AddLine("}}");
-                break;
-            }
-
-            case Opcode::LOOP: {
-                const std::string int_uniform =
-                    fmt::format("uniforms.i[{}]", instr.int_uniform_id());
-                const std::string loop_var = fmt::format("loop{}", offset);
-                auto& loop_sub = GetSubroutine(offset + 1, instr.dest_offset() + 1);
-
-                // As the interpreter: aL is set to y, the increment is added after the last iteration and
-                // after a break, and a loop entered inside another loop sets aL back to y when it ends
-                // (shader_interpreter.cpp keeps previous_aL after the LOOP case has assigned y to aL, so
-                // that is the value it gives back; the intention may have been the outer loop's aL, but
-                // the interpreter is the reference. Azahar's decompiler leaves aL as the loop left it).
-                shader.AddLine("{{");
-                ++shader.scope;
-                shader.AddLine("address_registers.z = int({}.y);", int_uniform);
-                shader.AddLine("++loop_depth;");
-                shader.AddLine("for (uint {} = 0u; {} <= {}.x; ++{}) {{", loop_var, loop_var, int_uniform,
-                               loop_var);
-                ++shader.scope;
-                CallSubroutine(loop_sub, false); // the loop takes the break itself
-                shader.AddLine("address_registers.z += int({}.z);", int_uniform);
-                if (loop_sub.has_break) {
-                    shader.AddLine("if (loop_break) {{ loop_break = false; break; }}");
-                }
-                --shader.scope;
-                shader.AddLine("}}");
-                shader.AddLine("--loop_depth;");
-                shader.AddLine("if (loop_depth > 0) {{ address_registers.z = int({}.y); }}", int_uniform);
-                --shader.scope;
-                shader.AddLine("}}");
-
-                offset = instr.dest_offset();
-
-                if (loop_sub.exit_method == ExitMethod::AlwaysEnd) {
-                    offset = PROGRAM_END - 1;
-                }
-
-                break;
-            }
-
-            case Opcode::EMIT:
-            case Opcode::SETEMIT:
-                // As Azahar's decompiler: nothing (it logs "Geometry shader operation detected in
-                // vertex shader"); the interpreter, with no emitter on a vertex unit, does nothing too.
-                has_emit = true;
-                break;
-
-            default: {
-                throw DecompileFail(fmt::format("Unhandled instruction at word {}", offset), "unhandled-instruction",
-                                    static_cast<int>(offset));
-            }
-            }
-
-            break;
-        }
-        }
-        return offset + 1;
     }
+    return kNone;
+}
 
-    /**
-     * Compiles a range of instructions from PICA to GLSL.
-     * @param begin the offset of the starting instruction.
-     * @param end the offset where the compilation should stop (exclusive).
-     * @return the offset of the next instruction to compile. PROGRAM_END if the program terminates.
-     */
-    u32 CompileRange(u32 begin, u32 end) {
-        u32 program_counter;
-        for (program_counter = begin; program_counter < (begin > end ? PROGRAM_END : end);) {
-            program_counter = CompileInstr(program_counter);
+int Translator::FindLoop(const Procedure& proc, int scope) const {
+    for (int current = scope; current != kNone; current = proc.scopes[current].parent) {
+        if (proc.scopes[current].kind == ScopeKind::Loop) {
+            return proc.scopes[current].break_target;
         }
-        return program_counter;
     }
+    return kNone;
+}
 
-    // The analysis follows the program's structure, the generator also compiles code a jump leads into
-    // from another range: GLSL has no recursion, so a cycle in the calls that were generated is refused.
-    void CheckNoRecursion() const {
-        std::map<std::string, int> state; // 1 on the path, 2 done
-        std::vector<std::string> stack;
-        const auto visit = [&](const auto& self, const std::string& name) -> void {
-            int& st = state[name];
-            if (st == 2) {
+void Translator::Decode(Procedure& proc, Node& node) {
+    const u32 pc = node.word;
+    const int scope = node.scope;
+    const Scope region = proc.scopes[scope];
+    const int at = static_cast<int>(pc);
+    if (pc >= region.end || pc >= input_.program.size()) {
+        throw Refusal{"loaded-code", "Execution ran beyond the loaded program", at};
+    }
+    if (++instruction_count_ > kMaxCompiledInstructions) {
+        throw Refusal{"program-size", "Vertex program exceeds the compiled instruction limit", at};
+    }
+    const Instruction instruction{input_.program[pc]};
+    const Opcode opcode = instruction.Effective();
+    const u32 target = instruction.dest_offset();
+    const u32 length = instruction.num_instructions();
+    const auto next = [&] { return Position(proc, scope, pc + 1); };
+    const bool tail_sensitive = region.kind == ScopeKind::Loop || region.kind == ScopeKind::Subroutine ||
+                                (region.kind == ScopeKind::Then && region.has_else);
+    node.code = "// PICA " + std::to_string(pc) + " " + instruction.info().name + "\n";
+
+    switch (opcode) {
+    case Opcode::END:
+        node.result = 1;
+        return;
+    case Opcode::NOP:
+        break;
+    case Opcode::EMIT:
+    case Opcode::SETEMIT:
+        ignored_geometry_ = true;
+        break;
+    case Opcode::BREAK:
+    case Opcode::BREAKC: {
+        const int local_loop = FindLoop(proc, scope);
+        if (local_loop != kNone) {
+            if (opcode == Opcode::BREAK) {
+                node.next = local_loop;
                 return;
             }
-            if (st == 1) {
-                throw DecompileFail("Recursive function detected", "recursion");
+            node.condition = Condition(instruction);
+            node.taken = local_loop;
+        } else {
+            node.code += "if (loop_depth > 0";
+            if (opcode == Opcode::BREAKC) {
+                node.code += " && (" + Condition(instruction) + ")";
             }
-            st = 1;
-            if (auto it = calls.find(name); it != calls.end()) {
-                for (const std::string& callee : it->second) {
-                    self(self, callee);
-                }
-            }
-            state[name] = 2;
-        };
-        visit(visit, "exec_shader");
+            node.code += ") return 2;\n";
+        }
+        break;
     }
-
-    void Generate() {
-        // The PICA's multiplication: 0 x inf is +0, a NaN factor gives NaN. The tests are on the bits so
-        // that no compiler can fold them away.
-        shader.AddLine("bvec4 pica_isnan(vec4 v) {{");
-        ++shader.scope;
-        shader.AddLine("return greaterThan(floatBitsToUint(v) & uvec4(0x7fffffffu), uvec4(0x7f800000u));");
-        --shader.scope;
-        shader.AddLine("}}\n");
-
-        // The fast arithmetic multiplies as the GPU does (`plain`): the rule cost a Moto g06 2.5 ms of a 42 ms frame, and
-        // deterministic runs of the village and of the Arena hunt draw the same pixels without it (MH4U's programs never
-        // multiply 0 by an infinity where it shows). MH4N_MUL=rule: the PICA's rule (as exact arithmetic always does);
-        // `zero`: a factor of 0 gives 0 (the rule, but 0 x NaN too).
-        static const int mul_mode = [] {
-            const char* v = std::getenv("MH4N_MUL");
-            return v == nullptr ? 2 : (std::string(v) == "plain" ? 2 : (std::string(v) == "zero" ? 1 : 0));
-        }();
-        if (!exact && mul_mode == 2) {
-            shader.AddLine("vec4 sanitize_mul(vec4 lhs, vec4 rhs) {{ return lhs * rhs; }}\n");
-        } else if (!exact && mul_mode == 1) {
-            shader.AddLine("vec4 sanitize_mul(vec4 lhs, vec4 rhs) {{");
-            ++shader.scope;
-            shader.AddLine("bvec4 zero = bvec4(uvec4(equal(lhs, vec4(0.0))) | uvec4(equal(rhs, vec4(0.0))));");
-            shader.AddLine("return mix(lhs * rhs, vec4(0.0), zero);");
-            --shader.scope;
-            shader.AddLine("}}\n");
+    case Opcode::IFC:
+    case Opcode::IFU: {
+        const u32 end = target + length;
+        if (target < pc + 1 || end > region.end) {
+            throw Refusal{"loaded-code", "IF branches extend outside their loaded region", at};
+        }
+        result_.differs_from_interpreter |= tail_sensitive && end == region.end;
+        const int join = Position(proc, scope, end);
+        const int then_scope = AddScope(proc, {ScopeKind::Then, pc + 1, target, scope, join, kNone, length != 0});
+        node.taken = Position(proc, then_scope, pc + 1);
+        if (length == 0) {
+            node.next = join;
         } else {
-        shader.AddLine("vec4 sanitize_mul(vec4 lhs, vec4 rhs) {{");
-        ++shader.scope;
-        shader.AddLine("vec4 product = lhs * rhs;");
-        shader.AddLine("return mix(product, mix(mix(vec4(0.0), product, pica_isnan(rhs)), product, "
-                       "pica_isnan(lhs)), pica_isnan(product));");
-        --shader.scope;
-        shader.AddLine("}}\n");
+            const int else_scope = AddScope(proc, {ScopeKind::Else, target, end, scope, join});
+            node.next = Position(proc, else_scope, target);
         }
-
-        // The sum of a dot product in the interpreter's order, ((0 + p.x) + p.y) + p.z (+ p.w), each addition
-        // rounded: a driver's own `dot` may add in another order or fuse the products into the sum (lavapipe
-        // does: the normalization-then-1+z case of gpu_shader_test, where one ulp of this sum is amplified by
-        // the cancellation, differed in 239 of 16,384 values), and `precise` forbids both. The products come
-        // from sanitize_mul already rounded.
-        if (!exact) {
-            // the GPU's own sums (its order, fused if it likes)
-            shader.AddLine("float pica_dp3(vec3 p) {{ return p.x + p.y + p.z; }}\n");
-            shader.AddLine("float pica_dp4(vec4 p) {{ return (p.x + p.y) + (p.z + p.w); }}\n");
-        } else {
-            shader.AddLine("float pica_dp3(vec3 p) {{");
-            ++shader.scope;
-            shader.AddLine("precise float d = 0.0 + p.x;");
-            shader.AddLine("d = d + p.y;");
-            shader.AddLine("d = d + p.z;");
-            shader.AddLine("return d;");
-            --shader.scope;
-            shader.AddLine("}}\n");
-            shader.AddLine("float pica_dp4(vec4 p) {{");
-            ++shader.scope;
-            shader.AddLine("precise float d = 0.0 + p.x;");
-            shader.AddLine("d = d + p.y;");
-            shader.AddLine("d = d + p.z;");
-            shader.AddLine("d = d + p.w;");
-            shader.AddLine("return d;");
-            --shader.scope;
-            shader.AddLine("}}\n");
+        node.condition = opcode == Opcode::IFU ? UniformCondition(instruction) : Condition(instruction);
+        return;
+    }
+    case Opcode::LOOP: {
+        const u32 end = target + 1;
+        if (target < pc + 1 || end > region.end) {
+            throw Refusal{"loaded-code", "LOOP body extends outside its loaded region", at};
         }
+        result_.differs_from_interpreter |= region.kind == ScopeKind::Loop && end == region.end;
+        const int after = Position(proc, scope, end);
+        const int step = AddNode(proc, {});
+        const int leave = AddNode(proc, {});
+        const int loop_scope = AddScope(proc, {ScopeKind::Loop, pc + 1, end, scope, step, leave});
+        const int body = Position(proc, loop_scope, pc + 1);
+        const std::string suffix = std::to_string(step);
+        const std::string counter = "pica_count_" + suffix;
+        const std::string uniform = "uniforms.i[" + std::to_string(instruction.int_uniform_id()) + "]";
+        const std::string initial = "address_registers.z = int(" + uniform + ".y);\n";
+        const std::string increment = "address_registers.z += int(" + uniform + ".z);\n";
+        proc.loops.push_back(step);
 
-        // MAX is `src1 > src2 ? src1 : src2` and MIN `src1 < src2 ? src1 : src2` (a NaN src1 gives
-        // src2, a NaN src2 gives NaN), selected on the bits so that it cannot become fmax / fmin.
-        shader.AddLine("vec4 pica_max(vec4 a, vec4 b) {{");
-        ++shader.scope;
-        shader.AddLine("return uintBitsToFloat(mix(floatBitsToUint(b), floatBitsToUint(a), greaterThan(a, b)));");
-        --shader.scope;
-        shader.AddLine("}}\n");
-        shader.AddLine("vec4 pica_min(vec4 a, vec4 b) {{");
-        ++shader.scope;
-        shader.AddLine("return uintBitsToFloat(mix(floatBitsToUint(b), floatBitsToUint(a), lessThan(a, b)));");
-        --shader.scope;
-        shader.AddLine("}}\n");
-
-        // RCP and RSQ as the interpreter computes them (1.0f / x and 1.0f / sqrtf(x), every step rounded to
-        // nearest), on any device. A device's reciprocal, square root and inverse square root are within a
-        // unit in the last place of the true value but not always the rounded one (the RX 6700 XT's differ
-        // from the CPU's in a sizeable share of the inputs, lavapipe's in about one input in ten), and one ulp
-        // is more than the comparison of the dump check allows once a program subtracts nearly equal numbers
-        // afterwards (one plus the z of a unit vector, z near -1). So the rounded value is computed in
-        // integers, and the float operations that remain only produce estimates that the integer arithmetic
-        // checks and repairs. Nothing here uses fma, and nothing depends on a float operation being
-        // correctly rounded: the result is exact whatever the estimates are, only the number of repair steps
-        // depends on how good they are. Only umulExtended, usubBorrow, shifts, comparisons and the exact
-        // conversion of integers below 2^24 are relied on (core GLSL 4.00; OpUMulExtended, OpISubBorrow).
-        //
-        // The range is every normal number whose result is normal as well, tested on the bits so that nothing
-        // depends on a float comparison: RCP for the biased exponent field 1 .. 252 (|x| from 2^-126 up to
-        // below 2^126), RSQ for a positive x with the field 1 .. 254. Outside it (zero, denormals, the two
-        // largest exponents of RCP, infinity, NaN, a negative RSQ operand) the plain device operations are
-        // used: the interpreter's results for those are the IEEE ones, which the device gives (1/0 is inf, 1/inf
-        // is 0, a negative root is NaN) or which a device may flush (denormals) in a way this code cannot
-        // repair.
-        //
-        // RCP. A positive normal s is m * 2^(e-23) with m the 24-bit integer significand, 2^23 <= m < 2^24
-        // and e the unbiased exponent. 1/s = (2^47 / m) * 2^(-24-e) and 2^23 < 2^47 / m <= 2^24, so the float
-        // nearest to 1/s is Q * 2^(-24-e) with Q the integer nearest to 2^47 / m, 2^23 <= Q <= 2^24 (Q = 2^24
-        // only for m = 2^23, and Q * 2^(-24-e) is then exact as well). Q is the nearest integer
-        // iff |2^47 / m - Q| < 1/2, that is iff 2 |d| < m with d = 2^47 - Q * m. A tie 2 |d| = m cannot
-        // happen: it would make 2^48 / m an odd integer, so m would be 2^48 divided by an odd number, and the
-        // only such m is 2^48, which is not a significand. So the nearest Q is unique and no round-to-even
-        // rule is needed. d is computed exactly: Q * m < 2^48 is the pair (ph, pl) of umulExtended and 2^47 is
-        // (0x8000, 0), so d is the pair (dh, dl) of a subtraction with borrow, in sign and magnitude (`low`:
-        // Q * m <= 2^47, d >= 0, Q is too small or exact). 2 |d| > m is decided on 64 bits: twice the
-        // magnitude has the high word (dh << 1) | (dl >> 31) and the low word dl << 1. The start is the
-        // float quotient 2^47 / m (both operands exact floats, so within a few ulp of Q on any device), then
-        // two jumps Q += round(d / m) with d converted to float (an estimate: after a jump the error of Q is
-        // below about 2^-21 of what it was, plus one half, so two jumps bring any start in [2^23, 2^24] to
-        // within 1), then three steps of Q +- 1 while 2 |d| > m (each step brings Q strictly nearer, as
-        // |d -+ m| < |d| when 2 |d| > m; one is enough after the jumps, the third is slack).
-        //
-        // RSQ is 1.0f / sqrtf(x): the square root is rounded, then the reciprocal of the rounded root is.
-        // x = m * 2^(e-23); N = m * 2^23 when e is even and m * 2^24 when e is odd is an integer in
-        // [2^46, 2^48) and x = N * 2^(e-23-s) with e-23-s even (s = 23 or 24), so sqrt(x) = sqrt(N) * 2^k,
-        // k = (e >> 1) - 23 (arithmetic shift), and sqrt(N) is in [2^23, 2^24). The float nearest to it is
-        // C * 2^k with C the integer nearest to sqrt(N), 2^23 <= C <= 2^24 - 1 (sqrt of the largest N is
-        // 2^24 - 1/2 - 2^-27 and below). C is nearest iff (2C-1)^2 < 4N < (2C+1)^2, both strict: the squares
-        // are odd and 4N is even, so sqrt(N) is never exactly C +- 1/2 and there is no tie. With R = N - C^2
-        // the right inequality is 4R < 4C + 1, i.e. R <= C, and the left one is 4R > 1 - 4C, i.e. R > -C. So
-        // C is the rounded root iff -C < R <= C, and when R > C the next integer is nearer, when R <= -C the
-        // previous one. R is computed exactly as the pair of a subtraction with borrow of N (nh, nl) and
-        // C^2 (umulExtended), in sign and magnitude. The start is the device's sqrt of the exact float
-        // m * 2^23 or m * 2^24, then three Newton steps C += round(R / (2C)) (an estimate: the error of C
-        // goes from D to about D^2 / 2^24 plus one half, so a start within 2^-4 of the root, or 2^20 units,
-        // arrives within 1; real devices are within a few units), then three steps of C +- 1 on the exact
-        // test. The reciprocal of the root is the RCP above with the root's own significand C and exponent
-        // e >> 1 (the root is C * 2^(k) = C * 2^((e >> 1) - 23)).
-        //
-        // The result is assembled in integers: Q * 2^(-24-e) has the biased exponent 126 - e and the
-        // fraction Q - 2^23, and for Q = 2^24 the addition carries into the exponent (127 - e, fraction 0).
-        if (!exact) {
-            // the GPU's reciprocal and inverse square root
-            shader.AddLine("float pica_rcp(float x) {{ return 1.0 / x; }}\n");
-            shader.AddLine("float pica_rsq(float x) {{ return inversesqrt(x); }}\n");
-        } else {
-            shader.AddLine("void pica_rcp_residual(uint q, uint m, out bool low, out uint dh, out uint dl) {{");
-            ++shader.scope;
-            shader.AddLine("uint ph;");
-            shader.AddLine("uint pl;");
-            shader.AddLine("umulExtended(q, m, ph, pl);");
-            shader.AddLine("low = ph < 0x8000u || (ph == 0x8000u && pl == 0u);");
-            shader.AddLine("if (low) {{");
-            ++shader.scope;
-            shader.AddLine("uint borrow;");
-            shader.AddLine("dl = usubBorrow(0u, pl, borrow);");
-            shader.AddLine("dh = 0x8000u - ph - borrow;");
-            --shader.scope;
-            shader.AddLine("}} else {{");
-            ++shader.scope;
-            shader.AddLine("dl = pl;");
-            shader.AddLine("dh = ph - 0x8000u;");
-            --shader.scope;
-            shader.AddLine("}}");
-            --shader.scope;
-            shader.AddLine("}}\n");
-            shader.AddLine("float pica_magnitude(uint dh, uint dl) {{ return float(dh) * 4294967296.0 + float(dl); }}\n");
-            shader.AddLine("uint pica_rcp_significand(uint m) {{");
-            ++shader.scope;
-            shader.AddLine("float mf = float(m);");
-            shader.AddLine("uint q = clamp(uint(floor(140737488355328.0 / mf + 0.5)), 0x800000u, 0x1000000u);");
-            shader.AddLine("for (int i = 0; i < 2; ++i) {{");
-            ++shader.scope;
-            shader.AddLine("bool low;");
-            shader.AddLine("uint dh;");
-            shader.AddLine("uint dl;");
-            shader.AddLine("pica_rcp_residual(q, m, low, dh, dl);");
-            shader.AddLine("uint jump = uint(floor(pica_magnitude(dh, dl) / mf + 0.5));");
-            shader.AddLine("q = clamp(low ? q + jump : q - min(jump, q), 0x800000u, 0x1000000u);");
-            --shader.scope;
-            shader.AddLine("}}");
-            shader.AddLine("for (int i = 0; i < 3; ++i) {{");
-            ++shader.scope;
-            shader.AddLine("bool low;");
-            shader.AddLine("uint dh;");
-            shader.AddLine("uint dl;");
-            shader.AddLine("pica_rcp_residual(q, m, low, dh, dl);");
-            shader.AddLine("uint twice_high = (dh << 1) | (dl >> 31);");
-            shader.AddLine("uint twice_low = dl << 1;");
-            shader.AddLine("if (twice_high != 0u || twice_low > m) {{ q = low ? q + 1u : q - 1u; }}");
-            --shader.scope;
-            shader.AddLine("}}");
-            shader.AddLine("return q;");
-            --shader.scope;
-            shader.AddLine("}}\n");
-            shader.AddLine("float pica_rcp_normal(uint m, int e) {{");
-            ++shader.scope;
-            shader.AddLine("return uintBitsToFloat((uint(126 - e) << 23) + (pica_rcp_significand(m) - 0x800000u));");
-            --shader.scope;
-            shader.AddLine("}}\n");
-            shader.AddLine("void pica_sqrt_residual(uint c, uint nh, uint nl, out bool pos, out uint dh, out uint dl) {{");
-            ++shader.scope;
-            shader.AddLine("uint ph;");
-            shader.AddLine("uint pl;");
-            shader.AddLine("umulExtended(c, c, ph, pl);");
-            shader.AddLine("pos = nh > ph || (nh == ph && nl >= pl);");
-            shader.AddLine("uint borrow;");
-            shader.AddLine("if (pos) {{");
-            ++shader.scope;
-            shader.AddLine("dl = usubBorrow(nl, pl, borrow);");
-            shader.AddLine("dh = nh - ph - borrow;");
-            --shader.scope;
-            shader.AddLine("}} else {{");
-            ++shader.scope;
-            shader.AddLine("dl = usubBorrow(pl, nl, borrow);");
-            shader.AddLine("dh = ph - nh - borrow;");
-            --shader.scope;
-            shader.AddLine("}}");
-            --shader.scope;
-            shader.AddLine("}}\n");
-            shader.AddLine("uint pica_sqrt_significand(uint m, bool odd) {{");
-            ++shader.scope;
-            shader.AddLine("uint nh = odd ? (m >> 8) : (m >> 9);");
-            shader.AddLine("uint nl = odd ? (m << 24) : (m << 23);");
-            shader.AddLine("float nf = float(m) * (odd ? 16777216.0 : 8388608.0);");
-            shader.AddLine("uint c = clamp(uint(sqrt(nf)), 0x800000u, 0xFFFFFFu);");
-            shader.AddLine("for (int i = 0; i < 3; ++i) {{");
-            ++shader.scope;
-            shader.AddLine("bool pos;");
-            shader.AddLine("uint dh;");
-            shader.AddLine("uint dl;");
-            shader.AddLine("pica_sqrt_residual(c, nh, nl, pos, dh, dl);");
-            shader.AddLine("uint jump = uint(floor(pica_magnitude(dh, dl) / (2.0 * float(c)) + 0.5));");
-            shader.AddLine("c = clamp(pos ? c + jump : c - min(jump, c), 0x800000u, 0xFFFFFFu);");
-            --shader.scope;
-            shader.AddLine("}}");
-            shader.AddLine("for (int i = 0; i < 3; ++i) {{");
-            ++shader.scope;
-            shader.AddLine("bool pos;");
-            shader.AddLine("uint dh;");
-            shader.AddLine("uint dl;");
-            shader.AddLine("pica_sqrt_residual(c, nh, nl, pos, dh, dl);");
-            shader.AddLine("if (pos) {{");
-            ++shader.scope;
-            shader.AddLine("if (dh != 0u || dl > c) {{ c += 1u; }}");
-            --shader.scope;
-            shader.AddLine("}} else if (dh != 0u || dl >= c) {{");
-            ++shader.scope;
-            shader.AddLine("c -= 1u;");
-            --shader.scope;
-            shader.AddLine("}}");
-            --shader.scope;
-            shader.AddLine("}}");
-            shader.AddLine("return c;");
-            --shader.scope;
-            shader.AddLine("}}\n");
-            shader.AddLine("float pica_rcp(float x) {{");
-            ++shader.scope;
-            shader.AddLine("uint bits = floatBitsToUint(x) & 0x7FFFFFFFu;");
-            shader.AddLine("if (bits >= 0x00800000u && bits < 0x7E800000u) {{");
-            ++shader.scope;
-            shader.AddLine("float q = pica_rcp_normal((bits & 0x7FFFFFu) | 0x800000u, int(bits >> 23) - 127);");
-            shader.AddLine("return x < 0.0 ? -q : q;");
-            --shader.scope;
-            shader.AddLine("}}");
-            shader.AddLine("return 1.0 / x;");
-            --shader.scope;
-            shader.AddLine("}}\n");
-            shader.AddLine("float pica_rsq(float x) {{");
-            ++shader.scope;
-            shader.AddLine("uint bits = floatBitsToUint(x);");
-            shader.AddLine("if (bits >= 0x00800000u && bits < 0x7F800000u) {{");
-            ++shader.scope;
-            shader.AddLine("int e = int(bits >> 23) - 127;");
-            shader.AddLine("uint root = pica_sqrt_significand((bits & 0x7FFFFFu) | 0x800000u, (e & 1) != 0);");
-            shader.AddLine("return pica_rcp_normal(root, e >> 1);");
-            --shader.scope;
-            shader.AddLine("}}");
-            shader.AddLine("return 1.0 / sqrt(x);");
-            --shader.scope;
-            shader.AddLine("}}\n");
+        node.code += counter + " = " + uniform + ".x + 1u;\n" + initial + "++loop_depth;\n";
+        node.next = body;
+        proc.nodes[step].code = increment;
+        proc.nodes[step].condition = "--" + counter + " != 0u";
+        proc.nodes[step].taken = body;
+        proc.nodes[leave].code = "if (--loop_depth > 0) " + initial;
+        // Both exits use the same restore. BREAK still advances aL once.
+        proc.nodes[step].next = leave;
+        proc.nodes[leave].next = after;
+        Node break_node;
+        break_node.code = increment;
+        break_node.next = leave;
+        proc.scopes[loop_scope].break_target = AddNode(proc, std::move(break_node));
+        return;
+    }
+    case Opcode::CALL:
+    case Opcode::CALLC:
+    case Opcode::CALLU: {
+        if (target >= input_.program.size() || target + length > input_.program.size()) {
+            throw Refusal{"loaded-code", "CALL target extends outside the loaded program", at};
         }
-
-        // LIT as vs_3_0 (and ARB_vertex_program) define it; not verified on hardware.
-        shader.AddLine("vec4 pica_lit(vec4 s) {{");
-        ++shader.scope;
-        shader.AddLine("float power = clamp(s.w, -127.9961, 127.9961);");
-        shader.AddLine("float spec = (s.x > 0.0 && s.y > 0.0) ? pow(s.y, power) : 0.0;");
-        shader.AddLine("return vec4(1.0, max(s.x, 0.0), spec, 1.0);");
-        --shader.scope;
-        shader.AddLine("}}\n");
-
-        shader.AddLine("vec4 get_offset_register(int base_index, int offset) {{");
-        ++shader.scope;
-        shader.AddLine("int fixed_offset = offset >= -128 && offset <= 127 ? offset : 0;");
-        shader.AddLine("uint index = uint((base_index + fixed_offset) & 0x7F);");
-        shader.AddLine("return index < 96u ? uniforms.f[index] : vec4(1.0);");
-        --shader.scope;
-        shader.AddLine("}}\n");
-
-        // Add declarations for registers
-        shader.AddLine("bvec2 conditional_code = bvec2(false);");
-        shader.AddLine("ivec3 address_registers = ivec3(0);");
-        shader.AddLine("int loop_depth = 0;");
-        shader.AddLine("bool loop_break = false;");
-        for (int i = 0; i < 16; ++i) {
-            shader.AddLine("vec4 reg_tmp{} = vec4(0.0, 0.0, 0.0, 1.0);", i);
+        if (length == 0) {
+            break;
         }
-        shader.AddNewLine();
-
-        // Add declarations for all subroutines
-        for (const auto& subroutine : subroutines) {
-            shader.AddLine("bool {}();", subroutine.GetName());
+        result_.differs_from_interpreter |= (tail_sensitive || region.kind == ScopeKind::Then) && pc + 1 == region.end;
+        node.callee = AddProcedure(target, target + length);
+        proc.callees.push_back(node.callee);
+        node.taken = FindLoop(proc, scope);
+        if (opcode == Opcode::CALLC) node.condition = Condition(instruction);
+        if (opcode == Opcode::CALLU) node.condition = UniformCondition(instruction);
+        // The call's break edge exists only when a loop is active in this function.
+        break;
+    }
+    case Opcode::JMPC:
+    case Opcode::JMPU:
+        if (target >= input_.program.size()) {
+            throw Refusal{"loaded-code", "Jump target is outside the loaded program", at};
         }
-        shader.AddNewLine();
-
-        // Add the main entry point
-        current_sub = "exec_shader";
-        shader.AddLine("bool exec_shader() {{");
-        ++shader.scope;
-        CallSubroutine(GetSubroutine(main_offset, PROGRAM_END));
-        --shader.scope;
-        shader.AddLine("}}\n");
-
-        // Add definitions for all subroutines
-        for (const auto& subroutine : subroutines) {
-            std::set<u32> labels = subroutine.labels;
-            current_sub = subroutine.GetName();
-
-            shader.AddLine("bool {}() {{", subroutine.GetName());
-            ++shader.scope;
-
-            if (labels.empty()) {
-                if (CompileRange(subroutine.begin, subroutine.end) != PROGRAM_END) {
-                    shader.AddLine("return false;");
-                }
-            } else {
-                labels.insert(subroutine.begin);
-                shader.AddLine("uint jmp_to = {}u;", subroutine.begin);
-                shader.AddLine("for (uint jmp_guard = 0u; jmp_guard < {}u; ++jmp_guard) {{",
-                               kMaxJumpIterations);
-                ++shader.scope;
-
-                shader.AddLine("switch (jmp_to) {{");
-
-                for (auto label : labels) {
-                    shader.AddLine("case {}u: {{", label);
-                    ++shader.scope;
-
-                    auto next_it = labels.lower_bound(label + 1);
-                    u32 next_label = next_it == labels.end() ? subroutine.end : *next_it;
-
-                    u32 compile_end = CompileRange(label, next_label);
-                    if (compile_end > next_label && compile_end != PROGRAM_END) {
-                        // This happens only when there is a label inside a IF/LOOP block
-                        shader.AddLine("{{ jmp_to = {}u; break; }}", compile_end);
-                        labels.emplace(compile_end);
-                    }
-
-                    --shader.scope;
-                    shader.AddLine("}}");
-                }
-
-                shader.AddLine("default: return false;");
-                shader.AddLine("}}");
-
-                --shader.scope;
-                shader.AddLine("}}");
-
-                shader.AddLine("return false;");
-            }
-
-            --shader.scope;
-            shader.AddLine("}}\n");
+        node.taken = ScopeExit(proc, scope, target);
+        if (node.taken == kNone) {
+            throw Refusal{"jump-scope", "Jump target is outside the current procedure or loop", at};
         }
+        result_.differs_from_interpreter |= (tail_sensitive || region.kind == ScopeKind::Then) && pc + 1 == region.end;
+        node.backwards = target <= pc;
+        proc.guarded |= node.backwards;
+        node.condition = opcode == Opcode::JMPC ? Condition(instruction) : UniformCondition(instruction, length & 1u);
+        break;
+    default:
+        if (instruction.info().format == isa::Format::Unknown) {
+            throw Refusal{"unhandled-instruction", "Unhandled instruction", at};
+        }
+        Arithmetic(node, instruction);
+        break;
+    }
+    node.next = next();
+}
 
-        CheckNoRecursion();
-        if (backward_jump_offset) {
-            result.notes.push_back(fmt::format(
-                "the jump at word {} goes backwards: the translated shader dispatches the labels of a "
-                "subroutine at most {} times",
-                *backward_jump_offset, kMaxJumpIterations));
-        }
-        for (const auto& [end, loops] : scope_ends.loops_by_end) {
-            // two loops that end on the same instruction: the interpreter repeats or pops one loop per instruction
-            differs_from_interpreter = differs_from_interpreter || loops.size() > 1;
-        }
-        if (differs_from_interpreter) {
-            result.differs_from_interpreter = true;
-            result.notes.push_back(
-                "a loop or call body ends with an if (with or without else), an if is the last statement of an "
-                "outer then-branch, two loops end together, or a call or jump is the last instruction of a "
-                "scope: the interpreter and the structured readings (this translation, Azahar's decompiler and "
-                "JIT) may disagree on this shape (a hint; see the header comment of glsl_decompiler.cpp)");
-        }
-        if (has_emit) {
-            result.notes.push_back(
-                "EMIT / SETEMIT are ignored (the program is translated as a vertex program, as Azahar's "
-                "decompiler does)");
+void Translator::CheckCallGraph() const {
+    std::vector<u32> incoming(procedures_.size());
+    for (const auto& proc : procedures_) {
+        for (const int callee : proc.callees) {
+            ++incoming[callee];
         }
     }
+    std::deque<int> ready;
+    for (size_t id = 0; id < incoming.size(); ++id) {
+        if (incoming[id] == 0) ready.push_back(static_cast<int>(id));
+    }
+    while (!ready.empty()) {
+        const int id = ready.front();
+        ready.pop_front();
+        for (const int callee : procedures_[id].callees) {
+            if (--incoming[callee] == 0) ready.push_back(callee);
+        }
+    }
+    const auto cycle = std::find_if(incoming.begin(), incoming.end(), [](u32 count) { return count != 0; });
+    if (cycle != incoming.end()) {
+        throw Refusal{"recursive-call", "Recursive vertex shader call", static_cast<int>(procedures_[cycle - incoming.begin()].begin)};
+    }
+}
 
-private:
-    const std::set<Subroutine>& subroutines;
-    const ScopeEnds& scope_ends;
-    const Program& program;
-    const u32 main_offset;
-    const RegGetter& inputreg_getter;
-    const RegGetter& outputreg_getter;
-    DecompileResult& result;
-    const bool exact = true;  // DecompileInput::exact_arithmetic
-    u32 compiled_instructions = 0;
-    std::string current_sub;
-    std::map<std::string, std::set<std::string>> calls;
-    std::optional<u32> backward_jump_offset;
-    bool has_emit = false;
-    bool differs_from_interpreter = false;
+void Translator::EmitNode(std::string& glsl, const Node& node, bool dispatch) const {
+    glsl += node.code;
+    if (node.callee != kNone) {
+        const bool conditional = !node.condition.empty();
+        glsl += conditional ? "if (" + node.condition + ") {\n" : "{\n";
+        glsl += "int outcome = " + ProcedureName(node.callee) + "();\n";
+        if (node.taken != kNone) {
+            glsl += "if (outcome == 2) { pc = " + std::to_string(node.taken) + "; break; }\n";
+        }
+        glsl += "if (outcome != 0) return outcome;\n}\n";
+    } else if (!node.condition.empty()) {
+        glsl += "if (" + node.condition + ") {\n";
+        if (node.backwards) {
+            glsl += "if (!(jmp_guard < " + std::to_string(kMaxJumpIterations) + "u)) return 1;\n++jmp_guard;\n";
+        }
+        glsl += "pc = " + std::to_string(node.taken) + "; break;\n}\n";
+    }
+    if (node.result != kNone) {
+        glsl += "return " + std::to_string(node.result) + ";\n";
+    } else if (dispatch) {
+        glsl += "pc = " + std::to_string(node.next) + "; break;\n";
+    }
+}
 
-    ShaderWriter shader;
-};
+void Translator::EmitProcedure(std::string& glsl, const Procedure& proc, int id) const {
+    std::vector<u32> incoming(proc.nodes.size());
+    std::vector<bool> is_head(proc.nodes.size());
+    bool dispatch = false;
+    is_head[proc.entry] = true;
+    for (const Node& node : proc.nodes) {
+        if (!node.reachable) continue;
+        if (node.next != kNone) ++incoming[node.next];
+        if (node.taken != kNone) {
+            dispatch = true;
+            ++incoming[node.taken];
+            is_head[node.taken] = true;
+        }
+    }
+    for (size_t n = 0; n < proc.nodes.size(); ++n) {
+        is_head[n] = is_head[n] || incoming[n] > 1;
+    }
+    dispatch |= std::count(is_head.begin(), is_head.end(), true) > 1;
+
+    glsl += "int " + ProcedureName(id) + "() {\n";
+    for (const int loop : proc.loops) {
+        const std::string n = std::to_string(loop);
+        glsl += "uint pica_count_" + n + " = 0u;\n";
+    }
+    if (dispatch) {
+        glsl += "int pc = " + std::to_string(proc.entry) + ";\n";
+        if (proc.guarded) glsl += "uint jmp_guard = 0u;\n";
+        glsl += "for (;;) {\nswitch (pc) {\n";
+    }
+    for (size_t head = 0; head < proc.nodes.size(); ++head) {
+        if (!is_head[head]) continue;
+        if (dispatch) glsl += "case " + std::to_string(head) + ": {\n";
+        for (int current = static_cast<int>(head); current != kNone;) {
+            const Node& node = proc.nodes[current];
+            const bool ends_block = node.next == kNone || is_head[node.next];
+            EmitNode(glsl, node, dispatch && ends_block);
+            current = ends_block ? kNone : node.next;
+        }
+        if (dispatch) glsl += "}\n";
+    }
+    if (dispatch) glsl += "default: return 1;\n}\n}\n";
+    glsl += "}\n";
+}
+
+DecompileResult Translator::Run() {
+    try {
+        if (input_.program.size() > kMaxProgramWords || input_.swizzle.size() > kMaxSwizzleWords) {
+            throw Refusal{"program-size", "Loaded shader data exceeds PICA memory", -1};
+        }
+        if (input_.main_offset >= input_.program.size()) {
+            throw Refusal{"entry-point", "Vertex shader entry point is outside the loaded program", -1};
+        }
+        AddProcedure(input_.main_offset, static_cast<u32>(input_.program.size()));
+        for (size_t id = 0; id < procedures_.size(); ++id) {
+            auto& proc = procedures_[id];
+            int return_node = kNone;
+            if (id != 0) {
+                Node end;
+                end.result = 0;
+                return_node = AddNode(proc, std::move(end));
+            }
+            const ScopeKind kind = id == 0 ? ScopeKind::Main : ScopeKind::Subroutine;
+            const int scope = AddScope(proc, {kind, id == 0 ? 0u : proc.begin, proc.end, kNone, return_node});
+            proc.entry = Position(proc, scope, proc.begin);
+            std::deque<int> pending{proc.entry};
+            while (!pending.empty()) {
+                const int current = pending.front();
+                pending.pop_front();
+                if (proc.nodes[current].reachable) continue;
+                Node node = std::move(proc.nodes[current]);
+                if (node.scope != kNone) Decode(proc, node);
+                if (node.next != kNone) pending.push_back(node.next);
+                if (node.taken != kNone) pending.push_back(node.taken);
+                node.reachable = true;
+                proc.nodes[current] = std::move(node);
+            }
+        }
+        CheckCallGraph();
+
+        std::string& glsl = result_.source;
+        glsl += kPrelude;
+        if (uses_scalar_rounding_) glsl += kExactScalars;
+        // The vertex and quaternion wrappers also reset these globals.
+        glsl += "ivec3 address_registers;\nbvec2 conditional_code;\nint loop_depth;\nbool loop_break;\n";
+        std::string reset;
+        for (int reg = 0; reg < 16; ++reg) {
+            const std::string name = "reg_tmp" + std::to_string(reg);
+            glsl += "vec4 " + name + ";\n";
+            reset += name + " = vec4(0.0, 0.0, 0.0, 1.0);\n";
+        }
+        for (size_t id = 0; id < procedures_.size(); ++id) {
+            glsl += "int " + ProcedureName(static_cast<int>(id)) + "();\n";
+        }
+        for (size_t id = 0; id < procedures_.size(); ++id) {
+            EmitProcedure(glsl, procedures_[id], static_cast<int>(id));
+        }
+        glsl += "bool exec_shader() {\n" + reset +
+                "address_registers = ivec3(0);\nconditional_code = bvec2(false);\nloop_depth = 0;\n"
+                "return pica_body_0() == 1;\n}\n";
+        if (std::any_of(procedures_.begin(), procedures_.end(), [](const auto& proc) { return proc.guarded; })) {
+            result_.notes.emplace_back("A backwards jump is bounded to 65536 taken branches per procedure invocation");
+        }
+        if (ignored_geometry_) {
+            result_.notes.emplace_back("EMIT and SETEMIT have no effect in the vertex stage");
+        }
+        result_.ok = true;
+    } catch (const Refusal& error) {
+        result_.error = error.message;
+        result_.error_category = error.category;
+        result_.error_word = error.word;
+    }
+    return std::move(result_);
+}
 
 } // namespace
 
 DecompileResult DecompileProgram(const DecompileInput& input, const RegGetter& input_reg,
                                  const RegGetter& output_reg) {
-    DecompileResult result;
-    try {
-        if (input.main_offset >= kMaxProgramWords) {
-            throw DecompileFail("The entry point is outside the program memory", "entry-point");
-        }
-        const Program program(input);
-        ControlFlowAnalyzer analyzer(program, input.main_offset);
-        const ScopeEnds scope_ends = analyzer.Scopes();
-        auto subroutines = analyzer.MoveSubroutines();
-        GLSLGenerator generator(subroutines, scope_ends, program, input.main_offset, input_reg, output_reg, result,
-                                input.exact_arithmetic);
-        result.source = generator.MoveShaderCode();
-        result.ok = true;
-    } catch (const DecompileFail& exception) {
-        result.ok = false;
-        result.source.clear();
-        result.error = exception.what();
-        result.error_category = exception.category;
-        result.error_word = exception.word;
-    }
-    return result;
+    return Translator(input, input_reg, output_reg).Run();
 }
 
 } // namespace mh4n::gpu::shader

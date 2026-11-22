@@ -1,128 +1,117 @@
-#include "gpu/cpuvertex/native_programs.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: cpuvertex and RHI contract headers, gpu_cpuvertex and gpu_cpuvertex_batch unit tests.
+
+#include "native_programs.h"
 
 #include <algorithm>
-#include <array>
 #include <cstdlib>
-#include <cstring>
+#include <string_view>
+#include <utility>
 
 namespace mh4n::gpu::cpuvertex {
-
 namespace {
 
-bool ByWords() {
-    static const bool on = [] {
-        const char* v = std::getenv("MH4N_PROGRAMS_BY_WORDS");
-        return v == nullptr || *v != '0';
-    }();
-    return on;
+bool CacheByWords() {
+    const char* value = std::getenv("MH4N_PROGRAMS_BY_WORDS");
+    return !value || std::string_view(value) != "0";
 }
 
-}  // namespace
+} // namespace
 
 void NativePrograms::SetTable(const PicaNativeEntry* entries, u32 count) {
-    entries_.assign(entries, entries + (entries != nullptr ? count : 0));
+    entries_.clear();
     known_.clear();
     groups_.clear();
     seen_.clear();
     seen_next_ = 0;
-    for (const PicaNativeEntry& e : entries_) {
-        if (e.code_words > pica::kMaxProgramWords || e.desc_count > pica::kMaxSwizzleWords) {
-            continue;  // (never matches: Hashed leaves it out)
+    if (!entries) {
+        return;
+    }
+
+    for (u32 i = 0; i < count; ++i) {
+        const auto& entry = entries[i];
+        if (!entry.function || entry.code_words > pica::kMaxProgramWords ||
+            entry.desc_count > pica::kMaxSwizzleWords) {
+            continue;
         }
-        const bool geometry = e.geometry != 0;
-        auto g = std::find_if(groups_.begin(), groups_.end(),
-                              [&](const Group& x) { return x.entry_point == e.entry_point && x.geometry == geometry; });
-        if (g == groups_.end()) {
-            groups_.push_back(Group{e.entry_point, geometry, 0, 0});
-            g = groups_.end() - 1;
+        entries_.push_back(entry);
+        const bool geometry = entry.geometry != 0;
+        auto group = std::find_if(groups_.begin(), groups_.end(), [&](const Group& g) {
+            return g.entry_point == entry.entry_point && g.geometry == geometry;
+        });
+        if (group == groups_.end()) {
+            groups_.push_back({entry.entry_point, geometry, entry.code_words, entry.desc_count});
+        } else {
+            group->code_words = std::max(group->code_words, entry.code_words);
+            group->desc_count = std::max(group->desc_count, entry.desc_count);
         }
-        g->code_words = std::max(g->code_words, e.code_words);
-        g->desc_count = std::max(g->desc_count, e.desc_count);
     }
 }
 
-PicaNativeFunction NativePrograms::Hashed(const pica::ShaderSetup& unit, u32 entry_point, bool geometry) const {
-    // (the hash of the first n words, once per n: the entries share a few lengths, and each hash reads the words)
-    struct Hash {
-        u32 n;
-        u64 hash;
-    };
-    std::array<Hash, 8> code_hashes, desc_hashes;
-    size_t code_n = 0, desc_n = 0;
-    const auto hash_of = [](const u32* words, u32 n, std::array<Hash, 8>& memo, size_t& used) {
-        for (size_t i = 0; i < used; ++i) {
-            if (memo[i].n == n) return memo[i].hash;
-        }
-        const u64 h = pica_native_hash(words, n);
-        memo[used < memo.size() ? used++ : memo.size() - 1] = Hash{n, h};
-        return h;
-    };
-    for (const PicaNativeEntry& e : entries_) {
-        if (e.entry_point != entry_point || (e.geometry != 0) != geometry || e.code_words > unit.program_code.size() ||
-            e.desc_count > unit.swizzle_data.size()) {
-            continue;
-        }
-        if (hash_of(unit.program_code.data(), e.code_words, code_hashes, code_n) == e.code_hash &&
-            hash_of(unit.swizzle_data.data(), e.desc_count, desc_hashes, desc_n) == e.desc_hash) {
-            return e.function;
+PicaNativeFunction NativePrograms::Hashed(const pica::ShaderSetup& unit, u32 entry_point,
+                                          bool geometry) const {
+    for (const auto& entry : entries_) {
+        if (entry.entry_point == entry_point && (entry.geometry != 0) == geometry &&
+            entry.code_hash == pica_native_hash(unit.program_code.data(), entry.code_words) &&
+            entry.desc_hash == pica_native_hash(unit.swizzle_data.data(), entry.desc_count)) {
+            return entry.function;
         }
     }
     return nullptr;
 }
 
 PicaNativeFunction NativePrograms::Find(const pica::ShaderSetup& unit, u32 entry_point, bool geometry) {
-    if (entries_.empty() || unit.program_serial == 0 || unit.swizzle_serial == 0) {
+    if (Empty() || !unit.program_serial || !unit.swizzle_serial) {
         return nullptr;
     }
-    for (const Known& k : known_) {
-        if (k.program_serial == unit.program_serial && k.swizzle_serial == unit.swizzle_serial &&
-            k.entry_point == entry_point && k.geometry == geometry) {
-            return k.function;
-        }
+    const auto known = std::find_if(known_.begin(), known_.end(), [&](const Known& k) {
+        return k.program_serial == unit.program_serial && k.swizzle_serial == unit.swizzle_serial &&
+               k.entry_point == entry_point && k.geometry == geometry;
+    });
+    if (known != known_.end()) {
+        return known->function;
     }
-    PicaNativeFunction found = nullptr;
-    const auto group = std::find_if(groups_.begin(), groups_.end(),
-                                    [&](const Group& g) { return g.entry_point == entry_point && g.geometry == geometry; });
+
+    PicaNativeFunction function = nullptr;
+    static const bool by_words = CacheByWords();
+    const auto group = std::find_if(groups_.begin(), groups_.end(), [&](const Group& g) {
+        return g.entry_point == entry_point && g.geometry == geometry;
+    });
     if (group != groups_.end()) {
-        // the words seen before at this entry point (the game's few programs in turn), else the hashes
-        const Seen* seen = nullptr;
-        if (ByWords()) {
-            for (const Seen& s : seen_) {
-                if (s.entry_point == entry_point && s.geometry == geometry &&
-                    std::memcmp(s.code.data(), unit.program_code.data(), s.code.size() * sizeof(u32)) == 0 &&
-                    std::memcmp(s.desc.data(), unit.swizzle_data.data(), s.desc.size() * sizeof(u32)) == 0) {
-                    seen = &s;
-                    break;
-                }
-            }
-        }
-        if (seen != nullptr) {
-            found = seen->function;
-        } else {
-            found = Hashed(unit, entry_point, geometry);
-            if (ByWords()) {
-                constexpr size_t kSeen = 64;
-                Seen s;
-                s.entry_point = entry_point;
-                s.geometry = geometry;
-                s.code.assign(unit.program_code.begin(), unit.program_code.begin() + group->code_words);
-                s.desc.assign(unit.swizzle_data.begin(), unit.swizzle_data.begin() + group->desc_count);
-                s.function = found;
-                if (seen_.size() < kSeen) {
-                    seen_.push_back(std::move(s));
+        if (by_words) {
+            const auto seen = std::find_if(seen_.begin(), seen_.end(), [&](const Seen& s) {
+                return s.entry_point == entry_point && s.geometry == geometry &&
+                       std::equal(s.code.begin(), s.code.end(), unit.program_code.begin()) &&
+                       std::equal(s.desc.begin(), s.desc.end(), unit.swizzle_data.begin());
+            });
+            if (seen != seen_.end()) {
+                function = seen->function;
+            } else {
+                function = Hashed(unit, entry_point, geometry);
+                Seen match{entry_point, geometry,
+                           {unit.program_code.begin(), unit.program_code.begin() + group->code_words},
+                           {unit.swizzle_data.begin(), unit.swizzle_data.begin() + group->desc_count},
+                           function};
+                constexpr size_t kWordCacheSize = 64;
+                if (seen_.size() < kWordCacheSize) {
+                    seen_.push_back(std::move(match));
                 } else {
-                    seen_[seen_next_] = std::move(s);
-                    seen_next_ = (seen_next_ + 1) % kSeen;
+                    seen_[seen_next_] = std::move(match);
+                    seen_next_ = (seen_next_ + 1) % kWordCacheSize;
                 }
             }
+        } else {
+            function = Hashed(unit, entry_point, geometry);
         }
     }
-    constexpr size_t kKnown = 32;
-    if (known_.size() >= kKnown) {
-        known_.erase(known_.begin());
+
+    constexpr size_t kSerialCacheSize = 64;
+    if (known_.size() == kSerialCacheSize) {
+        known_.clear();
     }
-    known_.push_back(Known{unit.program_serial, unit.swizzle_serial, entry_point, geometry, found});
-    return found;
+    known_.push_back({unit.program_serial, unit.swizzle_serial, entry_point, geometry, function});
+    return function;
 }
 
-}  // namespace mh4n::gpu::cpuvertex
+} // namespace mh4n::gpu::cpuvertex

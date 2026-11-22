@@ -37,6 +37,7 @@
 //  - All sessions share one DSP, as Azahar's single DSP_DSP object does, and so do their events.
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -243,6 +244,24 @@ void DspShared::ScheduleNext() {
 void DspShared::OnTick() {
     timer_id_ = 0;
     ++frames_run_;
+    {   // MODIFIED (diagnostic): the frames a second the DSP really runs, and how late the latest was
+        static auto since = std::chrono::steady_clock::now();
+        static u64 count = 0;
+        static double worst_late_ms = 0;
+        ++count;
+        const u64 now_ticks = context_->GetKernel().NowTicks();
+        if (now_ticks > deadline_) worst_late_ms = std::max(worst_late_ms, static_cast<double>(now_ticks - deadline_) / 268111.856);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+        if (secs >= 10.0) {
+            const double pct = count * 160.0 / 32728.0 / secs * 100.0;
+            {
+                MH4N_LOG(Info, kLog, "DSP clock: {} frames in {:.1f} s = {:.1f} % of real time, the latest tick was up to {:.1f} ms late", count, secs, pct, worst_late_ms);
+            }
+            since = std::chrono::steady_clock::now();
+            count = 0;
+            worst_late_ms = 0;
+        }
+    }
     if (frame_observer) {
         frame_observer(deadline_, context_->GetKernel().NowTicks());
     }

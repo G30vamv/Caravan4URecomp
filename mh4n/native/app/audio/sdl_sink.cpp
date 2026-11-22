@@ -68,10 +68,13 @@ bool SDLCALL OnSdlEvent(void* /*userdata*/, SDL_Event* event) {
 // callback (docs/native/audio-out.md). The last row is written when the log stops.
 class AudioLog {
 public:
-    AudioLog(const std::string& path, Feeder& feeder) : file_(path, std::ios::out | std::ios::trunc), feeder_(feeder) {}
+    // MODIFIED: an empty path = "monitor" mode: no file; a log line whenever the underrun / overflow / drop counters grow.
+    AudioLog(const std::string& path, Feeder& feeder) : monitor_(path.empty()), feeder_(feeder) {
+        if (!monitor_) file_.open(path, std::ios::out | std::ios::trunc);
+    }
     ~AudioLog() { Stop(); }
 
-    bool ok() const { return file_.is_open() && file_.good(); }
+    bool ok() const { return monitor_ || (file_.is_open() && file_.good()); }
 
     void Start(int device_rate) {
         const std::time_t now = std::time(nullptr);
@@ -79,9 +82,11 @@ public:
         if (const std::tm* utc = std::gmtime(&now)) {
             std::strftime(date, sizeof(date), "%Y-%m-%d", utc);
         }
-        file_ << "# audiolog v1 " << date << " device_rate=" << device_rate << "\n"
-              << "t_ms,frame,fill_frames,ratio,underruns,overflows,dropped\n";
-        file_.flush();
+        if (!monitor_) {
+            file_ << "# audiolog v1 " << date << " device_rate=" << device_rate << "\n"
+                  << "t_ms,frame,fill_frames,ratio,underruns,overflows,dropped\n";
+            file_.flush();
+        }
         start_ = std::chrono::steady_clock::now();
         thread_ = std::thread([this] {
             mh4n::SetHostThreadName("mh4n-audio");
@@ -117,12 +122,30 @@ private:
         audio_out::StreamStats stats = feeder_.Stream().Stats();
         const auto t_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_).count();
+        if (monitor_) {
+            const u64 gap_us = feeder_.Stream().TakeMaxGapUs();
+            const u64 req = feeder_.TakeMaxRequest(), req_gap_us = feeder_.TakeMaxRequestGapUs();
+            if (gap_us > 25000 && stats.underruns == last_.underruns) {
+                MH4N_LOG(Info, kLog, "audio ring at {:.1f} s: the DSP went {:.1f} ms between two frames", t_ms / 1000.0, gap_us / 1000.0);
+            }
+            if (stats.underruns != last_.underruns || stats.overflows != last_.overflows || stats.dropped != last_.dropped) {
+                MH4N_LOG(Info, kLog,
+                         "audio ring at {:.1f} s: underruns {} (+{}), overflows {} (+{}), dropped {} frames (+{}), fill {} frames, ratio {:.4f}, longest DSP gap {:.1f} ms, largest SDL request {} frames, longest wait between requests {:.1f} ms; last underrun: asked {} had {} priming {}; queued {} pulled {} frames since the last line",
+                         t_ms / 1000.0, stats.underruns, stats.underruns - last_.underruns, stats.overflows,
+                         stats.overflows - last_.overflows, stats.dropped, stats.dropped - last_.dropped,
+                         feeder_.Stream().Fill(), feeder_.Ratio(), gap_us / 1000.0, req, req_gap_us / 1000.0, feeder_.Stream().LastUnderrunWanted(), feeder_.Stream().LastUnderrunAvailable(), feeder_.Stream().LastUnderrunWasPriming(), stats.queued - last_.queued, stats.pulled - last_.pulled);
+                last_ = stats;
+            }
+            return;
+        }
         file_ << t_ms << ',' << audio_out::LastFrame() << ',' << feeder_.Stream().Fill() << ','
               << fmt::format("{:.6f}", feeder_.Ratio()) << ',' << stats.underruns << ',' << stats.overflows << ','
               << stats.dropped << '\n';
         file_.flush();
     }
 
+    bool monitor_ = false;
+    audio_out::StreamStats last_;
     std::ofstream file_;
     Feeder& feeder_;
     std::chrono::steady_clock::time_point start_;
@@ -304,8 +327,9 @@ std::unique_ptr<AudioSink> MakeSdl(Runtime& rt) {
     }
 
     auto device = std::make_shared<Device>(stream, static_cast<int>(volume));
-    if (const auto path = options.Get("--audio-log")) {
-        auto log = std::make_unique<AudioLog>(*path, device->GetFeeder());
+    {
+        const auto path = options.Get("--audio-log");
+        auto log = std::make_unique<AudioLog>(path ? *path : std::string(), device->GetFeeder());
         if (!log->ok()) {
             MH4N_LOG(Error, kLog, "cannot write --audio-log {}", *path);
             rt.RequestExit(2, "cannot write --audio-log");

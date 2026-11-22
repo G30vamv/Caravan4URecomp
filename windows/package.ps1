@@ -15,7 +15,7 @@ param(
     [ValidateSet("release", "test")][string]$Mode = "release",
     [string]$OutDir = "",
     [string]$BuildDir = "",
-    [string]$Version = "0.3.1"   # semantic versioning (semver.org); the zip and the tag of a release are named after it
+    [string]$Version = "0.4.0"   # semantic versioning (semver.org); the zip and the tag of a release are named after it
 )
 $ErrorActionPreference = "Stop"
 $source = $PSScriptRoot
@@ -84,6 +84,9 @@ foreach ($d in "tools", "config") {
 Copy-Item (Join-Path $source "package\*") $pkg -Force -Recurse
 Remove-Item (Join-Path $pkg "1-PrepareGame.bat") -Force -ErrorAction SilentlyContinue  # the program asks for the files itself
 Set-Content -Path (Join-Path $pkg "VERSION.txt") -Value ("Caravan4URecomp " + $Version) -Encoding ascii
+# 5b. the launcher (Caravan4URecomp-Launcher.exe: edits the settings, starts the program and updates the package's files)
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $source "launcher\build_launcher.ps1") -OutDir $pkg -Version $Version
+if ($LASTEXITCODE -ne 0) { throw "build_launcher.ps1 failed" }
 if ($Mode -eq "release") {
     foreach ($f in "2-GpuCheck.bat", "perf_summary.py", "LEEME-PRUEBA.txt") { Remove-Item (Join-Path $pkg $f) -Force -ErrorAction SilentlyContinue }
 } else {

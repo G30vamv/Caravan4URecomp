@@ -1,31 +1,18 @@
-// Derived from Azahar src/video_core/shader/generator/pica_fs_config.cpp, pica_fs_config.h and
-// src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6
-// (GPL-3.0-or-later: all three say "Licensed under GPLv3 or any later version"): the device profile applied to
-// the requested logic op and blend halves (FramebufferConfig::ApplyProfile, BlendConfig::UsesNoOpFactors), the
-// ONE, ZERO, ADD blend of an emulated min/max half and the colour write mask 0 of an emulated NoOp
-// (GraphicsPipeline::Build, PipelineInfo::GetFinalColorWriteMask). The rest is ours.
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (pica_fs_config.cpp, pica_fs_config.h,
-//   vk_graphics_pipeline.cpp)
-#include "gpu/backend/state/state.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: state.h, rhi.h, gpu_fbops_test.cpp and the Vulkan framebuffer operations specification.
+
+#include "state.h"
 
 namespace mh4n::gpu::rhi::state {
-
 namespace {
 
 bool IsMinMax(BlendOp op) {
     return op == BlendOp::Min || op == BlendOp::Max;
 }
 
-// A half whose equation is Min or Max and whose factors are not both One goes to the shader; the pipeline then blends
-// ONE, ZERO, ADD, which leaves the shader's colour as it is.
-bool MoveMinMaxToShader(BlendOp& op, BlendFactor& source, BlendFactor& destination) {
-    if (!IsMinMax(op) || (source == BlendFactor::One && destination == BlendFactor::One)) {
-        return false;
-    }
-    op = BlendOp::Add;
-    source = BlendFactor::One;
-    destination = BlendFactor::Zero;
-    return true;
+bool NeedsMinMaxShader(BlendOp op, BlendFactor src, BlendFactor dst) {
+    return IsMinMax(op) && (src != BlendFactor::One || dst != BlendFactor::One);
 }
 
 bool ReadsSourceAlpha(BlendFactor factor) {
@@ -33,15 +20,15 @@ bool ReadsSourceAlpha(BlendFactor factor) {
            factor == BlendFactor::SrcAlphaSaturate;
 }
 
-bool IsColorPair(BlendFactor factor) {
+bool IsConstantColor(BlendFactor factor) {
     return factor == BlendFactor::ConstantColor || factor == BlendFactor::OneMinusConstantColor;
 }
 
-bool IsAlphaPair(BlendFactor factor) {
+bool IsConstantAlpha(BlendFactor factor) {
     return factor == BlendFactor::ConstantAlpha || factor == BlendFactor::OneMinusConstantAlpha;
 }
 
-BlendFactor AsColorPair(BlendFactor factor) {
+BlendFactor RewriteConstantAlpha(BlendFactor factor) {
     switch (factor) {
     case BlendFactor::ConstantAlpha: return BlendFactor::ConstantColor;
     case BlendFactor::OneMinusConstantAlpha: return BlendFactor::OneMinusConstantColor;
@@ -54,79 +41,74 @@ BlendFactor AsColorPair(BlendFactor factor) {
 bool LogicOpNeedsDestination(LogicOp op) {
     switch (op) {
     case LogicOp::Clear:
-    case LogicOp::Copy:
     case LogicOp::Set:
+    case LogicOp::Copy:
     case LogicOp::CopyInverted:
-    case LogicOp::NoOp: return false;
-    default: return true;
+    case LogicOp::NoOp:
+        return false;
+    default:
+        return true;
     }
 }
 
 Result<PipelinePlan> PlanPipeline(const FixedFunctionState& requested, const Capabilities& caps) {
-    if (requested.logic_op_enabled && requested.blend_enabled) {
-        return Error{"a logic op and blending are exclusive"};
-    }
-    PipelinePlan plan;
+    PipelinePlan plan{requested};
     FixedFunctionState& built = plan.built;
-    built = requested;
-    built.color_write_mask = requested.color_write_mask & kWriteAll;
-
-    // The logic op. Copy is the colour as it is, so it is neither.
-    built.logic_op_enabled = false;
-    built.logic_op = FixedFunctionState{}.logic_op;
-    if (requested.logic_op_enabled && requested.logic_op != LogicOp::Copy) {
-        if (caps.logic_op) {
-            built.logic_op_enabled = true;
-            built.logic_op = requested.logic_op;
-        } else if (requested.logic_op == LogicOp::NoOp) {
-            built.color_write_mask = 0;  // the colour is discarded, the depth write stays
-        } else {
-            plan.shader_logic_op = true;
+    if (requested.logic_op_enabled) {
+        if (requested.blend_enabled) {
+            return Error{"Blending and logic operations cannot both be enabled"};
         }
+        if (!caps.logic_op) {
+            built.logic_op_enabled = false;
+            if (requested.logic_op == LogicOp::NoOp) {
+                built.color_write_mask = 0;
+            } else {
+                plan.shader_logic_op = true;
+                plan.needs_destination_copy = LogicOpNeedsDestination(requested.logic_op);
+            }
+        }
+        return plan;
+    }
+    if (!requested.blend_enabled) {
+        return plan;
     }
 
-    if (built.blend_enabled) {
-        plan.rgb_in_shader = MoveMinMaxToShader(built.color_op, built.src_color, built.dst_color);
-        plan.alpha_in_shader = MoveMinMaxToShader(built.alpha_op, built.src_alpha, built.dst_alpha);
-        if (plan.alpha_in_shader && !plan.rgb_in_shader &&
-            (ReadsSourceAlpha(built.src_color) || ReadsSourceAlpha(built.dst_color))) {
-            // The shader writes the alpha half into the colour's alpha, and the blender would take that for the source
-            // alpha of its factors: the colour half goes to the shader too.
-            plan.rgb_in_shader = true;
-            built.color_op = BlendOp::Add;
-            built.src_color = BlendFactor::One;
-            built.dst_color = BlendFactor::Zero;
-        }
-
-        // The alpha half reads the constant's alpha through either pair.
-        built.src_alpha = AsColorPair(built.src_alpha);
-        built.dst_alpha = AsColorPair(built.dst_alpha);
-        const bool colors = IsColorPair(built.src_color) || IsColorPair(built.dst_color);
-        const bool alphas = IsAlphaPair(built.src_color) || IsAlphaPair(built.dst_color);
-        if (colors && alphas) {
-            // One constant colour cannot be both pairs: the shader computes the colour half with the real blend colour.
-            plan.rgb_in_shader = true;
-            built.color_op = BlendOp::Add;
-            built.src_color = BlendFactor::One;
-            built.dst_color = BlendFactor::Zero;
-        } else if (alphas) {
-            built.src_color = AsColorPair(built.src_color);
-            built.dst_color = AsColorPair(built.dst_color);
-            plan.constants_from_alpha = true;
-        }
-    }
-
+    const bool rgb_constant_alpha = IsConstantAlpha(requested.src_color) || IsConstantAlpha(requested.dst_color);
+    const bool rgb_constant_color = IsConstantColor(requested.src_color) || IsConstantColor(requested.dst_color);
+    plan.alpha_in_shader = NeedsMinMaxShader(requested.alpha_op, requested.src_alpha, requested.dst_alpha);
+    plan.rgb_in_shader = NeedsMinMaxShader(requested.color_op, requested.src_color, requested.dst_color) ||
+                         (plan.alpha_in_shader &&
+                          (ReadsSourceAlpha(requested.src_color) || ReadsSourceAlpha(requested.dst_color))) ||
+                         (rgb_constant_alpha && rgb_constant_color);
     plan.rgb_uses_blend_rgb = plan.rgb_in_shader && !IsMinMax(requested.color_op);
-    plan.needs_destination_copy = (plan.shader_logic_op && LogicOpNeedsDestination(requested.logic_op)) ||
-                                  plan.rgb_in_shader || plan.alpha_in_shader;
+    plan.needs_destination_copy = plan.rgb_in_shader || plan.alpha_in_shader;
+
+    if (plan.rgb_in_shader) {
+        built.color_op = BlendOp::Add;
+        built.src_color = BlendFactor::One;
+        built.dst_color = BlendFactor::Zero;
+    } else {
+        plan.constants_from_alpha = rgb_constant_alpha;
+        built.src_color = RewriteConstantAlpha(requested.src_color);
+        built.dst_color = RewriteConstantAlpha(requested.dst_color);
+    }
+    if (plan.alpha_in_shader) {
+        built.alpha_op = BlendOp::Add;
+        built.src_alpha = BlendFactor::One;
+        built.dst_alpha = BlendFactor::Zero;
+    } else {
+        built.src_alpha = RewriteConstantAlpha(requested.src_alpha);
+        built.dst_alpha = RewriteConstantAlpha(requested.dst_alpha);
+    }
     return plan;
 }
 
 std::array<float, 4> EffectiveBlendConstants(bool constants_from_alpha, const std::array<float, 4>& requested) {
-    if (!constants_from_alpha) {
-        return requested;
+    if (constants_from_alpha) {
+        const float alpha = requested[3];
+        return {alpha, alpha, alpha, alpha};
     }
-    return {requested[3], requested[3], requested[3], requested[3]};
+    return requested;
 }
 
 std::array<float, 4> EffectiveBlendConstants(const PipelinePlan& plan, const std::array<float, 4>& requested) {

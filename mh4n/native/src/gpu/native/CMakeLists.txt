@@ -18,6 +18,12 @@ mh4n_module(
         default_provider.cpp
         hd_textures.cpp
         native_gpu.cpp
+        render_draw.cpp
+        render_pull.cpp
+        render_screens.cpp
+        render_shared.cpp
+        render_surfaces.cpp
+        render_textures.cpp
         pipeline_builder.cpp
         process_memory.cpp
         provider_select.cpp

@@ -1,100 +1,152 @@
-// The POSIX side of the guest memory (N1-02): Linux and macOS. The macOS paths are built and tested
-// by the native-macos job of .github/workflows/native.yml (N1-22; Apple silicon has 16 KiB host pages).
-#if !defined(_WIN32)
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: host.h, memory_test.cpp, and POSIX mmap, mprotect, sigaction, and sigaltstack.
 
-#include <signal.h>
-#include <sys/mman.h>
-#include <unistd.h>
-
-#include <cerrno>
-#include <cstring>
-#include <mutex>
-
-#if defined(__linux__) && defined(__x86_64__)
-#include <ucontext.h>
-#elif defined(__APPLE__)
-#include <sys/ucontext.h>
-#endif
+#ifndef _WIN32
 
 #include "host.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+#include "mh4n/assert.h"
 
 namespace mh4n::host {
 namespace {
 
-struct sigaction g_previous_segv;
-struct sigaction g_previous_bus;
+constexpr int kReserveFlags = MAP_PRIVATE | MAP_ANONYMOUS
+#ifdef MAP_NORESERVE
+                              | MAP_NORESERVE
+#endif
+    ;
 
-// Read or write, if the platform's fault frame says (nothing else is touched: this runs in the
-// signal handler).
-FaultAccess AccessOf(void* context) {
-#if defined(__linux__) && defined(__x86_64__)
-    // Bit 1 of the page-fault error code is set for a write.
-    const auto* uc = static_cast<const ucontext_t*>(context);
-    return (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0 ? FaultAccess::Write : FaultAccess::Read;
+struct PreviousAction {
+    struct sigaction action{};
+    std::atomic_flag called{};
+};
+
+PreviousAction previous_segv;
+PreviousAction previous_bus;
+
+#if (defined(__linux__) && defined(__x86_64__) && defined(REG_ERR)) || \
+    (defined(__APPLE__) && defined(__x86_64__))
+FaultAccess DecodePageFault(unsigned error) {
+    constexpr unsigned kWrite = 1u << 1;
+    constexpr unsigned kInstruction = 1u << 4;
+    if ((error & kInstruction) != 0) {
+        return FaultAccess::Unknown;
+    }
+    return (error & kWrite) != 0 ? FaultAccess::Write : FaultAccess::Read;
+}
+#endif
+
+FaultAccess DecodeAccess(void* opaque) {
+#if defined(__linux__) && defined(__x86_64__) && defined(REG_ERR)
+    return DecodePageFault(static_cast<ucontext_t*>(opaque)->uc_mcontext.gregs[REG_ERR]);
 #elif defined(__APPLE__) && defined(__x86_64__)
-    const auto* uc = static_cast<const ucontext_t*>(context);
-    return (uc->uc_mcontext->__es.__err & 2) != 0 ? FaultAccess::Write : FaultAccess::Read;
-#elif defined(__APPLE__) && defined(__aarch64__)
-    // ESR_EL1: WnR is bit 6 of the syndrome of a data abort.
-    const auto* uc = static_cast<const ucontext_t*>(context);
-    return (uc->uc_mcontext->__es.__esr & (1u << 6)) != 0 ? FaultAccess::Write : FaultAccess::Read;
+    return DecodePageFault(static_cast<ucontext_t*>(opaque)->uc_mcontext->__es.__err);
 #else
-    (void)context;
+    (void)opaque;
     return FaultAccess::Unknown;
 #endif
 }
 
-void Handler(int signo, siginfo_t* info, void* context) {
-    if (fault::HandleFault(reinterpret_cast<std::uintptr_t>(info->si_addr), AccessOf(context))) {
-        return; // not reached: HandleFault ends the process for a fault of ours
-    }
-    // Not ours: hand it to the handler that was installed before.
-    const struct sigaction& previous = signo == SIGSEGV ? g_previous_segv : g_previous_bus;
-    if ((previous.sa_flags & SA_SIGINFO) != 0 && previous.sa_sigaction != nullptr) {
-        previous.sa_sigaction(signo, info, context);
-        return;
-    }
-    if (previous.sa_handler != SIG_DFL && previous.sa_handler != SIG_IGN) {
-        previous.sa_handler(signo);
-        return;
-    }
-    // Default action: restore it and return, so the instruction faults again and the process dies
-    // the way it would have without us.
-    struct sigaction dfl;
-    std::memset(&dfl, 0, sizeof dfl);
-    dfl.sa_handler = SIG_DFL;
-    sigemptyset(&dfl.sa_mask);
-    sigaction(signo, &dfl, nullptr);
+[[noreturn]] void DeliverDefault(int signal) {
+    struct sigaction action{};
+    action.sa_handler = SIG_DFL;
+    sigemptyset(&action.sa_mask);
+    sigaction(signal, &action, nullptr);
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, signal);
+    pthread_sigmask(SIG_UNBLOCK, &signals, nullptr);
+    raise(signal);
+    _exit(128 + signal);
 }
 
-// An alternate signal stack for the calling thread, freed when the thread ends.
-struct AltStack {
-    void* memory = nullptr;
-    std::size_t size = 0;
-    ~AltStack() {
-        if (memory != nullptr) {
-            stack_t disable;
-            std::memset(&disable, 0, sizeof disable);
-            disable.ss_flags = SS_DISABLE;
-            sigaltstack(&disable, nullptr);
-            munmap(memory, size);
+void OnSignal(int signal, siginfo_t* info, void* opaque) {
+    if (info->si_code > 0) {
+        fault::HandleFault(reinterpret_cast<std::uintptr_t>(info->si_addr), DecodeAccess(opaque));
+    }
+
+    auto& previous = signal == SIGSEGV ? previous_segv : previous_bus;
+    const auto& action = previous.action;
+    if (action.sa_handler == SIG_IGN) {
+        return;
+    }
+    if (action.sa_handler == SIG_DFL ||
+        ((action.sa_flags & SA_RESETHAND) != 0 && previous.called.test_and_set())) {
+        DeliverDefault(signal);
+    }
+    if ((action.sa_flags & SA_SIGINFO) != 0) {
+        action.sa_sigaction(signal, info, opaque);
+    } else {
+        action.sa_handler(signal);
+    }
+}
+
+void InstallAction(int signal, PreviousAction& previous) {
+    MH4N_ASSERT(sigaction(signal, nullptr, &previous.action) == 0);
+    struct sigaction action{};
+    action.sa_sigaction = OnSignal;
+    action.sa_mask = previous.action.sa_mask;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK |
+                      (previous.action.sa_flags & (SA_RESTART | SA_NODEFER));
+    MH4N_ASSERT(sigaction(signal, &action, nullptr) == 0);
+}
+
+class ThreadFaultStack {
+public:
+    void EnsureInstalled() {
+        stack_t current{};
+        MH4N_ASSERT(sigaltstack(nullptr, &current) == 0);
+        if ((current.ss_flags & SS_DISABLE) == 0) {
+            return;
+        }
+        if (!storage_) {
+            size_ = std::max<std::size_t>(SIGSTKSZ, 64 * 1024);
+            storage_ = std::make_unique<u8[]>(size_);
+        }
+        stack_t stack{};
+        stack.ss_sp = storage_.get();
+        stack.ss_size = size_;
+        MH4N_ASSERT(sigaltstack(&stack, nullptr) == 0);
+    }
+
+    ~ThreadFaultStack() {
+        stack_t current{};
+        if (storage_ && sigaltstack(nullptr, &current) == 0 &&
+            (current.ss_flags & SS_DISABLE) == 0 && current.ss_sp == storage_.get()) {
+            stack_t disabled{};
+            disabled.ss_flags = SS_DISABLE;
+            MH4N_ASSERT(sigaltstack(&disabled, nullptr) == 0);
         }
     }
+
+private:
+    std::unique_ptr<u8[]> storage_;
+    std::size_t size_ = 0;
 };
 
 } // namespace
 
 std::size_t PageSize() {
-    return static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    const long page_size = sysconf(_SC_PAGESIZE);
+    return page_size > 0 ? static_cast<std::size_t>(page_size) : 0;
 }
 
 void* Reserve(std::size_t size) {
-    void* p = mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    return p == MAP_FAILED ? nullptr : p;
+    void* base = mmap(nullptr, size, PROT_NONE, kReserveFlags, -1, 0);
+    return base == MAP_FAILED ? nullptr : base;
 }
 
 void Release(void* base, std::size_t size) {
-    munmap(base, size);
+    MH4N_ASSERT(munmap(base, size) == 0);
 }
 
 bool Commit(void* addr, std::size_t size) {
@@ -102,52 +154,23 @@ bool Commit(void* addr, std::size_t size) {
 }
 
 bool Decommit(void* addr, std::size_t size) {
-    // Replacing the pages with a fresh inaccessible mapping frees them at once and guarantees that
-    // a later Commit sees zeros (madvise(MADV_DONTNEED) does that on Linux only).
-    void* p = mmap(addr, size, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
-    return p != MAP_FAILED;
+    // Replace the pages in place so their addresses stay reserved and their old data is gone.
+    return mmap(addr, size, PROT_NONE, kReserveFlags | MAP_FIXED, -1, 0) == addr;
 }
 
 void InstallFaultHandler() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        struct sigaction action;
-        std::memset(&action, 0, sizeof action);
-        action.sa_sigaction = Handler;
-        action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-        sigemptyset(&action.sa_mask);
-        sigaction(SIGSEGV, &action, &g_previous_segv);
-        sigaction(SIGBUS, &action, &g_previous_bus);
+    static std::once_flag installed;
+    std::call_once(installed, [] {
+        InstallAction(SIGSEGV, previous_segv);
+        InstallAction(SIGBUS, previous_bus);
     });
 }
 
 void InstallThreadFaultStack() {
-    thread_local AltStack stack;
-    if (stack.memory != nullptr) {
-        return;
-    }
-    stack_t current;
-    if (sigaltstack(nullptr, &current) == 0 && (current.ss_flags & SS_DISABLE) == 0) {
-        return; // the thread already has one
-    }
-    const std::size_t size = 64 * 1024;
-    void* memory = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (memory == MAP_FAILED) {
-        return;
-    }
-    stack_t alt;
-    std::memset(&alt, 0, sizeof alt);
-    alt.ss_sp = memory;
-    alt.ss_size = size;
-    if (sigaltstack(&alt, nullptr) != 0) {
-        munmap(memory, size);
-        return;
-    }
-    stack.memory = memory;
-    stack.size = size;
+    thread_local ThreadFaultStack stack;
+    stack.EnsureInstalled();
 }
 
 } // namespace mh4n::host
 
-#endif // !_WIN32
+#endif

@@ -1,161 +1,160 @@
-// Written for this package from the design: nothing is copied from Azahar here. See emitter.h.
-#include "gpu/fragment/emitter.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: emitter.h, the FragmentKey layout and gpu_tev_test's emitter probe.
 
+#include "emitter.h"
+
+#include <algorithm>
 #include <cstring>
 
 namespace mh4n::gpu::fragment {
 
-namespace {
-
-constexpr char kLane[4] = {'x', 'y', 'z', 'w'};
-
-std::string CfgRead(size_t word) {
-    return fmt::format("cfg[{}].{}", word / 4, kLane[word % 4]);
-}
-
-}  // namespace
-
 Emitter::Emitter(Mode mode, const FragmentKey& applied_key, const DeviceProfile& profile, ShaderPass pass)
     : mode_(mode), profile_(profile), pass_(pass) {
-    std::memcpy(words_, &applied_key, sizeof(words_));
+    if (specialised()) {
+        std::memcpy(words_, &applied_key, sizeof(words_));
+    }
 }
 
 Value Emitter::Field(size_t word, u32 first, u32 count) const {
     if (specialised()) {
-        return Value::Known(fragment::Bits(words_[word], first, count));
+        return Slice(Const(KnownWord(word)), first, count);
     }
-    Value v;
-    std::string expr = CfgRead(word);
+    return Slice({false, 0, fmt::format("cfg[{}][{}]", word / 4, word % 4)}, first, count);
+}
+
+Value Emitter::Slice(const Value& value, u32 first, u32 count) const {
+    if (count == 0 || first >= 32) {
+        return Const(0);
+    }
+    const u32 available = 32 - first;
+    const u32 mask = 0xFFFFFFFFu >> (32 - std::min(count, available));
+    if (value.known) {
+        return Const((value.literal >> first) & mask);
+    }
+    std::string expression = value.glsl;
     if (first != 0) {
-        expr = fmt::format("({} >> {}u)", expr, first);
+        expression = fmt::format("(({}) >> {}u)", expression, first);
     }
-    if (count < 32) {
-        expr = fmt::format("({} & {}u)", expr, (1u << count) - 1u);
+    if (count < available) {
+        expression = fmt::format("(({}) & {}u)", expression, mask);
     }
-    v.glsl = std::move(expr);
-    return v;
+    return {false, 0, std::move(expression)};
 }
 
-Value Emitter::Slice(const Value& v, u32 first, u32 count) const {
-    if (v.known) {
-        return Value::Known(fragment::Bits(v.literal, first, count));
+Value Emitter::Select(const Cond& condition, const Value& yes, const Value& no) const {
+    if (condition.known) {
+        return condition.value ? yes : no;
     }
-    Value out;
-    std::string expr = v.glsl;
-    if (first != 0) {
-        expr = fmt::format("({} >> {}u)", expr, first);
+    if (yes.known && no.known && yes.literal == no.literal) {
+        return yes;
     }
-    if (count < 32) {
-        expr = fmt::format("({} & {}u)", expr, (1u << count) - 1u);
-    }
-    out.glsl = std::move(expr);
-    return out;
+    return {false, 0, fmt::format("({} ? {} : {})", condition.glsl, yes.glsl, no.glsl)};
 }
 
-Value Emitter::Select(const Cond& c, const Value& b, const Value& a) const {
-    if (c.known) {
-        return c.value ? b : a;
-    }
-    Value v;
-    v.glsl = fmt::format("(({}) ? {} : {})", c.glsl, b.glsl, a.glsl);
-    return v;
+Cond Emitter::Eq(const Value& value, u32 number) const {
+    return Eq(value, Const(number));
 }
 
-Cond Emitter::Eq(const Value& v, u32 n) const {
-    if (v.known) {
-        return Cond::Known(v.literal == n);
-    }
-    return Cond{false, false, fmt::format("({} == {}u)", v.glsl, n)};
-}
-
-Cond Emitter::Ne(const Value& v, u32 n) const {
-    if (v.known) {
-        return Cond::Known(v.literal != n);
-    }
-    return Cond{false, false, fmt::format("({} != {}u)", v.glsl, n)};
+Cond Emitter::Ne(const Value& value, u32 number) const {
+    return Not(Eq(value, number));
 }
 
 Cond Emitter::Eq(const Value& a, const Value& b) const {
     if (a.known && b.known) {
         return Cond::Known(a.literal == b.literal);
     }
-    return Cond{false, false, fmt::format("({} == {})", a.glsl, b.glsl)};
+    return {false, false, fmt::format("(({}) == ({}))", a.glsl, b.glsl)};
 }
 
-Cond Emitter::Not(const Cond& c) const {
-    if (c.known) {
-        return Cond::Known(!c.value);
+Cond Emitter::Not(const Cond& condition) const {
+    if (condition.known) {
+        return Cond::Known(!condition.value);
     }
-    return Cond{false, false, fmt::format("(!{})", c.glsl)};
+    return {false, false, fmt::format("(!({}))", condition.glsl)};
 }
 
 Cond Emitter::And(const Cond& a, const Cond& b) const {
-    if (a.known && !a.value) return a;
-    if (b.known && !b.value) return b;
-    if (a.known) return b;
-    if (b.known) return a;
-    return Cond{false, false, fmt::format("({} && {})", a.glsl, b.glsl)};
+    if (a.known) {
+        return a.value ? b : a;
+    }
+    if (b.known) {
+        return b.value ? a : b;
+    }
+    return {false, false, fmt::format("(({}) && ({}))", a.glsl, b.glsl)};
 }
 
 Cond Emitter::Or(const Cond& a, const Cond& b) const {
-    if (a.known && a.value) return a;
-    if (b.known && b.value) return b;
-    if (a.known) return b;
-    if (b.known) return a;
-    return Cond{false, false, fmt::format("({} || {})", a.glsl, b.glsl)};
+    if (a.known) {
+        return a.value ? a : b;
+    }
+    if (b.known) {
+        return b.value ? b : a;
+    }
+    return {false, false, fmt::format("(({}) || ({}))", a.glsl, b.glsl)};
 }
 
-void Emitter::If(const Cond& c, const Body& then, const Body& otherwise) {
-    if (c.known) {
-        const Body& chosen = c.value ? then : otherwise;
-        if (chosen) chosen();
+void Emitter::If(const Cond& condition, const Body& then, const Body& otherwise) {
+    if (condition.known) {
+        const Body& chosen = condition.value ? then : otherwise;
+        if (chosen) {
+            chosen();
+        }
         return;
     }
-    out_ += fmt::format("if ({}) {{\n", c.glsl);
-    if (then) then();
+
+    Line("if ({}) {{", condition.glsl);
+    then();
     if (otherwise) {
-        out_ += "} else {\n";
+        Raw("} else {\n");
         otherwise();
     }
-    out_ += "}\n";
+    Raw("}\n");
 }
 
-void Emitter::Switch(const Value& v, std::initializer_list<std::pair<u32, Body>> cases, const Body& otherwise) {
-    if (v.known) {
-        for (const auto& [value, body] : cases) {
-            if (value == v.literal) {
-                if (body) body();
+void Emitter::Switch(const Value& value, std::initializer_list<std::pair<u32, Body>> cases,
+                     const Body& otherwise) {
+    if (value.known) {
+        for (const auto& [number, body] : cases) {
+            if (value.literal == number) {
+                body();
                 return;
             }
         }
-        if (otherwise) otherwise();
+        if (otherwise) {
+            otherwise();
+        }
         return;
     }
-    out_ += fmt::format("switch ({}) {{\n", v.glsl);
-    for (const auto& [value, body] : cases) {
-        out_ += fmt::format("case {}u: {{\n", value);
-        if (body) body();
-        out_ += "} break;\n";
+
+    Line("switch ({}) {{", value.glsl);
+    for (const auto& [number, body] : cases) {
+        Line("case {}u: {{", number);
+        body();
+        Raw("} break;\n");
     }
-    out_ += "default: {\n";
-    if (otherwise) otherwise();
-    out_ += "} break;\n}\n";
+    if (otherwise) {
+        Raw("default: {\n");
+        otherwise();
+        Raw("} break;\n");
+    }
+    Raw("}\n");
 }
 
 void Emitter::ForEach(const Value& count, u32 max, std::string_view variable,
                       const std::function<void(const std::string& index)>& body) {
     if (count.known) {
-        const u32 n = count.literal < max ? count.literal : max;
-        for (u32 i = 0; i < n; ++i) {
-            out_ += "{\n";
-            body(fmt::format("{}u", i));
-            out_ += "}\n";
+        for (u32 i = 0; i < std::min(count.literal, max); ++i) {
+            Raw("{\n");
+            body(Const(i).glsl);
+            Raw("}\n");
         }
         return;
     }
-    out_ += fmt::format("for (uint {0} = 0u; {0} < min({1}, {2}u); ++{0}) {{\n", variable, count.glsl, max);
+
+    Line("for (uint {0} = 0u; {0} < min({1}, {2}u); ++{0}) {{", variable, count.glsl, max);
     body(std::string(variable));
-    out_ += "}\n";
+    Raw("}\n");
 }
 
-}  // namespace mh4n::gpu::fragment
+} // namespace mh4n::gpu::fragment

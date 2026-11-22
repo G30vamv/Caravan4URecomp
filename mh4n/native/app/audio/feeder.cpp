@@ -55,6 +55,11 @@ void Feeder::OnRequest(SDL_AudioStream* sdl, int additional_amount) {
     }
     const std::size_t frames = static_cast<std::size_t>(additional_amount) / kBytesPerFrame;
     const double now = now_();
+    if (frames > max_request_.load(std::memory_order_relaxed)) max_request_.store(frames, std::memory_order_relaxed);
+    if (have_last_) {
+        const u64 gap = static_cast<u64>((now - last_s_) * 1e6);
+        if (gap > max_request_gap_us_.load(std::memory_order_relaxed)) max_request_gap_us_.store(gap, std::memory_order_relaxed);
+    }
     const double target = static_cast<double>(stream_->Target());
     const double block = static_cast<double>(frames);
 

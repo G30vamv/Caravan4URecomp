@@ -1,67 +1,70 @@
-// The `services` boot step (N1-10): the service manager of a runtime, with every registered service
-// installed and the SVC layer's ConnectToPort and SendSyncRequest handlers pointing at it.
-#include <map>
-#include <memory>
-#include <mutex>
-
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: mh4n/runtime.h, mh4n/service.h and ipc/internal.h.
 #include "internal.h"
-#include "mh4n/registry.h"
+
 #include "mh4n/runtime.h"
 #include "mh4n/service.h"
 
-namespace mh4n {
+#include <mutex>
 
+namespace mh4n {
 namespace {
 
-std::mutex g_managers_mutex;
-std::map<Runtime*, ServiceManager*>& Managers() {
-    static std::map<Runtime*, ServiceManager*> managers;
-    return managers;
+struct RuntimeManagers {
+    std::mutex mutex;
+    std::map<Runtime*, ServiceManager*> managers;
+};
+
+RuntimeManagers& Managers() {
+    static RuntimeManagers table;
+    return table;
 }
 
-void StartServices(Runtime& rt) {
-    ServiceEnvironment env;
-    env.game_folder = rt.GameFolder();
-    env.user_folder = rt.UserFolder();
-    env.options = &rt.GetOptions();
-    env.kernel = &rt.GetKernel();
-    env.scheduler = &rt.Scheduler();
-    env.threads = &rt.Threads();
-    env.interfaces = &rt.Interfaces();
-    env.request_exit = [&rt](int status, const std::string& reason) {
-        rt.RequestExit(status, reason);
-    };
-    auto manager = std::make_shared<ServiceManager>(std::move(env));
+void InstallServices(Runtime& runtime) {
+    auto manager = std::make_shared<ServiceManager>(ServiceEnvironment{
+        .game_folder = runtime.GameFolder(),
+        .user_folder = runtime.UserFolder(),
+        .options = &runtime.GetOptions(),
+        .kernel = &runtime.GetKernel(),
+        .scheduler = &runtime.Scheduler(),
+        .threads = &runtime.Threads(),
+        .interfaces = &runtime.Interfaces(),
+        .request_exit = [&runtime](int status, const std::string& reason) {
+            runtime.RequestExit(status, reason);
+        },
+    });
     manager->InstallRegistered();
-    manager->Install(rt.Svc());
-    detail::RememberServiceManager(&rt, manager.get());
-    rt.Own(manager);
+    manager->Install(runtime.Svc());
+    detail::RememberServiceManager(&runtime, manager.get());
+    runtime.Own(std::move(manager));
 }
 
-MH4N_REGISTER(BootStep, "services.ipc", BootStep{Phase::Services, StartServices});
+MH4N_REGISTER(BootStep, "services", BootStep{Phase::Services, InstallServices});
 
 }  // namespace
 
 namespace detail {
 
 void RememberServiceManager(Runtime* runtime, ServiceManager* manager) {
-    std::lock_guard lock(g_managers_mutex);
-    Managers()[runtime] = manager;
+    auto& table = Managers();
+    const std::lock_guard lock(table.mutex);
+    table.managers.insert_or_assign(runtime, manager);
 }
 
 void ForgetServiceManager(ServiceManager* manager) {
-    std::lock_guard lock(g_managers_mutex);
-    for (auto it = Managers().begin(); it != Managers().end();) {
-        it = it->second == manager ? Managers().erase(it) : std::next(it);
-    }
+    auto& table = Managers();
+    const std::lock_guard lock(table.mutex);
+    std::erase_if(table.managers, [manager](const auto& entry) { return entry.second == manager; });
 }
 
 }  // namespace detail
 
 ServiceManager* FindServiceManager(Runtime& runtime) {
-    std::lock_guard lock(g_managers_mutex);
-    const auto it = Managers().find(&runtime);
-    return it == Managers().end() ? nullptr : it->second;
+    auto& table = Managers();
+    const std::lock_guard lock(table.mutex);
+    const auto found = table.managers.find(&runtime);
+    return found == table.managers.end() ? nullptr : found->second;
 }
 
 }  // namespace mh4n

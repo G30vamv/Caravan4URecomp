@@ -1,87 +1,75 @@
-// The real preemption source (N1-06): one host thread that waits for the deadline and raises the
-// scheduler's flag. It never switches fibers and never touches guest memory or kernel objects (the
-// trap of the spec): all it calls is the `raise` function it was given.
-#include <thread>
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: scheduler.h, clock.h and scheduler_test.cpp.
 
 #include "mh4n/scheduler.h"
-#include "mh4n/host_thread_name.h"
 
 namespace mh4n {
-
 namespace {
 
-class TimerThreadPreemption final : public PreemptionSource {
+class TimerPreemption final : public PreemptionSource {
 public:
-    explicit TimerThreadPreemption(TimeSource& source) : source_(source) {}
-    ~TimerThreadPreemption() override { Stop(); }
+    explicit TimerPreemption(TimeSource& source) : source_(source) {}
+    ~TimerPreemption() override { Stop(); }
 
     void Start(std::function<void()> raise) override {
         std::lock_guard lock(mutex_);
-        if (thread_.joinable()) {
-            return;
-        }
         raise_ = std::move(raise);
-        stop_ = false;
-        thread_ = std::thread([this] {
-            SetHostThreadName("mh4n-timer");
-            Loop();
-        });
+        worker_ = std::thread([this] { Run(); });
     }
 
     void Stop() override {
-        std::thread thread;
         {
-            std::lock_guard lock(mutex_);
-            stop_ = true;
-            thread = std::move(thread_);
+            std::unique_lock lock(mutex_);
+            raise_ = {};
+            deadline_.reset();
+            changed_.notify_all();
+            finished_.wait(lock, [this] { return immediate_ == 0; });
         }
-        cv_.notify_all();
-        if (thread.joinable()) {
-            thread.join();
+        if (worker_.joinable()) {
+            worker_.join();
         }
     }
 
     void Arm(std::optional<s64> deadline_ns) override {
-        bool wake = false;
+        std::function<void()> raise_now;
         {
             std::lock_guard lock(mutex_);
-            deadline_ = deadline_ns;
+            if (!raise_) {
+                return;
+            }
+            if (deadline_ns && *deadline_ns <= source_.NowNs()) {
+                raise_now = raise_;
+                ++immediate_;
+                deadline_.reset();
+            } else {
+                deadline_ = deadline_ns;
+            }
             ++generation_;
-            // Only a deadline before the one the thread waits for needs it now. A later one, or none, waits until the
-            // thread wakes for the one it has: it then finds the request changed and waits again, raising nothing. The
-            // scheduler moves its deadline at nearly every switch, and each wake-up was a futex call and a host thread
-            // scheduled (a Moto g06's game thread: 4 % in notify_all and its system calls).
-            wake = !waiting_ || (deadline_ns && (!waiting_for_ || *deadline_ns < *waiting_for_));
         }
-        if (wake) {
-            cv_.notify_all();
+        changed_.notify_one();
+        if (raise_now) {
+            raise_now();
+            std::lock_guard lock(mutex_);
+            --immediate_;
+            finished_.notify_all();
         }
     }
 
 private:
-    void Loop() {
+    void Run() {
         std::unique_lock lock(mutex_);
-        while (!stop_) {
+        while (raise_) {
             const u64 generation = generation_;
-            const std::optional<s64> deadline = deadline_;
-            // Until the request changes or, with a deadline, the deadline passes (Arm wakes it early only for an
-            // earlier deadline: waiting_for_)
-            waiting_ = true;
-            waiting_for_ = deadline;
-            const bool changed = source_.WaitUntil(cv_, lock, deadline, [&] {
-                return stop_ || generation_ != generation;
+            const auto deadline = deadline_;
+            const bool revised = source_.WaitUntil(changed_, lock, deadline, [&] {
+                return !raise_ || generation_ != generation;
             });
-            waiting_ = false;
-            if (stop_) {
-                break;
-            }
-            if (!changed && deadline) {
-                // One shot: the request is spent. Raised without our lock, so that the scheduler can
-                // Arm again from inside whatever the flag makes it do.
+            if (!revised) {
                 deadline_.reset();
-                ++generation_;
+                const auto raise = raise_;
                 lock.unlock();
-                raise_();
+                raise();
                 lock.lock();
             }
         }
@@ -89,20 +77,19 @@ private:
 
     TimeSource& source_;
     std::mutex mutex_;
-    std::condition_variable cv_;
+    std::condition_variable changed_;
+    std::condition_variable finished_;
+    std::function<void()> raise_;
     std::optional<s64> deadline_;
     u64 generation_ = 0;
-    bool waiting_ = false;                // the thread is in WaitUntil, for waiting_for_ (none: no deadline)
-    std::optional<s64> waiting_for_;
-    bool stop_ = false;
-    std::function<void()> raise_;
-    std::thread thread_;
+    std::size_t immediate_ = 0;
+    std::thread worker_;
 };
 
 }  // namespace
 
 std::unique_ptr<PreemptionSource> MakeTimerThreadPreemption(TimeSource& source) {
-    return std::make_unique<TimerThreadPreemption>(source);
+    return std::make_unique<TimerPreemption>(source);
 }
 
 }  // namespace mh4n

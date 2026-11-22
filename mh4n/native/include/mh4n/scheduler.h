@@ -210,7 +210,8 @@ public:
     void RequestStop();
     // Applies posted work and due timers without any guest fiber, until none is left (the replay
     // tool). Returns whether anything ran. Threads that were woken stay ready.
-    bool RunPending();
+    // `run_timers` false: only the posted work (the shutdown drain, so no new timer fires).
+    bool RunPending(bool run_timers = true);
 
     // What RC_TICK does: call Preempt() if the flag is set. For code that is not recompiled (tests,
     // the interpreter).
@@ -281,7 +282,7 @@ private:
     void SwitchFromSelf(GuestThread* self);
     void Reschedule();
     void NeedReschedule(int core);
-    bool ProcessPending(bool until_quiet);
+    bool ProcessPending(bool until_quiet, bool run_timers = true);
     bool RunDueTimers();
     void RunHooks();
     bool StopWanted();

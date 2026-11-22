@@ -1,273 +1,222 @@
-// Derived from Azahar src/core/cheats/gateway_cheat.cpp and src/core/cheats/gateway_cheat.h at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later: both say "GPLv2 or any later version"):
-// the execution state (State), each code type's operation (WriteOp, CompOp, LoadOffsetOp, LoopOp,
-// TerminateOp, LoopExecuteVariantOp, FullTerminateOp, SetOffsetOp, AddValueOp, SetValueOp,
-// IncrementiveWriteOp, LoadOp, AddOffsetOp, JokerOp, PatchOp), CheatLine's parsing, Execute, ToString
-// and LoadFile; and Common::StripSpaces and Common::SplitString as src/common/string_util.cpp has them
-// (GPL-2.0-or-later).
-// Copyright 2018-2026 Citra Emulator Project / Azahar Emulator Project (gateway_cheat.cpp)
-// Copyright 2018-2025 Citra Emulator Project / Azahar Emulator Project (gateway_cheat.h)
-// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project (string_util.cpp)
-#include "cheats/gateway_cheat.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: gateway_cheat.h, cheats_test.cpp and the Gateway 3DS release notes (Cheat Code Format, mirrored on WikiTemp).
+
+#include "gateway_cheat.h"
 
 #include <algorithm>
-#include <cctype>
-#include <cmath>
+#include <charconv>
 #include <fstream>
-#include <iterator>
-#include <optional>
 #include <sstream>
-#include <stdexcept>
-#include <type_traits>
-
-#include "../common/utf8.h"
+#include <string_view>
+#include <utility>
 
 namespace mh4n::cheats {
-
 namespace {
 
-struct State {
-    u32 reg = 0;
-    u32 offset = 0;
-    u32 if_flag = 0;
-    u32 loop_count = 0;
-    std::size_t loop_back_line = 0;
-    std::size_t current_line_nr = 0;
-    bool loop_flag = false;
-};
+using Type = GatewayCheat::CheatType;
+using Line = GatewayCheat::CheatLine;
 
-using CheatLine = GatewayCheat::CheatLine;
-using CheatType = GatewayCheat::CheatType;
+std::string_view Trim(std::string_view line) {
+    constexpr std::string_view whitespace = " \t\r\n\v\f";
+    const auto first = line.find_first_not_of(whitespace);
+    if (first == line.npos) return {};
+    return line.substr(first, line.find_last_not_of(whitespace) - first + 1);
+}
 
-template <typename T>
-T ReadT(CheatTarget& target, u32 address) {
-    if constexpr (sizeof(T) == 1) {
-        return target.Read8(address);
-    } else if constexpr (sizeof(T) == 2) {
-        return target.Read16(address);
-    } else {
-        return target.Read32(address);
+bool Hex(std::string_view word, u32& value) {
+    const auto [end, error] = std::from_chars(word.data(), word.data() + word.size(), value, 16);
+    return error == std::errc{} && end == word.data() + word.size();
+}
+
+std::string_view StripInlineComment(std::string_view line) {
+    const auto comment = std::min({line.find("//"), line.find('#'), line.find(';')});
+    return Trim(line.substr(0, comment));
+}
+
+std::vector<Line> ReadLines(std::istream& input) {
+    std::vector<Line> lines;
+    for (std::string line; std::getline(input, line);) {
+        const auto text = Trim(line);
+        if (!text.empty()) lines.emplace_back(std::string(text));
+    }
+    return lines;
+}
+
+u32 WriteWidth(Type type) {
+    switch (type) {
+    case Type::Write32: case Type::IncrementiveWrite32: return 4;
+    case Type::Write16: case Type::IncrementiveWrite16: return 2;
+    case Type::Write8: case Type::IncrementiveWrite8: return 1;
+    default: return 0;
     }
 }
 
-template <typename T>
-void WriteT(CheatTarget& target, u32 address, T value) {
-    if constexpr (sizeof(T) == 1) {
-        target.Write8(address, value);
-    } else if constexpr (sizeof(T) == 2) {
-        target.Write16(address, value);
-    } else {
-        target.Write32(address, value);
+bool IsCondition(Type type) {
+    return (type >= Type::GreaterThan32 && type <= Type::NotEqualTo16WithMask) || type == Type::Joker;
+}
+
+bool Condition(const Line& line, u32 offset, CheatTarget& target) {
+    if (line.type == Type::Joker) return (target.PadState() & line.value) == line.value;
+    const u32 address = offset + line.address;
+    const bool narrow = line.type >= Type::GreaterThan16WithMask;
+    const u32 expected = narrow ? line.value & 0xFFFF : line.value;
+    const u32 actual = narrow ? (target.Read16(address) & ~(line.value >> 16)) : target.Read32(address);
+    switch (line.type) {
+    case Type::GreaterThan32: case Type::GreaterThan16WithMask: return expected > actual;
+    case Type::LessThan32: case Type::LessThan16WithMask: return expected < actual;
+    case Type::EqualTo32: case Type::EqualTo16WithMask: return expected == actual;
+    default: return expected != actual;
     }
 }
 
-template <typename T>
-void WriteOp(const CheatLine& line, const State& state, CheatTarget& target) {
-    const u32 addr = line.address + state.offset;
-    const T val = ReadT<T>(target, addr);
-    if (val != static_cast<T>(line.value)) {
-        WriteT<T>(target, addr, static_cast<T>(line.value));
+u32 Read(CheatTarget& target, u32 address, u32 width) {
+    switch (width) {
+    case 1: return target.Read8(address);
+    case 2: return target.Read16(address);
+    default: return target.Read32(address);
     }
 }
 
-template <typename T, typename CompareFunc>
-void CompOp(const CheatLine& line, State& state, CheatTarget& target, CompareFunc comp) {
-    const u32 addr = line.address + state.offset;
-    const T val = ReadT<T>(target, addr);
-    if (!comp(val)) {
-        state.if_flag++;
+void Write(CheatTarget& target, u32 address, u32 value, u32 width) {
+    switch (width) {
+    case 1:
+        if (target.Read8(address) != static_cast<u8>(value)) target.Write8(address, static_cast<u8>(value));
+        break;
+    case 2:
+        if (target.Read16(address) != static_cast<u16>(value)) target.Write16(address, static_cast<u16>(value));
+        break;
+    case 4:
+        if (target.Read32(address) != value) target.Write32(address, value);
+        break;
     }
 }
 
-void LoadOffsetOp(CheatTarget& target, const CheatLine& line, State& state) {
-    const u32 addr = line.address + state.offset;
-    state.offset = target.Read32(addr);
+std::size_t PatchLines(const std::vector<Line>& lines, std::size_t op) {
+    const u64 requested = (u64{lines[op].value} + 7) / 8;
+    return static_cast<std::size_t>(std::min<u64>(requested, lines.size() - op - 1));
 }
 
-void LoopOp(const CheatLine& line, State& state) {
-    state.loop_flag = state.loop_count < line.value;
-    state.loop_count++;
-    state.loop_back_line = state.current_line_nr;
-}
-
-void TerminateOp(State& state) {
-    if (state.if_flag > 0) {
-        state.if_flag--;
-    }
-}
-
-void LoopExecuteVariantOp(State& state) {
-    if (state.loop_flag) {
-        state.current_line_nr = state.loop_back_line - 1;
-    } else {
-        state.loop_count = 0;
-    }
-}
-
-void FullTerminateOp(State& state) {
-    if (state.loop_flag) {
-        state.current_line_nr = state.loop_back_line - 1;
-    } else {
-        state.offset = 0;
-        state.reg = 0;
-        state.loop_count = 0;
-        state.if_flag = 0;
-        state.loop_flag = false;
-    }
-}
-
-template <typename T>
-void IncrementiveWriteOp(const CheatLine& line, State& state, CheatTarget& target) {
-    const u32 addr = line.value + state.offset;
-    const T val = ReadT<T>(target, addr);
-    if (val != static_cast<T>(state.reg)) {
-        WriteT<T>(target, addr, static_cast<T>(state.reg));
-    }
-    state.offset += sizeof(T);
-}
-
-template <typename T>
-void LoadOp(const CheatLine& line, State& state, CheatTarget& target) {
-    const u32 addr = line.value + state.offset;
-    state.reg = ReadT<T>(target, addr);
-}
-
-void JokerOp(const CheatLine& line, State& state, CheatTarget& target) {
-    const u32 pad_state = target.PadState();
-    const bool pressed = (pad_state & line.value) == line.value;
-    if (!pressed) {
-        state.if_flag++;
-    }
-}
-
-// EXXXXXXX YYYYYYYY: YYYYYYYY bytes from the next lines (their two words in turn) to [XXXXXXXX + offset].
-void PatchOp(const CheatLine& line, State& state, CheatTarget& target, const std::vector<CheatLine>& cheat_lines) {
-    if (state.if_flag > 0) {
-        // Skip over the additional patch lines
-        state.current_line_nr += static_cast<std::size_t>(std::ceil(line.value / 8.0));
-        return;
-    }
-    u32 num_bytes = line.value;
-    u32 addr = line.address + state.offset;
-
-    bool first = true;
-    u32 bit_offset = 0;
-    if (num_bytes > 0) {
-        state.current_line_nr++;  // skip over the current code
-    }
-    // (departure: a patch longer than its lines stops at the last one)
-    const auto at = [&](std::size_t nr) -> const CheatLine* { return nr < cheat_lines.size() ? &cheat_lines[nr] : nullptr; };
-    while (num_bytes >= 4) {
-        const CheatLine* l = at(state.current_line_nr);
-        if (l == nullptr) {
-            return;
+template <typename Emit>
+void EmitPatch(const std::vector<Line>& lines, std::size_t op, u32 address, Emit emit) {
+    u32 remaining = lines[op].value;
+    const auto count = PatchLines(lines, op);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& payload = lines[op + 1 + i];
+        if (!payload.valid) return;
+        for (u32 word : {payload.first, payload.value}) {
+            const u32 size = std::min(remaining, 4u);
+            if (size == 0) break;
+            emit(address, word, size);
+            address += size;
+            remaining -= size;
         }
-        const u32 tmp = first ? l->first : l->value;
-        if (!first && num_bytes > 4) {
-            state.current_line_nr++;
-        }
-        first = !first;
-        target.Write32(addr, tmp);
-        addr += 4;
-        num_bytes -= 4;
-    }
-    while (num_bytes > 0) {
-        const CheatLine* l = at(state.current_line_nr);
-        if (l == nullptr) {
-            return;
-        }
-        const u32 tmp = (first ? l->first : l->value) >> bit_offset;
-        target.Write8(addr, static_cast<u8>(tmp));
-        addr += 1;
-        num_bytes -= 1;
-        bit_offset += 8;
     }
 }
 
-// Common::StripSpaces: without the spaces, tabs, carriage returns and line feeds at either end.
-std::string StripSpaces(const std::string& str) {
-    const std::size_t s = str.find_first_not_of(" \t\r\n");
-    if (s == std::string::npos) {
-        return "";
-    }
-    const std::size_t e = str.find_last_not_of(" \t\r\n");
-    return str.substr(s, e - s + 1);
+bool InRange(u32 address, u32 width, u32 begin, u32 end) {
+    return width != 0 && begin < end &&
+           ((address < end && u64{address} + width > begin) ||
+            u64{address} + width > (u64{1} << 32) + begin);
 }
 
-// Common::SplitString: the empty piece after the last delimiter is dropped.
-std::vector<std::string> SplitString(const std::string& str, char delim) {
-    std::istringstream iss(str);
-    std::vector<std::string> output(1);
-    while (std::getline(iss, *output.rbegin(), delim)) {
-        output.emplace_back();
-    }
-    output.pop_back();
-    return output;
-}
-
-// A code line as the community's lists write it, in the form Azahar reads ("XXXXXXXX YYYYYYYY"): the two words
-// split by any spaces or tabs, or written together (16 digits), and a comment after them ("// ...", "# ...",
-// "; ..."). Anything else: nullopt (the line stays as it is, and is no code).
-std::optional<std::string> NormalizeCodeLine(const std::string& line) {
-    const auto hex_run = [&](std::size_t at) {
-        std::size_t e = at;
-        while (e < line.size() && std::isxdigit(static_cast<unsigned char>(line[e]))) ++e;
-        return e - at;
+bool ScanWrites(const std::vector<Line>& lines, u32 begin, u32 end,
+                std::map<u32, u8>* bytes, std::string* why) {
+    const auto fail = [why](const char* reason) {
+        if (why) *why = reason;
+        return false;
     };
-    const auto blank = [](char c) { return c == ' ' || c == '\t'; };
-    std::string first, second;
-    std::size_t at = 0;
-    const std::size_t n1 = hex_run(0);
-    if (n1 == 16) {
-        first = line.substr(0, 8), second = line.substr(8, 8);
-        at = 16;
-    } else if (n1 == 8) {
-        first = line.substr(0, 8);
-        at = 8;
-        if (at >= line.size() || !blank(line[at])) return std::nullopt;
-        while (at < line.size() && blank(line[at])) ++at;
-        if (hex_run(at) != 8) return std::nullopt;
-        second = line.substr(at, 8);
-        at += 8;
-    } else {
-        return std::nullopt;
+    std::map<u32, u8> result;
+    u32 offset = 0;
+    bool loaded = false;
+    bool uncertain_offset = false;
+    u32 conditions = 0;
+    bool in_loop = false;
+    bool saw_loop = false;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const auto& line = lines[i];
+        if (!line.valid) continue;
+        const Type type = line.type;
+        if (IsCondition(type)) {
+            ++conditions;
+            continue;
+        }
+        if (type == Type::Terminator) {
+            if (conditions) --conditions;
+            continue;
+        }
+        if (type == Type::Loop) {
+            in_loop = saw_loop = true;
+            continue;
+        }
+        if (type == Type::LoopExecuteVariant || type == Type::FullTerminator) {
+            in_loop = false;
+            if (type == Type::FullTerminator) {
+                offset = 0;
+                loaded = uncertain_offset = saw_loop = false;
+                conditions = 0;
+            }
+            continue;
+        }
+        if (type == Type::SetOffset || type == Type::AddOffset || type == Type::LoadOffset) {
+            const bool conditional = conditions || in_loop;
+            if (type == Type::LoadOffset) {
+                loaded = true;
+            } else if (type == Type::SetOffset) {
+                offset = line.value;
+                if (!conditional) loaded = uncertain_offset = false;
+            } else {
+                offset += line.value;
+            }
+            uncertain_offset |= conditional;
+            continue;
+        }
+
+        const bool patch = type == Type::Patch;
+        const bool from_register = type >= Type::IncrementiveWrite32 && type <= Type::IncrementiveWrite8;
+        const auto width = patch ? static_cast<u32>(std::min<u64>(line.value, 8ull * PatchLines(lines, i)))
+                                 : WriteWidth(type);
+        if (width == 0) continue;
+        const u32 address = offset + (from_register ? line.value : line.address);
+        if (bytes && loaded) return fail("loaded_offset");
+        if (bytes && uncertain_offset) return fail("conditional");
+        if (!loaded && InRange(address, width, begin, end)) {
+            if (!bytes) return true;
+            if (conditions || in_loop) return fail("conditional");
+            if (from_register) return fail("register");
+            const auto emit = [&](u32 at, u32 value, u32 size) {
+                for (u32 byte = 0; byte < size; ++byte, ++at) {
+                    if (at >= begin && at < end) result[at] = static_cast<u8>(value >> (8 * byte));
+                }
+            };
+            if (patch) EmitPatch(lines, i, address, emit);
+            else emit(address, line.value, width);
+        }
+        if (patch) i += PatchLines(lines, i);
+        if (from_register) {
+            offset += width;
+            uncertain_offset |= conditions != 0 || saw_loop;
+        }
     }
-    if (at < line.size()) {  // only a comment may follow, after a space
-        if (!blank(line[at])) return std::nullopt;
-        while (at < line.size() && blank(line[at])) ++at;
-        const std::string rest = line.substr(at);
-        if (!(rest.rfind("//", 0) == 0 || rest.front() == '#' || rest.front() == ';')) return std::nullopt;
-    }
-    return first + ' ' + second;
+    if (result.empty()) return fail("none");
+    *bytes = std::move(result);
+    if (why) why->clear();
+    return true;
 }
 
-}  // namespace
+} // namespace
 
-GatewayCheat::CheatLine::CheatLine(const std::string& line) {
-    constexpr std::size_t cheat_length = 17;
-    if (line.length() != cheat_length) {
-        type = CheatType::Null;
-        cheat_line = line;
-        valid = false;
-        return;
-    }
-    try {
-        const std::string type_temp = line.substr(0, 1);
-        // 0xD types have extra subtype value, i.e. 0xDA
-        std::string sub_type_temp;
-        if (type_temp == "D" || type_temp == "d") {
-            sub_type_temp = line.substr(1, 1);
-        }
-        type = static_cast<CheatType>(std::stoi(type_temp + sub_type_temp, nullptr, 16));
-        first = static_cast<u32>(std::stoul(line.substr(0, 8), nullptr, 16));
-        address = first & 0x0FFFFFFF;
-        value = static_cast<u32>(std::stoul(line.substr(9, 8), nullptr, 16));
-        cheat_line = line;
-    } catch (const std::logic_error&) {
-        type = CheatType::Null;
-        cheat_line = line;
-        valid = false;
-    }
+GatewayCheat::CheatLine::CheatLine(const std::string& line) : cheat_line(Trim(line)) {
+    const auto text = StripInlineComment(cheat_line);
+    const auto left = text.substr(0, 8);
+    const auto right = Trim(text.substr(left.size()));
+    valid = left.size() == 8 && right.size() == 8 && Hex(left, first) && Hex(right, value);
+    if (!valid) return;
+
+    cheat_line = std::string(left) + " " + std::string(right);
+    const u32 primary = first >> 28;
+    type = static_cast<Type>(primary == 0xD ? first >> 24 : primary);
+    address = first & 0x0FFF'FFFF;
 }
 
 GatewayCheat::GatewayCheat(std::string name, std::vector<CheatLine> cheat_lines, std::string comments)
@@ -275,388 +224,167 @@ GatewayCheat::GatewayCheat(std::string name, std::vector<CheatLine> cheat_lines,
 
 GatewayCheat::GatewayCheat(std::string name, const std::string& code, std::string comments)
     : name_(std::move(name)), comments_(std::move(comments)) {
-    for (const std::string& line : SplitString(code, '\n')) {
-        if (!line.empty()) {
-            cheat_lines_.emplace_back(line);
-        }
-    }
+    std::istringstream input(code);
+    cheat_lines_ = ReadLines(input);
 }
 
 void GatewayCheat::Execute(CheatTarget& target) const {
-    State state;
-    for (state.current_line_nr = 0; state.current_line_nr < cheat_lines_.size(); state.current_line_nr++) {
-        const CheatLine& line = cheat_lines_[state.current_line_nr];
-        if (state.if_flag > 0) {
-            switch (line.type) {
-            case CheatType::GreaterThan32:
-            case CheatType::LessThan32:
-            case CheatType::EqualTo32:
-            case CheatType::NotEqualTo32:
-            case CheatType::GreaterThan16WithMask:
-            case CheatType::LessThan16WithMask:
-            case CheatType::EqualTo16WithMask:
-            case CheatType::NotEqualTo16WithMask:
-            case CheatType::Joker:
-                // Increment the if_flag to handle the end if correctly
-                state.if_flag++;
-                break;
-            case CheatType::Patch:
-                // Skip the additional patch lines
-                PatchOp(line, state, target, cheat_lines_);
-                break;
-            case CheatType::Terminator:
-                // D0000000 00000000 - ENDIF
-                TerminateOp(state);
-                break;
-            case CheatType::FullTerminator:
-                // D2000000 00000000 - END; offset = 0; reg = 0;
-                FullTerminateOp(state);
-                break;
-            default:
-                break;
+    u32 offset = 0;
+    u32 data = 0;
+    u32 skipped = 0;
+    std::size_t loop_start = 0;
+    u32 repeats = 0;
+    for (std::size_t i = 0; i < cheat_lines_.size(); ++i) {
+        const auto& line = cheat_lines_[i];
+        if (!line.valid) continue;
+        const Type type = line.type;
+        if (type == Type::FullTerminator || (type == Type::LoopExecuteVariant && !skipped)) {
+            if (repeats) {
+                --repeats;
+                i = loop_start;
+                skipped = 0;
+            } else if (type == Type::FullTerminator) {
+                offset = data = skipped = 0;
             }
-            // Do not execute any other op code
             continue;
         }
-        switch (line.type) {
-        case CheatType::Null:
+        if (IsCondition(type)) {
+            if (skipped || !Condition(line, offset, target)) ++skipped;
+            continue;
+        }
+        if (type == Type::Terminator) {
+            if (skipped) --skipped;
+            continue;
+        }
+        if (type == Type::Patch) {
+            if (!skipped) {
+                EmitPatch(cheat_lines_, i, line.address + offset, [&](u32 at, u32 word, u32 size) {
+                    if (size == 3) {
+                        Write(target, at, word, 2);
+                        Write(target, at + 2, word >> 16, 1);
+                    } else {
+                        Write(target, at, word, size);
+                    }
+                });
+            }
+            i += PatchLines(cheat_lines_, i);
+            continue;
+        }
+        if (skipped) continue;
+
+        switch (type) {
+        case Type::Write32: case Type::Write16: case Type::Write8:
+            Write(target, offset + line.address, line.value, WriteWidth(type));
             break;
-        case CheatType::Write32:
-            // 0XXXXXXX YYYYYYYY - word[XXXXXXX+offset] = YYYYYYYY
-            WriteOp<u32>(line, state, target);
+        case Type::LoadOffset: offset = target.Read32(offset + line.address); break;
+        case Type::Loop: loop_start = i; repeats = line.value; break;
+        case Type::SetOffset: offset = line.value; break;
+        case Type::AddOffset: offset += line.value; break;
+        case Type::AddValue: data += line.value; break;
+        case Type::SetValue: data = line.value; break;
+        case Type::IncrementiveWrite32: case Type::IncrementiveWrite16: case Type::IncrementiveWrite8: {
+            const u32 width = WriteWidth(type);
+            Write(target, offset + line.value, data, width);
+            offset += width;
             break;
-        case CheatType::Write16:
-            // 1XXXXXXX 0000YYYY - half[XXXXXXX+offset] = YYYY
-            WriteOp<u16>(line, state, target);
-            break;
-        case CheatType::Write8:
-            // 2XXXXXXX 000000YY - byte[XXXXXXX+offset] = YY
-            WriteOp<u8>(line, state, target);
-            break;
-        case CheatType::GreaterThan32:
-            // 3XXXXXXX YYYYYYYY - execute next block IF YYYYYYYY > word[XXXXXXX]   ;unsigned
-            CompOp<u32>(line, state, target, [&line](u32 val) { return line.value > val; });
-            break;
-        case CheatType::LessThan32:
-            // 4XXXXXXX YYYYYYYY - execute next block IF YYYYYYYY < word[XXXXXXX]   ;unsigned
-            CompOp<u32>(line, state, target, [&line](u32 val) { return line.value < val; });
-            break;
-        case CheatType::EqualTo32:
-            // 5XXXXXXX YYYYYYYY - execute next block IF YYYYYYYY == word[XXXXXXX]   ;unsigned
-            CompOp<u32>(line, state, target, [&line](u32 val) { return line.value == val; });
-            break;
-        case CheatType::NotEqualTo32:
-            // 6XXXXXXX YYYYYYYY - execute next block IF YYYYYYYY != word[XXXXXXX]   ;unsigned
-            CompOp<u32>(line, state, target, [&line](u32 val) { return line.value != val; });
-            break;
-        case CheatType::GreaterThan16WithMask:
-            // 7XXXXXXX ZZZZYYYY - execute next block IF YYYY > ((not ZZZZ) AND half[XXXXXXX])
-            CompOp<u16>(line, state, target, [&line](u16 val) {
-                return static_cast<u16>(line.value) > (static_cast<u16>(~line.value >> 16) & val);
-            });
-            break;
-        case CheatType::LessThan16WithMask:
-            // 8XXXXXXX ZZZZYYYY - execute next block IF YYYY < ((not ZZZZ) AND half[XXXXXXX])
-            CompOp<u16>(line, state, target, [&line](u16 val) {
-                return static_cast<u16>(line.value) < (static_cast<u16>(~line.value >> 16) & val);
-            });
-            break;
-        case CheatType::EqualTo16WithMask:
-            // 9XXXXXXX ZZZZYYYY - execute next block IF YYYY = ((not ZZZZ) AND half[XXXXXXX])
-            CompOp<u16>(line, state, target, [&line](u16 val) {
-                return static_cast<u16>(line.value) == (static_cast<u16>(~line.value >> 16) & val);
-            });
-            break;
-        case CheatType::NotEqualTo16WithMask:
-            // AXXXXXXX ZZZZYYYY - execute next block IF YYYY <> ((not ZZZZ) AND half[XXXXXXX])
-            CompOp<u16>(line, state, target, [&line](u16 val) {
-                return static_cast<u16>(line.value) != (static_cast<u16>(~line.value >> 16) & val);
-            });
-            break;
-        case CheatType::LoadOffset:
-            // BXXXXXXX 00000000 - offset = word[XXXXXXX+offset]
-            LoadOffsetOp(target, line, state);
-            break;
-        case CheatType::Loop:
-            // C0000000 YYYYYYYY - LOOP next block YYYYYYYY times
-            LoopOp(line, state);
-            break;
-        case CheatType::Terminator:
-            // D0000000 00000000 - END IF
-            TerminateOp(state);
-            break;
-        case CheatType::LoopExecuteVariant:
-            // D1000000 00000000 - END LOOP
-            LoopExecuteVariantOp(state);
-            break;
-        case CheatType::FullTerminator:
-            // D2000000 00000000 - NEXT & Flush
-            FullTerminateOp(state);
-            break;
-        case CheatType::SetOffset:
-            // D3000000 XXXXXXXX - Sets the offset to XXXXXXXX
-            state.offset = line.value;
-            break;
-        case CheatType::AddValue:
-            // D4000000 XXXXXXXX - reg += XXXXXXXX
-            state.reg += line.value;
-            break;
-        case CheatType::SetValue:
-            // D5000000 XXXXXXXX - reg = XXXXXXXX
-            state.reg = line.value;
-            break;
-        case CheatType::IncrementiveWrite32:
-            // D6000000 XXXXXXXX - (32bit) [XXXXXXXX+offset] = reg ; offset += 4
-            IncrementiveWriteOp<u32>(line, state, target);
-            break;
-        case CheatType::IncrementiveWrite16:
-            // D7000000 XXXXXXXX - (16bit) [XXXXXXXX+offset] = reg & 0xffff ; offset += 2
-            IncrementiveWriteOp<u16>(line, state, target);
-            break;
-        case CheatType::IncrementiveWrite8:
-            // D8000000 XXXXXXXX - (8bit) [XXXXXXXX+offset] = reg & 0xff ; offset++
-            IncrementiveWriteOp<u8>(line, state, target);
-            break;
-        case CheatType::Load32:
-            // D9000000 XXXXXXXX - reg = [XXXXXXXX+offset]
-            LoadOp<u32>(line, state, target);
-            break;
-        case CheatType::Load16:
-            // DA000000 XXXXXXXX - reg = [XXXXXXXX+offset] & 0xFFFF
-            LoadOp<u16>(line, state, target);
-            break;
-        case CheatType::Load8:
-            // DB000000 XXXXXXXX - reg = [XXXXXXXX+offset] & 0xFF
-            LoadOp<u8>(line, state, target);
-            break;
-        case CheatType::AddOffset:
-            // DC000000 XXXXXXXX - offset + XXXXXXXX
-            state.offset += line.value;
-            break;
-        case CheatType::Joker:
-            // DD000000 XXXXXXXX - if KEYPAD has value XXXXXXXX execute next block
-            JokerOp(line, state, target);
-            break;
-        case CheatType::Patch:
-            // EXXXXXXX YYYYYYYY - copies YYYYYYYY bytes from (current code location + 8) to [XXXXXXXX + offset]
-            PatchOp(line, state, target, cheat_lines_);
-            break;
+        }
+        case Type::Load32: data = Read(target, offset + line.value, 4); break;
+        case Type::Load16: data = Read(target, offset + line.value, 2); break;
+        case Type::Load8: data = Read(target, offset + line.value, 1); break;
+        default: break;
         }
     }
 }
 
 std::string GatewayCheat::GetCode() const {
-    std::string result;
-    for (const CheatLine& line : cheat_lines_) {
-        result += line.cheat_line + '\n';
+    std::string code;
+    for (const auto& line : cheat_lines_) {
+        code += line.cheat_line;
+        code += '\n';
     }
-    return result;
+    return code;
 }
 
 std::size_t GatewayCheat::InvalidLines() const {
-    return static_cast<std::size_t>(
-        std::count_if(cheat_lines_.begin(), cheat_lines_.end(), [](const CheatLine& l) { return !l.valid; }));
+    return static_cast<std::size_t>(std::count_if(cheat_lines_.begin(), cheat_lines_.end(),
+                                                  [](const auto& line) { return !line.valid; }));
 }
 
 bool GatewayCheat::TouchesCode(u32 begin, u32 end) const {
-    // The offset as the lines set it; unknown after one loaded from memory (B, the Patch's own offset).
-    std::optional<u32> offset = 0;
-    const auto lands = [&](u32 address, u32 size) {
-        if (!offset) {
-            return false;
-        }
-        const u64 at = static_cast<u64>(address) + *offset;
-        return at < end && at + size > begin;
-    };
-    for (std::size_t i = 0; i < cheat_lines_.size(); ++i) {
-        const CheatLine& line = cheat_lines_[i];
-        switch (line.type) {
-        case CheatType::Write32:
-            if (lands(line.address, 4)) return true;
-            break;
-        case CheatType::Write16:
-            if (lands(line.address, 2)) return true;
-            break;
-        case CheatType::Write8:
-            if (lands(line.address, 1)) return true;
-            break;
-        case CheatType::Patch:
-            if (lands(line.address, std::max<u32>(line.value, 1))) return true;
-            i += static_cast<std::size_t>(std::ceil(line.value / 8.0));  // (its data lines are no codes)
-            break;
-        case CheatType::IncrementiveWrite32:
-        case CheatType::IncrementiveWrite16:
-        case CheatType::IncrementiveWrite8: {
-            const u32 size = line.type == CheatType::IncrementiveWrite32 ? 4 : line.type == CheatType::IncrementiveWrite16 ? 2 : 1;
-            if (lands(line.value, size)) return true;
-            if (offset) *offset += size;
-            break;
-        }
-        case CheatType::LoadOffset:
-            offset.reset();
-            break;
-        case CheatType::SetOffset:
-            offset = line.value;
-            break;
-        case CheatType::AddOffset:
-            if (offset) *offset += line.value;
-            break;
-        case CheatType::FullTerminator:
-            offset = 0;
-            break;
-        default:
-            break;
-        }
-    }
-    return false;
+    return ScanWrites(cheat_lines_, begin, end, nullptr, nullptr);
 }
 
 bool GatewayCheat::CodeWrites(u32 begin, u32 end, std::map<u32, u8>* bytes, std::string* why) const {
-    u32 offset = 0;
-    bool offset_known = true;  // (false after B: an offset read from memory, until D3 or D2 sets one again)
-    int conditions = 0;        // (open conditions and buttons: D0 closes one, D2 all)
-    bool loop = false;         // (C0 up to D1 or D2)
-    std::string blocked;
-    const auto put = [&](u32 address, u32 value, u32 size) {
-        for (u32 i = 0; i < size; ++i) {
-            const u64 at = static_cast<u64>(address) + i;
-            if (at < begin || at >= end) continue;
-            if (!offset_known) {
-                blocked = "loaded_offset";
-                return false;
-            }
-            if (conditions > 0 || loop) {
-                blocked = "conditional";
-                return false;
-            }
-            (*bytes)[static_cast<u32>(at)] = static_cast<u8>(value >> (8 * i));
-        }
-        return true;
-    };
-    bool ok = true;
-    for (std::size_t i = 0; i < cheat_lines_.size() && ok; ++i) {
-        const CheatLine& line = cheat_lines_[i];
-        switch (line.type) {
-        case CheatType::Write32: ok = put(line.address + offset, line.value, 4); break;
-        case CheatType::Write16: ok = put(line.address + offset, line.value, 2); break;
-        case CheatType::Write8: ok = put(line.address + offset, line.value, 1); break;
-        case CheatType::Patch: {  // (its bytes: the next lines' words in turn, as PatchOp reads them)
-            const u32 address = line.address + offset;
-            std::size_t nr = i + 1;
-            bool first = true;
-            for (u32 n = 0; n < line.value && ok && nr < cheat_lines_.size(); n += 4) {
-                const u32 word = first ? cheat_lines_[nr].first : cheat_lines_[nr].value;
-                ok = put(address + n, word, std::min<u32>(4, line.value - n));
-                if (!first) ++nr;
-                first = !first;
-            }
-            i += static_cast<std::size_t>(std::ceil(line.value / 8.0));
-            break;
-        }
-        case CheatType::SetOffset: offset = line.value, offset_known = true; break;
-        case CheatType::AddOffset: offset += line.value; break;
-        case CheatType::LoadOffset: offset_known = false; break;
-        case CheatType::FullTerminator: offset = 0, offset_known = true, conditions = 0, loop = false; break;
-        case CheatType::Terminator: conditions = conditions > 0 ? conditions - 1 : 0; break;
-        case CheatType::LoopExecuteVariant: loop = false; break;
-        case CheatType::Loop: loop = true; break;
-        case CheatType::GreaterThan32: case CheatType::LessThan32: case CheatType::EqualTo32: case CheatType::NotEqualTo32:
-        case CheatType::GreaterThan16WithMask: case CheatType::LessThan16WithMask: case CheatType::EqualTo16WithMask:
-        case CheatType::NotEqualTo16WithMask: case CheatType::Joker:
-            ++conditions;
-            break;
-        case CheatType::IncrementiveWrite32: case CheatType::IncrementiveWrite16: case CheatType::IncrementiveWrite8: {
-            const u32 size = line.type == CheatType::IncrementiveWrite32 ? 4 : line.type == CheatType::IncrementiveWrite16 ? 2 : 1;
-            const u64 at = static_cast<u64>(line.value) + offset;
-            if (at < end && at + size > begin) {  // (the register's value: read from memory or added up at run time)
-                blocked = "register";
-                ok = false;
-            }
-            offset += size;
-            break;
-        }
-        default:
-            break;
-        }
-    }
-    if (!ok || bytes->empty()) {
-        if (why) *why = !ok ? blocked : "none";
-        bytes->clear();
-        return false;
-    }
-    return true;
+    std::map<u32, u8> discarded;
+    return ScanWrites(cheat_lines_, begin, end, bytes ? bytes : &discarded, why);
 }
 
 std::string GatewayCheat::ToString() const {
-    std::string result;
-    result += '[' + name_ + "]\n";
-    if (IsEnabled()) {
-        result += kEnabledText;
-        result += '\n';
-    }
-    for (const std::string& comment_line : SplitString(comments_, '\n')) {
-        result += "*" + comment_line + '\n';
-    }
-    result += GetCode() + '\n';
-    return result;
+    std::string text = "[" + name_ + "]\n";
+    if (IsEnabled()) text += std::string(kEnabledText) + '\n';
+    std::istringstream comments(comments_);
+    for (std::string line; std::getline(comments, line);) text += '*' + line + '\n';
+    return text + GetCode() + '\n';
 }
 
 std::vector<std::shared_ptr<GatewayCheat>> GatewayCheat::Parse(const std::string& text) {
+    constexpr std::string_view bom = "\xEF\xBB\xBF";
+    std::istringstream input(text.starts_with(bom) ? text.substr(bom.size()) : text);
     std::vector<std::shared_ptr<GatewayCheat>> cheats;
-    std::istringstream file(text);
-    std::string comments;
-    std::vector<CheatLine> cheat_lines;
     std::string name;
+    std::string comments;
+    std::vector<Line> lines;
     bool enabled = false;
-
-    std::string line;
-    bool first_line = true;
-    while (std::getline(file, line)) {
-        line.erase(std::remove(line.begin(), line.end(), '\0'), line.end());
-        if (first_line && line.rfind("\xEF\xBB\xBF", 0) == 0) line.erase(0, 3);  // (a UTF-8 file's mark: Notepad's)
-        first_line = false;
-        line = StripSpaces(line);  // remove spaces at front and end
-        if (line.length() >= 2 && line.front() == '[') {
-            if (!cheat_lines.empty()) {
-                cheats.push_back(std::make_shared<GatewayCheat>(name, cheat_lines, comments));
-                cheats.back()->SetEnabled(enabled);
-                enabled = false;
+    bool have_name = false;
+    const auto finish = [&] {
+        if (have_name && !lines.empty()) {
+            auto cheat = std::make_shared<GatewayCheat>(name, std::move(lines), std::move(comments));
+            cheat->SetEnabled(enabled);
+            cheats.push_back(std::move(cheat));
+        }
+        lines.clear();
+        comments.clear();
+        enabled = false;
+    };
+    for (std::string raw; std::getline(input, raw);) {
+        auto line = Trim(raw);
+        if (line.empty()) continue;
+        if (line.front() == '[') {
+            if (const auto end = line.find(']'); end != line.npos) {
+                finish();
+                name = line.substr(1, end - 1);
+                have_name = true;
+                continue;
             }
-            // (up to its last ']': "[Name] // by someone" is Name)
-            const std::size_t close = line.rfind(']');
-            name = close != std::string::npos && close > 0 ? line.substr(1, close - 1) : line.substr(1, line.length() - 2);
-            cheat_lines.clear();
-            comments.erase();
-        } else if (!line.empty() && line.front() == '*') {
-            if (line == kEnabledText) {
-                enabled = true;
+        }
+        if (!have_name) continue;
+        if (line == kEnabledText) {
+            enabled = true;
+        } else if (line.starts_with('*') || line.starts_with('#') || line.starts_with("//") ||
+                   (line.starts_with('{') && line.ends_with('}'))) {
+            if (line.starts_with('{')) {
+                line = Trim(line.substr(1, line.size() - 2));
+            } else if (line.starts_with('*')) {
+                line.remove_prefix(1);
             } else {
-                comments += line.substr(1, line.length() - 1) + '\n';
+                line = Trim(line.substr(line.starts_with("//") ? 2 : 1));
             }
-        } else if (!line.empty() && (line.front() == '{' || line.front() == '#' || line.rfind("//", 0) == 0)) {
-            // a note: CTRPF's "{...}", or a comment the lists add; kept as a comment (Azahar's are '*' lines)
-            std::string note = line.front() == '{' ? line.substr(1, line.length() - (line.back() == '}' ? 2 : 1))
-                                                   : line.substr(line.front() == '#' ? 1 : 2);
-            comments += StripSpaces(note) + '\n';
-        } else if (!line.empty()) {
-            const std::optional<std::string> code = NormalizeCodeLine(line);
-            cheat_lines.emplace_back(code ? *code : line);
+            comments.append(line);
+            comments += '\n';
+        } else {
+            lines.emplace_back(std::string(line));
         }
     }
-    if (!cheat_lines.empty()) {
-        cheats.push_back(std::make_shared<GatewayCheat>(name, cheat_lines, comments));
-        cheats.back()->SetEnabled(enabled);
-    }
+    finish();
     return cheats;
 }
 
 std::vector<std::shared_ptr<GatewayCheat>> GatewayCheat::LoadFile(const std::string& path) {
-    std::ifstream file(utf8::PathFromUtf8(path), std::ios::binary);
-    if (!file) {
-        return {};
-    }
-    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    return Parse(text);
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return {};
+    std::ostringstream text;
+    text << input.rdbuf();
+    return Parse(text.str());
 }
 
-}  // namespace mh4n::cheats
+} // namespace mh4n::cheats

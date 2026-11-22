@@ -1,80 +1,84 @@
-// The game clock and the two time sources (N1-06). Our own code; the only thing taken from Azahar is
-// the tick rate (BASE_CLOCK_RATE_ARM11 of core/core_timing.h, a hardware constant).
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: clock.h, scheduler_test.cpp, determinism_test.cpp and kernel_usage.md.
+
 #include "mh4n/clock.h"
 
 #include <algorithm>
+#include <limits>
 
-#include "mh4n/assert.h"
+#include "deterministic.h"
 
 namespace mh4n {
+namespace {
 
-// ---- SteadyTimeSource --------------------------------------------------------------------------------
+s64 AddHostTime(s64 base, u64 delta) {
+    const u64 room = static_cast<u64>(std::numeric_limits<s64>::max()) - static_cast<u64>(base);
+    if (delta > room) {
+        return std::numeric_limits<s64>::max();
+    }
+    return static_cast<s64>(static_cast<u64>(base) + delta);
+}
+
+}  // namespace
 
 s64 SteadyTimeSource::NowNs() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                                epoch_)
-        .count();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - epoch_).count();
 }
 
 bool SteadyTimeSource::WaitUntil(std::condition_variable& cv, std::unique_lock<std::mutex>& lock,
                                  std::optional<s64> deadline_ns, const std::function<bool()>& pred) {
-    if (!deadline_ns) {
-        cv.wait(lock, pred);
-        return true;
+    if (deadline_ns) {
+        const auto room = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::time_point::max() - epoch_).count();
+        const auto deadline = epoch_ + std::chrono::nanoseconds(std::clamp(*deadline_ns, s64{0}, room));
+        return cv.wait_until(lock, deadline, pred);
     }
-    return cv.wait_until(lock, epoch_ + std::chrono::nanoseconds(*deadline_ns), pred);
+    cv.wait(lock, pred);
+    return true;
 }
-
-// ---- ManualTimeSource --------------------------------------------------------------------------------
 
 bool ManualTimeSource::WaitUntil(std::condition_variable& cv, std::unique_lock<std::mutex>& lock,
                                  std::optional<s64> deadline_ns, const std::function<bool()>& pred) {
-    if (pred()) {
-        return true;
-    }
     if (!deadline_ns) {
         cv.wait(lock, pred);
         return true;
     }
-    // Nothing else can happen before the deadline in a simulation: skip the idle time.
-    s64 now = now_.load(std::memory_order_acquire);
-    while (now < *deadline_ns && !now_.compare_exchange_weak(now, *deadline_ns)) {
+    if (!pred() && NowNs() < *deadline_ns) {
+        lock.unlock();
+        Set(*deadline_ns);
+        lock.lock();
     }
     return pred();
 }
 
 void ManualTimeSource::Advance(s64 ns) {
-    MH4N_ASSERT(ns >= 0, "ManualTimeSource::Advance({})", ns);
-    now_.fetch_add(ns, std::memory_order_acq_rel);
-    if (hook_) {
-        hook_();
-    }
+    Set(AddHostTime(NowNs(), static_cast<u64>(std::max(ns, s64{0}))));
 }
 
 void ManualTimeSource::Set(s64 ns) {
-    MH4N_ASSERT(ns >= now_.load(), "ManualTimeSource::Set({}) goes backwards", ns);
-    now_.store(ns, std::memory_order_release);
+    s64 previous = now_.load(std::memory_order_relaxed);
+    while (previous < ns &&
+           !now_.compare_exchange_weak(previous, ns, std::memory_order_release, std::memory_order_relaxed)) {
+    }
     if (hook_) {
         hook_();
     }
 }
 
-// ---- GameClock ---------------------------------------------------------------------------------------
-
-GameClock::GameClock(TimeSource& source) : source_(source), base_host_ns_(source.NowNs()) {}
+GameClock::GameClock(TimeSource& source)
+    : source_(source), base_host_ns_(dynamic_cast<VirtualTimeSource*>(&source) ? 0 : source.NowNs()) {}
 
 u64 GameClock::NowLocked() const {
-    if (!running_) {
-        return base_ticks_;
+    u64 tick = base_ticks_;
+    if (running_) {
+        const s64 now = source_.NowNs();
+        if (now > base_host_ns_) {
+            tick += NsToTicks(static_cast<u64>(now) - static_cast<u64>(base_host_ns_));
+        }
     }
-    const s64 elapsed = std::max<s64>(source_.NowNs() - base_host_ns_, 0);
-    // base + elapsed: NsToTicks saturates, so does the sum.
-    const u64 ticks = NsToTicks(static_cast<u64>(elapsed));
-    u64 now = base_ticks_ + ticks;
-    if (now < base_ticks_) {
-        now = ~u64{0};
-    }
-    return limit_ ? std::min(now, *limit_) : now;
+    return limit_ ? std::min(tick, *limit_) : tick;
 }
 
 u64 GameClock::Now() const {
@@ -83,19 +87,14 @@ u64 GameClock::Now() const {
 }
 
 void GameClock::Snapshot() {
-    base_ticks_ = NowLocked();
-    base_host_ns_ = source_.NowNs();
-}
-
-void GameClock::Notify() {
-    std::function<void()> callback;
-    {
-        std::lock_guard lock(mutex_);
-        callback = on_change_;
+    const s64 now = source_.NowNs();
+    if (running_ && now > base_host_ns_) {
+        base_ticks_ += NsToTicks(static_cast<u64>(now) - static_cast<u64>(base_host_ns_));
+        if (limit_) {
+            base_ticks_ = std::min(base_ticks_, *limit_);
+        }
     }
-    if (callback) {
-        callback();
-    }
+    base_host_ns_ = now;
 }
 
 void GameClock::Pause() {
@@ -116,8 +115,8 @@ void GameClock::Resume() {
         if (running_) {
             return;
         }
+        Snapshot();
         running_ = true;
-        base_host_ns_ = source_.NowNs();  // the paused time is dropped
     }
     Notify();
 }
@@ -130,8 +129,14 @@ bool GameClock::Paused() const {
 void GameClock::Hold(u64 until_tick) {
     {
         std::lock_guard lock(mutex_);
-        Snapshot();  // the time that already stood still at an older limit is dropped here
-        limit_ = std::max(until_tick, base_ticks_);
+        const u64 limit = std::max(until_tick, NowLocked());
+        if (limit_ == limit) {
+            return;
+        }
+        if (limit_ && NowLocked() == *limit_) {
+            Snapshot();
+        }
+        limit_ = limit;
     }
     Notify();
 }
@@ -142,10 +147,23 @@ void GameClock::ReleaseHold() {
         if (!limit_) {
             return;
         }
-        Snapshot();
+        if (NowLocked() == *limit_) {
+            Snapshot();
+        }
         limit_.reset();
     }
     Notify();
+}
+
+std::optional<s64> GameClock::HostNsFor(u64 tick) const {
+    std::lock_guard lock(mutex_);
+    if (tick <= NowLocked()) {
+        return source_.NowNs();
+    }
+    if (!running_ || (limit_ && tick > *limit_)) {
+        return std::nullopt;
+    }
+    return AddHostTime(base_host_ns_, TicksToNsCeil(tick - base_ticks_));
 }
 
 std::optional<u64> GameClock::HeldAt() const {
@@ -153,26 +171,20 @@ std::optional<u64> GameClock::HeldAt() const {
     return limit_;
 }
 
-std::optional<s64> GameClock::HostNsFor(u64 tick) const {
-    std::lock_guard lock(mutex_);
-    const u64 now = NowLocked();
-    if (tick <= now) {
-        return source_.NowNs();
-    }
-    if (!running_ || (limit_ && tick > *limit_)) {
-        return std::nullopt;
-    }
-    // base_host + the least time that covers (tick - base) ticks; the host nanoseconds are s64.
-    const u64 dt_ns = TicksToNsCeil(tick - base_ticks_);
-    if (dt_ns > static_cast<u64>(INT64_MAX - base_host_ns_)) {
-        return std::nullopt;
-    }
-    return base_host_ns_ + static_cast<s64>(dt_ns);
-}
-
 void GameClock::SetChangeCallback(std::function<void()> callback) {
     std::lock_guard lock(mutex_);
     on_change_ = std::move(callback);
+}
+
+void GameClock::Notify() {
+    std::function<void()> callback;
+    {
+        std::lock_guard lock(mutex_);
+        callback = on_change_;
+    }
+    if (callback) {
+        callback();
+    }
 }
 
 }  // namespace mh4n

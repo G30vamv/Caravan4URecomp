@@ -207,14 +207,14 @@ void Recorder::CopyBufferToImage(const Buffer& src, Image& dst, std::span<const 
     Transition(r, img, RenderTextureLayout::GENERAL);
 }
 
-void Recorder::CopyImageToBuffer(const Image& src, Buffer& dst, std::span<const BufferImageRegion> regions) {
+void Recorder::CopyImageToBuffer(const Image& src, Buffer& dst, std::span<const BufferImageRegion> regions, bool keep_general) {
     Impl& r = *impl_;
     Image::Impl& img = src.impl();
     Settle(r);
     Acquire(r, img);
     RHI_TARGETS_REQUIRE(HasUsage(dst.Usage(), BufferUsage::Transfer) && dst.GetHeap() != Heap::Upload,
                         "CopyImageToBuffer needs a Transfer buffer that is not in the Upload heap");
-    Transition(r, img, RenderTextureLayout::COPY_SOURCE);
+    if (!keep_general) Transition(r, img, RenderTextureLayout::COPY_SOURCE);
     std::vector<VkBufferImageCopy> copies;
     for (const BufferImageRegion& region : regions) {
         CheckMip(img, region.mip_level, region.layer);
@@ -235,7 +235,8 @@ void Recorder::CopyImageToBuffer(const Image& src, Buffer& dst, std::span<const 
         reuse.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &reuse, 0,
                              nullptr, 0, nullptr);
-        vkCmdCopyImageToBuffer(commands, img.vulkan()->vk, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.impl().vulkan()->vk,
+        const auto layout = keep_general ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        vkCmdCopyImageToBuffer(commands, img.vulkan()->vk, layout, dst.impl().vulkan()->vk,
                                static_cast<u32>(copies.size()), copies.data());
         // The copy's writes are visible to the host once the submission has completed (as ReadBuffer does it).
         VkMemoryBarrier host = {};
@@ -245,7 +246,7 @@ void Recorder::CopyImageToBuffer(const Image& src, Buffer& dst, std::span<const 
         vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0,
                              nullptr);
     }
-    Transition(r, img, RenderTextureLayout::GENERAL);
+    if (!keep_general) Transition(r, img, RenderTextureLayout::GENERAL);
 }
 
 // ---- Passes ---------------------------------------------------------------------------------------

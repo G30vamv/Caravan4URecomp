@@ -179,6 +179,9 @@ struct Options {
     float skip_end_hold = 1.0f;  // skip_end_hold / MH4U_SKIP_END_HOLD: seconds they are held
     u32 skip_panel = 0xb;   // skip_panel: the touch-screen button whose tap the skip button makes
                             // (the panel manager's Skip, 0xb, as the stylus's tap on it shows)
+    u32 skip_panel_scene = 11;  // MODIFIED: skip_panel_scene: the button the skip press taps when the post-quest wait is not on
+                            // (a monster's death scene: the real Skip is panel 11 too, handled at 009DC488); skip_anywhere = 0 turns that off
+    bool skip_anywhere = true;
     int skip_hint = 1;      // skip_hint / MH4U_SKIP_HINT: 0 off, 1 a hint on screen, 2 flashing
     ScreenOverlay touch_overlay;  // touch_overlay / MH4U_TOUCH_OVERLAY (custom layout)
     PanelView quest_overlay{true};   // quest_overlay / MH4U_QUEST_OVERLAY: in quests, the map
@@ -376,6 +379,10 @@ void Set(Options& o, const std::string& key, const std::string& value) {
         o.skip_end_hold = std::clamp(std::strtof(value.c_str(), nullptr), 0.2f, 10.0f);
     } else if (key == "skip_panel") {
         o.skip_panel = static_cast<u32>(std::clamp(std::strtol(value.c_str(), nullptr, 0), 0L, 0xffL));
+    } else if (key == "skip_panel_scene") {
+        o.skip_panel_scene = static_cast<u32>(std::clamp(std::strtol(value.c_str(), nullptr, 0), 0L, 0xffL));
+    } else if (key == "skip_anywhere") {
+        o.skip_anywhere = IsOn(value);
     } else if (key == "skip_hint") {
         o.skip_hint = IsOff(value) ? 0 : value == "flash" ? 2 : 1;
     } else if (key == "touch_overlay") {
@@ -639,6 +646,8 @@ Steady steady;
 u64 limiter_done_ns = 0;   // when the limiter last let a frame go (limiter_sleep)
 u64 sleep_late_ns = 300000;  // how late the sleeps wake up, a slow average (the margin left to the limiter's spin)
 
+std::atomic<u64> game_frame_total{0};  // MODIFIED: GameFrameCount
+
 /// sMain::updateFrameTiming(this): the frame limiter. Delta time is counted in 1/60 s
 /// whatever the cap, and gameplay scales with it, so the cap is what limits the frame rate.
 ///
@@ -657,6 +666,19 @@ u64 sleep_late_ns = 300000;  // how late the sleeps wake up, a slow average (the
 void UpdateFrameTiming(RCtx* ctx, RFunc original) {
     PACE_MARK(kLimiterIn, 0);
     const u32 cap_addr = ctx->r[0] + SMAIN_CAP;
+    {   // MODIFIED: how many game frames the limiter really lets through (the app's counter shows the screen's refreshes)
+        static u64 window_start = 0, window_frames = 0;
+        game_frame_total.fetch_add(1, std::memory_order_relaxed);
+        const u64 t = HostNs();
+        if (window_start == 0) window_start = t;
+        ++window_frames;
+        if (t - window_start >= 10000000000ull) {
+            LogInfo("limiter: {:.1f} game frames a second over {:.1f} s (cap {})", window_frames * 1e9 / static_cast<double>(t - window_start),
+                    static_cast<double>(t - window_start) / 1e9, options.fps_cap);
+            window_start = t;
+            window_frames = 0;
+        }
+    }
     const float cap = options.fps_cap > 0 ? options.fps_cap : ReadF32(ctx, cap_addr);
     u64 vb_next = 0, vb_period = 0;
     const bool grid = options.pace_vblank && VBlankGrid(vb_next, vb_period);
@@ -1261,6 +1283,8 @@ constexpr u32 AQUEST_END_REWARDS = 3;     // that stage once the rewards are up 
 constexpr u32 QUEST_STATE_PHASE = 0x24;   // u8 in the state block: 0 playing, 1 waiting, then over
 constexpr u8 QUEST_PHASE_WAITING = 1;
 std::atomic<bool> skip_offered{false};   // SkipOffered()
+// MODIFIED: the touch-screen button the skip press taps: the post-quest wait's (skip_panel) while it is offered, else the scene's
+u32 SkipPanel() { return skip_offered.load(std::memory_order_relaxed) ? options.skip_panel : options.skip_panel_scene; }
 bool skip_held = false;                  // the skip button, last frame
 int skip_tap = 0;                        // frames of the tap left: 3 pressed, 2 held, 1 released
 bool skip_tap_direct = false;            // the tap couldn't go through the hit test: write
@@ -1301,13 +1325,17 @@ void PanelTouchAllowed(RCtx* ctx, RFunc original) {
     if (!from_process_touch || skip_tap == 0) {
         return;
     }
-    const int index = PanelIndex(ctx, options.skip_panel);
+    const int index = PanelIndex(ctx, SkipPanel());
     if (index < 0) {
+        if (!skip_offered.load(std::memory_order_relaxed)) {  // MODIFIED: a scene skip with no such button on this screen: nothing to tap
+            skip_tap = 0;
+            return;
+        }
         // no such button on this touch screen: the direct write after processTouch instead
         const u32 mode = rd8(ctx, PANEL_MANAGER + PANEL_MODE);
         LogInfo("skip: no hit index is button {} (mode {}: slots {} {} {} {}, their panels {} {} {} {}); the tap "
                 "is written after processTouch instead",
-                options.skip_panel, mode, rd32(ctx, PANEL_ID_TABLES + mode * 16) & 0xFF,
+                SkipPanel(), mode, rd32(ctx, PANEL_ID_TABLES + mode * 16) & 0xFF,
                 rd32(ctx, PANEL_ID_TABLES + mode * 16 + 4) & 0xFF, rd32(ctx, PANEL_ID_TABLES + mode * 16 + 8) & 0xFF,
                 rd32(ctx, PANEL_ID_TABLES + mode * 16 + 12) & 0xFF,
                 rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16) & 0xFF)),
@@ -1321,7 +1349,7 @@ void PanelTouchAllowed(RCtx* ctx, RFunc original) {
     const u32 hit = static_cast<u32>(index) | flags;
     ctx->r[5] = hit;
     LogInfo("skip: {} the touch screen's button {} (hit {:04X}, touches {})",
-            skip_tap == 3 ? "pressing" : skip_tap == 2 ? "holding" : "releasing", options.skip_panel, hit,
+            skip_tap == 3 ? "pressing" : skip_tap == 2 ? "holding" : "releasing", SkipPanel(), hit,
             ctx->r[0] ? "allowed" : "not allowed");
     --skip_tap;
 }
@@ -1333,10 +1361,10 @@ void PanelProcessTouch(RCtx* ctx, RFunc original) {
         skip_tap_direct = false;
         skip_tap = 0;
         skip_tap_seen = false;
-        wr8(ctx, PANEL_MANAGER + PANEL_ID, options.skip_panel);
+        wr8(ctx, PANEL_MANAGER + PANEL_ID, SkipPanel());
         wr16(ctx, PANEL_MANAGER + PANEL_FLAGS, PANEL_TAP_FLAGS);
         LogInfo("skip: a tap on the touch screen's button {} (written after processTouch)",
-                options.skip_panel);
+                SkipPanel());
         return;
     }
     const bool skipping = skip_offered.load(std::memory_order_relaxed);
@@ -1358,7 +1386,7 @@ void PanelIsTapped(RCtx* ctx, RFunc original) {
     const u32 id = ctx->r[0];
     const u32 caller = ctx->r[14];
     original(ctx);
-    if (id == options.skip_panel && skip_offered.load(std::memory_order_relaxed)) {
+    if (id == SkipPanel() && (skip_offered.load(std::memory_order_relaxed) || skip_tap > 0)) {
         ++skip_polls;
         if (ctx->r[0] != 0 && !skip_tap_seen) {
             skip_tap_seen = true;
@@ -1374,6 +1402,7 @@ void PanelIsTapped(RCtx* ctx, RFunc original) {
 /// sMhPad::update(this): turns pad state and the panels' injected bits into actions.
 /// The kick button injects the kick for the next update, like the touch panel does (the
 /// button keeps its own action too, so pick one the game doesn't use).
+std::atomic<bool> host_skip{false};  // MODIFIED: SetHostSkip: the shell's skip key (Tab), a skip press that is no 3DS button
 std::atomic<u32> host_triggers{0};  // SetHostTriggers: ZL 0x400 and ZR 0x800, as the held word has them
 
 void ItemBarHold(RCtx* ctx);  // (the item bar by touch, below)
@@ -1438,8 +1467,8 @@ void MhPadUpdate(RCtx* ctx, RFunc original) {
     // rest of the combo is held (a combo that includes this button is the end, not the skip)
     const u32 rest = combo & ~options.skip_button;
     const bool rest_held = rest && (held & rest) == rest;
-    const bool skip_now = options.skip_button && (held & options.skip_button);
-    if (skip_now && !skip_held && offered && !rest_held) {
+    const bool skip_now = (options.skip_button && (held & options.skip_button)) || host_skip.load(std::memory_order_relaxed);
+    if (skip_now && !skip_held && (offered || options.skip_anywhere) && !rest_held) {
         skip_tap = 3;
         skip_tap_seen = false;
         LogInfo("skip: {} pressed", PadName(options.skip_button));
@@ -3276,6 +3305,14 @@ void ClearCameraTurn() {
     camera_turn_yaw = camera_turn_pitch = 0.0;
 }
 
+unsigned long long GameFrameCount() {
+    return game_frame_total.load(std::memory_order_relaxed);
+}
+
+void SetHostSkip(bool down) {
+    host_skip.store(down, std::memory_order_relaxed);
+}
+
 void SetHostTriggers(bool zl, bool zr) {
     host_triggers.store((zl ? PadBit("ZL") : 0u) | (zr ? PadBit("ZR") : 0u), std::memory_order_relaxed);
 }
@@ -3385,7 +3422,7 @@ bool SetOption(const std::string& key, const std::string& value) {
     static constexpr std::string_view live[] = {
         "fps", "refresh_rate", "max_refresh", "steady", "dither", "stereo_3d", "antialiasing", "fov", "render_flags_set", "render_flags_clear",
         "kick",
-        "target", "skip", "skip_panel", "skip_hint", "skip_end", "skip_end_hold", "touch_overlay",
+        "target", "skip", "skip_panel", "skip_panel_scene", "skip_anywhere", "skip_hint", "skip_end", "skip_end_hold", "touch_overlay",
         "quest_overlay", "target_overlay",
         "hud_edges", "trace_frames", "trace_layout", "trace_panels", "bloom", "motion_blur",
         "depth_of_field", "radial_blur", "haze", "trace_filters", "trace_state", "item_bar", "hud_probe",

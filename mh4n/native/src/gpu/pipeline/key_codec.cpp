@@ -1,207 +1,135 @@
-// Written for N2-16: nothing is copied from Azahar here.
-#include "gpu/pipeline/key_codec.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: key_codec.h, pipeline_key.h, gpu_pipeline_test and byte output of the shipped codec.
 
-#include <bit>
+#include "key_codec.h"
+
 #include <cstring>
+
+#include "cache_bytes.h"
 
 namespace mh4n::gpu::pipeline {
 namespace {
 
-using native::PipelineKey;
-
-struct Writer {
-    std::vector<u8>& out;
-    void U8(u64 v) { out.push_back(static_cast<u8>(v)); }
-    void U32(u32 v) {
-        for (u32 i = 0; i < 4; ++i) out.push_back(static_cast<u8>(v >> (8 * i)));
+void EncodeState(const rhi::FixedFunctionState& s, std::vector<u8>& out) {
+    out.insert(out.end(), {
+        s.blend_enabled, static_cast<u8>(s.src_color), static_cast<u8>(s.dst_color), static_cast<u8>(s.color_op),
+        static_cast<u8>(s.src_alpha), static_cast<u8>(s.dst_alpha), static_cast<u8>(s.alpha_op), s.color_write_mask,
+        s.logic_op_enabled, static_cast<u8>(s.logic_op), s.depth_test, s.depth_write, static_cast<u8>(s.depth_compare),
+        s.stencil_test,
+    });
+    for (const auto* face : {&s.stencil_front, &s.stencil_back}) {
+        out.insert(out.end(), {
+            static_cast<u8>(face->fail), static_cast<u8>(face->pass), static_cast<u8>(face->depth_fail),
+            static_cast<u8>(face->compare),
+        });
     }
-    void U64(u64 v) {
-        U32(static_cast<u32>(v));
-        U32(static_cast<u32>(v >> 32));
-    }
-};
-
-struct Reader {
-    std::span<const u8> bytes;
-    size_t at = 0;
-    bool ok = true;
-    u8 U8(u32 max) {
-        if (at >= bytes.size()) {
-            ok = false;
-            return 0;
-        }
-        const u8 v = bytes[at++];
-        if (v > max) ok = false;
-        return v;
-    }
-    u32 U32() {
-        if (at + 4 > bytes.size()) {
-            ok = false;
-            return 0;
-        }
-        u32 v = 0;
-        for (u32 i = 0; i < 4; ++i) v |= static_cast<u32>(bytes[at + i]) << (8 * i);
-        at += 4;
-        return v;
-    }
-    u64 U64() {
-        const u64 lo = U32();
-        return lo | (static_cast<u64>(U32()) << 32);
-    }
-};
-
-// The largest value of each enumeration (a value above it is not a key of this build).
-constexpr u32 kMaxFormat = 127;
-constexpr u32 kMaxBlendFactor = static_cast<u32>(rhi::BlendFactor::SrcAlphaSaturate);
-constexpr u32 kMaxBlendOp = static_cast<u32>(rhi::BlendOp::Max);
-constexpr u32 kMaxLogicOp = static_cast<u32>(rhi::LogicOp::OrInverted);
-constexpr u32 kMaxCompareOp = static_cast<u32>(rhi::CompareOp::Always);
-constexpr u32 kMaxStencilOp = static_cast<u32>(rhi::StencilOp::DecrementWrap);
-constexpr u32 kMaxCullMode = static_cast<u32>(rhi::CullMode::Back);
-constexpr u32 kMaxFrontFace = static_cast<u32>(rhi::FrontFace::CounterClockwise);
-constexpr u32 kMaxTopology = static_cast<u32>(rhi::Topology::TriangleFan);
-
-void PutFace(Writer& w, const rhi::StencilFaceState& f) {
-    w.U8(static_cast<u64>(f.fail));
-    w.U8(static_cast<u64>(f.pass));
-    w.U8(static_cast<u64>(f.depth_fail));
-    w.U8(static_cast<u64>(f.compare));
+    out.insert(out.end(), {static_cast<u8>(s.cull), static_cast<u8>(s.front_face), s.depth_bias_enabled});
+    disk::Append(out, std::bit_cast<u32>(s.depth_bias_constant));
+    disk::Append(out, std::bit_cast<u32>(s.depth_bias_slope));
 }
 
-rhi::StencilFaceState GetFace(Reader& r) {
-    rhi::StencilFaceState f;
-    f.fail = static_cast<rhi::StencilOp>(r.U8(kMaxStencilOp));
-    f.pass = static_cast<rhi::StencilOp>(r.U8(kMaxStencilOp));
-    f.depth_fail = static_cast<rhi::StencilOp>(r.U8(kMaxStencilOp));
-    f.compare = static_cast<rhi::CompareOp>(r.U8(kMaxCompareOp));
-    return f;
+rhi::FixedFunctionState DecodeState(disk::Reader& in) {
+    rhi::FixedFunctionState s;
+    s.blend_enabled = in.Flag();
+    s.src_color = in.Enum<rhi::BlendFactor::SrcAlphaSaturate>();
+    s.dst_color = in.Enum<rhi::BlendFactor::SrcAlphaSaturate>();
+    s.color_op = in.Enum<rhi::BlendOp::Max>();
+    s.src_alpha = in.Enum<rhi::BlendFactor::SrcAlphaSaturate>();
+    s.dst_alpha = in.Enum<rhi::BlendFactor::SrcAlphaSaturate>();
+    s.alpha_op = in.Enum<rhi::BlendOp::Max>();
+    s.color_write_mask = in.Read<u8>();
+    s.logic_op_enabled = in.Flag();
+    s.logic_op = in.Enum<rhi::LogicOp::OrInverted>();
+    s.depth_test = in.Flag();
+    s.depth_write = in.Flag();
+    s.depth_compare = in.Enum<rhi::CompareOp::Always>();
+    s.stencil_test = in.Flag();
+    for (auto* face : {&s.stencil_front, &s.stencil_back}) {
+        face->fail = in.Enum<rhi::StencilOp::DecrementWrap>();
+        face->pass = in.Enum<rhi::StencilOp::DecrementWrap>();
+        face->depth_fail = in.Enum<rhi::StencilOp::DecrementWrap>();
+        face->compare = in.Enum<rhi::CompareOp::Always>();
+    }
+    s.cull = in.Enum<rhi::CullMode::Back>();
+    s.front_face = in.Enum<rhi::FrontFace::CounterClockwise>();
+    s.depth_bias_enabled = in.Flag();
+    s.depth_bias_constant = std::bit_cast<float>(in.Read<u32>());
+    s.depth_bias_slope = std::bit_cast<float>(in.Read<u32>());
+    return s;
 }
 
 }  // namespace
 
-void EncodeKey(const PipelineKey& key, std::vector<u8>& out) {
-    Writer w{out};
-    w.U8(static_cast<u64>(key.pass));
-    w.U8(static_cast<u64>(key.vertex.kind));
-    w.U64(key.vertex.program);
-    const native::VertexInputKey& input = key.vertex.input;
-    w.U8(input.binding_count);
-    w.U8(input.attribute_count);
-    for (u32 i = 0; i < input.binding_count && i < input.bindings.size(); ++i) {
-        w.U32(input.bindings[i].stride);
-        w.U8(input.bindings[i].per_instance);
+void EncodeKey(const native::PipelineKey& key, std::vector<u8>& out) {
+    const auto& input = key.vertex.input;
+    out.insert(out.end(), {static_cast<u8>(key.pass), static_cast<u8>(key.vertex.kind)});
+    disk::Append(out, key.vertex.program);
+    out.insert(out.end(), {input.binding_count, input.attribute_count});
+    for (u32 i = 0; i < input.binding_count; ++i) {
+        disk::Append(out, input.bindings[i].stride);
+        out.push_back(input.bindings[i].per_instance);
     }
-    for (u32 i = 0; i < input.attribute_count && i < input.attributes.size(); ++i) {
-        const native::VertexInputKey::Attribute& a = input.attributes[i];
-        w.U8(a.location);
-        w.U8(a.binding);
-        w.U8(static_cast<u64>(a.format));
-        w.U32(a.offset);
+    for (u32 i = 0; i < input.attribute_count; ++i) {
+        const auto& attr = input.attributes[i];
+        out.insert(out.end(), {attr.location, attr.binding, static_cast<u8>(attr.format)});
+        disk::Append(out, attr.offset);
     }
-    w.U8(static_cast<u64>(key.fixup));
-    w.U8(static_cast<u64>(key.fragment.kind));
-    w.U8(static_cast<u64>(key.fragment.uber));
+    out.insert(out.end(), {
+        static_cast<u8>(key.fixup), static_cast<u8>(key.fragment.kind), static_cast<u8>(key.fragment.uber),
+    });
     if (key.fragment.kind == native::FragmentKind::Specialised) {
-        const size_t at = out.size();
-        out.resize(at + sizeof(fragment::FragmentKey));
-        std::memcpy(out.data() + at, &key.fragment.key, sizeof(fragment::FragmentKey));
+        const auto* bytes = reinterpret_cast<const u8*>(&key.fragment.key);
+        out.insert(out.end(), bytes, bytes + sizeof(key.fragment.key));
     }
-    const rhi::FixedFunctionState& s = key.state;
-    w.U8(s.blend_enabled);
-    w.U8(static_cast<u64>(s.src_color));
-    w.U8(static_cast<u64>(s.dst_color));
-    w.U8(static_cast<u64>(s.color_op));
-    w.U8(static_cast<u64>(s.src_alpha));
-    w.U8(static_cast<u64>(s.dst_alpha));
-    w.U8(static_cast<u64>(s.alpha_op));
-    w.U8(s.color_write_mask);
-    w.U8(s.logic_op_enabled);
-    w.U8(static_cast<u64>(s.logic_op));
-    w.U8(s.depth_test);
-    w.U8(s.depth_write);
-    w.U8(static_cast<u64>(s.depth_compare));
-    w.U8(s.stencil_test);
-    PutFace(w, s.stencil_front);
-    PutFace(w, s.stencil_back);
-    w.U8(static_cast<u64>(s.cull));
-    w.U8(static_cast<u64>(s.front_face));
-    w.U8(s.depth_bias_enabled);
-    w.U32(std::bit_cast<u32>(s.depth_bias_constant));
-    w.U32(std::bit_cast<u32>(s.depth_bias_slope));
-    w.U8(static_cast<u64>(key.topology));
-    w.U8(static_cast<u64>(key.color_format));
-    w.U8(static_cast<u64>(key.depth_format));
+    EncodeState(key.state, out);
+    out.insert(out.end(), {static_cast<u8>(key.topology), static_cast<u8>(key.color_format), static_cast<u8>(key.depth_format)});
 }
 
-std::vector<u8> EncodeKey(const PipelineKey& key) {
-    std::vector<u8> out;
-    out.reserve(80 + sizeof(fragment::FragmentKey));
-    EncodeKey(key, out);
-    return out;
+std::vector<u8> EncodeKey(const native::PipelineKey& key) {
+    std::vector<u8> bytes;
+    EncodeKey(key, bytes);
+    return bytes;
 }
 
-std::optional<PipelineKey> DecodeKey(std::span<const u8> bytes) {
-    Reader r{bytes};
-    PipelineKey key;
-    key.pass = static_cast<native::PassKind>(r.U8(1));
-    key.vertex.kind = static_cast<native::VertexStageKind>(r.U8(2));
-    key.vertex.program = r.U64();
-    native::VertexInputKey& input = key.vertex.input;
-    input.binding_count = r.U8(rhi::kMaxVertexBindings);
-    input.attribute_count = r.U8(rhi::kMaxVertexAttributes);
-    if (!r.ok) {
+std::optional<native::PipelineKey> DecodeKey(std::span<const u8> bytes) {
+    disk::Reader in(bytes);
+    native::PipelineKey key;
+    key.pass = in.Enum<native::PassKind::ShadowWrite>();
+    key.vertex.kind = in.Enum<native::VertexStageKind::QuaternionPass>();
+    key.vertex.program = in.Read<u64>();
+    auto& input = key.vertex.input;
+    input.binding_count = in.Read<u8>();
+    input.attribute_count = in.Read<u8>();
+    if (input.binding_count > input.bindings.size() || input.attribute_count > input.attributes.size()) {
         return std::nullopt;
     }
     for (u32 i = 0; i < input.binding_count; ++i) {
-        input.bindings[i].stride = r.U32();
-        input.bindings[i].per_instance = r.U8(1);
+        input.bindings[i].stride = in.Read<u32>();
+        input.bindings[i].per_instance = in.Read<u8>();
     }
     for (u32 i = 0; i < input.attribute_count; ++i) {
-        native::VertexInputKey::Attribute& a = input.attributes[i];
-        a.location = r.U8(255);
-        a.binding = r.U8(255);
-        a.format = static_cast<rhi::Format>(r.U8(kMaxFormat));
-        a.offset = r.U32();
+        auto& attr = input.attributes[i];
+        attr.location = in.Read<u8>();
+        attr.binding = in.Read<u8>();
+        attr.format = in.Enum<rhi::Format::Rgba16Sint>();
+        attr.offset = in.Read<u32>();
     }
-    key.fixup = static_cast<native::FixupStage>(r.U8(1));
-    key.fragment.kind = static_cast<native::FragmentKind>(r.U8(1));
-    key.fragment.uber = static_cast<native::UberModule>(r.U8(1));
+    key.fixup = in.Enum<native::FixupStage::FixedGeometry>();
+    key.fragment.kind = in.Enum<native::FragmentKind::Uber>();
+    key.fragment.uber = in.Enum<native::UberModule::ShadowWrite>();
     if (key.fragment.kind == native::FragmentKind::Specialised) {
-        if (r.at + sizeof(fragment::FragmentKey) > bytes.size()) {
+        const auto fragment = in.Take(sizeof(key.fragment.key));
+        if (fragment.empty()) {
             return std::nullopt;
         }
-        std::memcpy(&key.fragment.key, bytes.data() + r.at, sizeof(fragment::FragmentKey));
-        r.at += sizeof(fragment::FragmentKey);
+        std::memcpy(&key.fragment.key, fragment.data(), fragment.size());
     }
-    rhi::FixedFunctionState& s = key.state;
-    s.blend_enabled = r.U8(1) != 0;
-    s.src_color = static_cast<rhi::BlendFactor>(r.U8(kMaxBlendFactor));
-    s.dst_color = static_cast<rhi::BlendFactor>(r.U8(kMaxBlendFactor));
-    s.color_op = static_cast<rhi::BlendOp>(r.U8(kMaxBlendOp));
-    s.src_alpha = static_cast<rhi::BlendFactor>(r.U8(kMaxBlendFactor));
-    s.dst_alpha = static_cast<rhi::BlendFactor>(r.U8(kMaxBlendFactor));
-    s.alpha_op = static_cast<rhi::BlendOp>(r.U8(kMaxBlendOp));
-    s.color_write_mask = r.U8(255);
-    s.logic_op_enabled = r.U8(1) != 0;
-    s.logic_op = static_cast<rhi::LogicOp>(r.U8(kMaxLogicOp));
-    s.depth_test = r.U8(1) != 0;
-    s.depth_write = r.U8(1) != 0;
-    s.depth_compare = static_cast<rhi::CompareOp>(r.U8(kMaxCompareOp));
-    s.stencil_test = r.U8(1) != 0;
-    s.stencil_front = GetFace(r);
-    s.stencil_back = GetFace(r);
-    s.cull = static_cast<rhi::CullMode>(r.U8(kMaxCullMode));
-    s.front_face = static_cast<rhi::FrontFace>(r.U8(kMaxFrontFace));
-    s.depth_bias_enabled = r.U8(1) != 0;
-    s.depth_bias_constant = std::bit_cast<float>(r.U32());
-    s.depth_bias_slope = std::bit_cast<float>(r.U32());
-    key.topology = static_cast<rhi::Topology>(r.U8(kMaxTopology));
-    key.color_format = static_cast<rhi::Format>(r.U8(kMaxFormat));
-    key.depth_format = static_cast<rhi::Format>(r.U8(kMaxFormat));
-    if (!r.ok || r.at != bytes.size()) {
-        return std::nullopt;
-    }
-    return key;
+    key.state = DecodeState(in);
+    key.topology = in.Enum<rhi::Topology::TriangleFan>();
+    key.color_format = in.Enum<rhi::Format::Rgba16Sint>();
+    key.depth_format = in.Enum<rhi::Format::Rgba16Sint>();
+    return in.Done() ? std::optional{key} : std::nullopt;
 }
 
 }  // namespace mh4n::gpu::pipeline

@@ -1,51 +1,37 @@
-// Derived from Azahar src/core/hle/service/hid/hid.cpp at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6
-// (GPL-2.0-or-later: it says "GPLv2 or any later version"): the module's construction, its update
-// events and the enabling of the sensors (see the header next to this file).
-// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: HID and kernel contract headers, hid_test.cpp, kernel_objects_test.cpp
+// and boot-village IPC and SVC traces.
+
 #include "hid_state.h"
 
-#include <memory>
-
-#include "mh4n/log.h"
 #include "mh4n/scheduler.h"
 
 namespace mh4n::hid {
-
-namespace {
-constexpr const char* kLog = "Service.HID";
-}
-
-std::shared_ptr<Shared> GetShared(ServiceContext& context) {
-    std::shared_ptr<Shared> shared = context.State<Shared>("hid");
-    shared->Ensure(context);
-    return shared;
-}
 
 void Shared::Ensure(ServiceContext& context) {
     if (initialised_) {
         return;
     }
-    initialised_ = true;
-    context_ = &context;
-    scheduler_ = &context.Scheduler();
-    Kernel& kernel = context.GetKernel();
 
-    // CreateSharedMemory(nullptr, 0x1000, ReadWrite, Read, 0, BASE): 0x1000 bytes from the BASE
-    // region, read-only for the application.
+    auto& kernel = context.GetKernel();
     const Result result = kernel.NewSharedMemory(&memory_, nullptr, kSharedMemorySize,
                                                  MemoryPermission::ReadWrite, MemoryPermission::Read,
-                                                 0, FcramRegion::Base, "HID:SharedMemory");
-    if (IsError(result)) {
-        MH4N_LOG(Error, kLog, "cannot allocate the shared memory: 0x{:08X}", result);
-        memory_.reset();
+                                                 0, FcramRegion::Base, "HID");
+    if (!IsSuccess(result)) {
+        context.RequestExit(2, "HID: could not allocate shared memory");
+        return;
     }
-    pad_or_touch_1_ = kernel.NewEvent(ResetType::OneShot, "HID:EventPadOrTouch1");
-    pad_or_touch_2_ = kernel.NewEvent(ResetType::OneShot, "HID:EventPadOrTouch2");
-    accelerometer_event_ = kernel.NewEvent(ResetType::OneShot, "HID:EventAccelerometer");
-    gyroscope_event_ = kernel.NewEvent(ResetType::OneShot, "HID:EventGyroscope");
-    debug_pad_event_ = kernel.NewEvent(ResetType::OneShot, "HID:EventDebugPad");
 
+    pad_or_touch_1_ = kernel.NewEvent(ResetType::OneShot, "HID pad or touch 1");
+    pad_or_touch_2_ = kernel.NewEvent(ResetType::OneShot, "HID pad or touch 2");
+    accelerometer_event_ = kernel.NewEvent(ResetType::OneShot, "HID accelerometer");
+    gyroscope_event_ = kernel.NewEvent(ResetType::OneShot, "HID gyroscope");
+    debug_pad_event_ = kernel.NewEvent(ResetType::OneShot, "HID debug pad");
+    context_ = &context;
+    scheduler_ = &context.Scheduler();
     origin_ = scheduler_->NowTicks();
+    initialised_ = true;
     SchedulePad(origin_ + kPadUpdateTicks);
 }
 
@@ -54,83 +40,91 @@ u8* Shared::MemoryPointer() const {
 }
 
 InputState Shared::Sample(u64 tick) const {
-    InputSource* input = context_->Interfaces().input;
-    return input != nullptr ? input->Sample(tick) : InputState{};
+    if (context_ && context_->Interfaces().input) {
+        return context_->Interfaces().input->Sample(tick);
+    }
+    return {};
 }
 
-// Each update comes `period` after the tick the last one was due at, not after the tick it ran at,
-// as Azahar's `period - cycles_late`: a late event does not shift the ones after it.
+void Shared::RunPadUpdate(u64 tick) {
+    if (u8* memory = MemoryPointer()) {
+        module_.UpdatePad(memory, Sample(tick), tick);
+        pad_or_touch_1_->Signal();
+        pad_or_touch_2_->Signal();
+    }
+}
+
+void Shared::RunAccelerometerUpdate(u64 tick) {
+    if (u8* memory = MemoryPointer()) {
+        module_.UpdateAccelerometer(memory, Sample(tick), tick);
+        accelerometer_event_->Signal();
+    }
+}
+
+void Shared::RunGyroscopeUpdate(u64 tick) {
+    if (u8* memory = MemoryPointer()) {
+        module_.UpdateGyroscope(memory, Sample(tick), tick);
+        gyroscope_event_->Signal();
+    }
+}
+
 void Shared::SchedulePad(u64 due) {
-    std::weak_ptr<Shared> weak = weak_from_this();
-    pad_timer_ = scheduler_->ScheduleAt(due, [weak, due] {
-        if (const auto self = weak.lock()) {
-            self->RunPadUpdate(due);
-            self->SchedulePad(due + kPadUpdateTicks);
+    pad_timer_ = scheduler_->ScheduleAt(due, [weak = weak_from_this(), due] {
+        if (auto hid = weak.lock()) {
+            hid->RunPadUpdate(due);
+            hid->SchedulePad(due + kPadUpdateTicks);
         }
     });
 }
 
 void Shared::ScheduleAccelerometer(u64 due) {
-    std::weak_ptr<Shared> weak = weak_from_this();
-    accelerometer_timer_ = scheduler_->ScheduleAt(due, [weak, due] {
-        if (const auto self = weak.lock()) {
-            self->RunAccelerometerUpdate(due);
-            self->ScheduleAccelerometer(due + kAccelerometerUpdateTicks);
+    accelerometer_timer_ = scheduler_->ScheduleAt(due, [weak = weak_from_this(), due] {
+        if (auto hid = weak.lock()) {
+            hid->RunAccelerometerUpdate(due);
+            hid->ScheduleAccelerometer(due + kAccelerometerUpdateTicks);
         }
     });
 }
 
 void Shared::ScheduleGyroscope(u64 due) {
-    std::weak_ptr<Shared> weak = weak_from_this();
-    gyroscope_timer_ = scheduler_->ScheduleAt(due, [weak, due] {
-        if (const auto self = weak.lock()) {
-            self->RunGyroscopeUpdate(due);
-            self->ScheduleGyroscope(due + kGyroscopeUpdateTicks);
+    gyroscope_timer_ = scheduler_->ScheduleAt(due, [weak = weak_from_this(), due] {
+        if (auto hid = weak.lock()) {
+            hid->RunGyroscopeUpdate(due);
+            hid->ScheduleGyroscope(due + kGyroscopeUpdateTicks);
         }
     });
 }
 
-void Shared::RunPadUpdate(u64 tick) {
-    module_.UpdatePad(MemoryPointer(), Sample(tick), tick);
-    // Signal both handles when there's an update to Pad or touch
-    pad_or_touch_1_->Signal();
-    pad_or_touch_2_->Signal();
-}
-
-void Shared::RunAccelerometerUpdate(u64 tick) {
-    module_.UpdateAccelerometer(MemoryPointer(), Sample(tick), tick);
-    accelerometer_event_->Signal();
-}
-
-void Shared::RunGyroscopeUpdate(u64 tick) {
-    module_.UpdateGyroscope(MemoryPointer(), Sample(tick), tick);
-    gyroscope_event_->Signal();
-}
-
-// Schedules the update event if the sensor was just enabled, one period from now.
 void Shared::EnableAccelerometer() {
-    if (module_.EnableAccelerometer()) {
+    if (initialised_ && module_.EnableAccelerometer()) {
         ScheduleAccelerometer(scheduler_->NowTicks() + kAccelerometerUpdateTicks);
     }
 }
 
-// Unschedules the update event if the sensor was just disabled.
 void Shared::DisableAccelerometer() {
-    if (module_.DisableAccelerometer()) {
+    if (initialised_ && module_.DisableAccelerometer()) {
         scheduler_->Cancel(accelerometer_timer_);
+        accelerometer_timer_ = 0;
     }
 }
 
 void Shared::EnableGyroscope() {
-    if (module_.EnableGyroscope()) {
+    if (initialised_ && module_.EnableGyroscope()) {
         ScheduleGyroscope(scheduler_->NowTicks() + kGyroscopeUpdateTicks);
     }
 }
 
 void Shared::DisableGyroscope() {
-    if (module_.DisableGyroscope()) {
+    if (initialised_ && module_.DisableGyroscope()) {
         scheduler_->Cancel(gyroscope_timer_);
+        gyroscope_timer_ = 0;
     }
+}
+
+std::shared_ptr<Shared> GetShared(ServiceContext& context) {
+    auto hid = context.State<Shared>("hid");
+    hid->Ensure(context);
+    return hid;
 }
 
 }  // namespace mh4n::hid

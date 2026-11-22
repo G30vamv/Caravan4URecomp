@@ -1,35 +1,42 @@
-// The Windows side of the guest memory (N1-02): VirtualAlloc for the reservation and a vectored
-// exception handler for the bad accesses. Built and tested by the native-windows job of
-// .github/workflows/native.yml (N1-22), and cross-built and run under wine when working without a runner.
-#if defined(_WIN32)
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: host.h, memory_test.cpp, and Microsoft Learn Win32 virtual memory and exception handling documentation.
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#ifdef _WIN32
 
 #include "host.h"
+
+#include <cstdlib>
+#include <windows.h>
+
+#include "mh4n/assert.h"
 
 namespace mh4n::host {
 namespace {
 
-LONG CALLBACK Handler(PEXCEPTION_POINTERS info) {
-    const EXCEPTION_RECORD* record = info->ExceptionRecord;
-    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
-        // ExceptionInformation[0]: 0 read, 1 write, 8 execute; [1]: the address
-        const ULONG_PTR kind = record->ExceptionInformation[0];
-        const FaultAccess access = kind == 0   ? FaultAccess::Read
-                                   : kind == 1 ? FaultAccess::Write
-                                               : FaultAccess::Unknown;
-        // Does not return for a fault inside a guest reservation.
-        fault::HandleFault(static_cast<std::uintptr_t>(record->ExceptionInformation[1]), access);
+LONG CALLBACK OnException(EXCEPTION_POINTERS* details) {
+    const EXCEPTION_RECORD& record = *details->ExceptionRecord;
+    if ((record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+         record.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+        record.NumberParameters >= 2) {
+        FaultAccess access = FaultAccess::Unknown;
+        switch (record.ExceptionInformation[0]) {
+        case 0:
+            access = FaultAccess::Read;
+            break;
+        case 1:
+            access = FaultAccess::Write;
+            break;
+        }
+        fault::HandleFault(record.ExceptionInformation[1], access);
     }
-    return EXCEPTION_CONTINUE_SEARCH; // anyone else's: the next handler
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
 } // namespace
 
 std::size_t PageSize() {
-    SYSTEM_INFO info;
+    SYSTEM_INFO info{};
     GetSystemInfo(&info);
     return info.dwPageSize;
 }
@@ -39,11 +46,11 @@ void* Reserve(std::size_t size) {
 }
 
 void Release(void* base, std::size_t) {
-    VirtualFree(base, 0, MEM_RELEASE);
+    MH4N_ASSERT(VirtualFree(base, 0, MEM_RELEASE) != 0);
 }
 
 bool Commit(void* addr, std::size_t size) {
-    return VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    return VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE) == addr;
 }
 
 bool Decommit(void* addr, std::size_t size) {
@@ -51,12 +58,14 @@ bool Decommit(void* addr, std::size_t size) {
 }
 
 void InstallFaultHandler() {
-    static const PVOID handle = AddVectoredExceptionHandler(1, Handler);
-    (void)handle;
+    static std::once_flag installed;
+    std::call_once(installed, [] {
+        MH4N_ASSERT(AddVectoredExceptionHandler(1, OnException) != nullptr);
+    });
 }
 
 void InstallThreadFaultStack() {}
 
 } // namespace mh4n::host
 
-#endif // _WIN32
+#endif

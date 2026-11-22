@@ -127,6 +127,9 @@ public:
     // Hands `work` to the real host's Post. The work runs once: at the real host's safe point, or
     // earlier in RunPostedUpTo, whichever comes first.
     void Post(std::function<void()> work) override;
+    // Posts a notification in the same scheduler FIFO as the interrupts. It is never run early
+    // by InvalidateRegion, which may run only guest writes ahead of the next safe point.
+    void PostCompletion(std::function<void()> work);
 
     // The number of Post calls so far.
     u64 PostedMark() const;
@@ -156,7 +159,7 @@ private:
 // hints there). Set it before the GPU is made; nullptr: nothing.
 void SetRendererThreadStartHook(std::function<void()> hook);
 
-class QueueGpu final : public Gpu, public GpuDebug, public WrapperGpu {
+class QueueGpu : public Gpu, public GpuDebug, public WrapperGpu {
 public:
     // Builds the wrapped GPU on the renderer thread with a QueueHost around `host`.
     using InnerMaker = std::function<std::unique_ptr<Gpu>(Host&)>;
@@ -208,16 +211,31 @@ public:
     // The posted-work list of the QueueHost, null for a QueueGpu built around an existing GPU.
     QueueHost* Proxy() const { return proxy_.get(); }
 
+    // Posts scheduler work after the GPU has completed the work queued by the caller.
+    void PostAfterQueued(std::function<void()> work);
+    bool CanPostAfterQueued() const override { return proxy_ != nullptr; }
+    bool PostAfterQueuedWork(const std::function<void()>& work) override {
+        if (!proxy_) return false;
+        PostAfterQueued(std::function<void()>(work));
+        return true;
+    }
+
+protected:
+    // Queues a VBlank with settings captured when the scheduler requested it.
+    // With limit_next_frame the producer waits at the safety cap before starting another frame.
+    void EnqueueVBlank(u32 screen, std::function<void(Gpu&)> vblank, bool limit_next_frame = false);
+    // Runs `fn` on the renderer thread, after everything queued, and waits; rethrows its exception.
+    void RunSync(const std::function<void()>& fn, bool count = false);
+
 private:
     void Start(std::function<void()> make_inner);
     void RendererMain();
     // Puts `item` on the queue and returns its sequence number. `frame_end`: the item is a
     // VBlank(0), so the frame limit applies before it is queued.
-    u64 Enqueue(std::function<void()> item, bool frame_end = false);
+    u64 Enqueue(std::function<void()> item, bool frame_end = false, bool limit_next_frame = false);
+    void WaitForFrameSlot(std::unique_lock<std::mutex>& lock);
     // Returns when item `seq` is done; the time spent is counted as waiting when `count`.
     void WaitFor(u64 seq, bool count = true);
-    // Runs `fn` on the renderer thread, after everything queued, and waits; rethrows its exception.
-    void RunSync(const std::function<void()>& fn, bool count = false);
     // After an asynchronous call: in lockstep mode, waits for it.
     void Finished(u64 seq);
     void CollectFrameStats();

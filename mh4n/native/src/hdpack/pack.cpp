@@ -1,329 +1,231 @@
-// Derived from Azahar src/video_core/custom_textures/custom_tex_manager.cpp (FindCustomTextures,
-// ParseFilename, ReadConfig, GetTextures), custom_tex_manager.h (the option defaults),
-// material.cpp (Material::AddMapTexture), material.h (MapType) and custom_format.h at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later; every one of those files says
-// "Licensed under GPLv2 or any later version").
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (custom_tex_manager.cpp)
-// Copyright 2023 Citra Emulator Project (material.cpp, material.h, custom_format.h, custom_tex_manager.h)
-#include "hdpack/pack.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: pack.h, json.h and hdpack_test.cpp pack fixtures.
+
+#include "pack.h"
 
 #include <algorithm>
-#include <cctype>
+#include <charconv>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
+#include <iterator>
+#include <utility>
 
-#include <fmt/format.h>
-
-#include "hdpack/json.h"
-#include "mh4n/log.h"
+#include "json.h"
 
 namespace mh4n::hdpack {
+namespace {
 
 namespace fs = std::filesystem;
 
-namespace {
-
-bool ParseUInt(std::string_view s, std::size_t& pos, u64& value, int base) {
-    const std::size_t begin = pos;
-    value = 0;
-    while (pos < s.size()) {
-        const char c = s[pos];
-        unsigned digit;
-        if (c >= '0' && c <= '9') {
-            digit = static_cast<unsigned>(c - '0');
-        } else if (base == 16 && c >= 'a' && c <= 'f') {
-            digit = static_cast<unsigned>(c - 'a' + 10);
-        } else if (base == 16 && c >= 'A' && c <= 'F') {
-            digit = static_cast<unsigned>(c - 'A' + 10);
-        } else {
-            break;
-        }
-        value = value * static_cast<u64>(base) + digit; // wraps like sscanf's %llX would not; fine
-        ++pos;
-    }
-    return pos > begin;
+std::string_view Basename(std::string_view name) {
+    const auto separator = name.find_last_of("/\\");
+    return separator == std::string_view::npos ? name : name.substr(separator + 1);
 }
 
-FileFormat MakeFileFormat(std::string_view ext) {
-    if (ext == "png") {
+FileFormat Extension(std::string_view extension) {
+    if (extension == "png") {
         return FileFormat::Png;
     }
-    if (ext == "dds") {
+    if (extension == "dds") {
         return FileFormat::Dds;
     }
-    if (ext == "ktx") {
+    if (extension == "ktx") {
         return FileFormat::Ktx;
     }
     return FileFormat::None;
 }
 
-std::vector<std::string> Split(const std::string& s, char sep) {
-    std::vector<std::string> parts;
-    std::size_t begin = 0;
-    for (;;) {
-        const std::size_t end = s.find(sep, begin);
-        if (end == std::string::npos) {
-            parts.push_back(s.substr(begin));
-            return parts;
+void AddFile(Pack& pack, const fs::path& root, const fs::directory_entry& entry,
+             const std::map<std::string, std::vector<u64>>& mapped_hashes) {
+    const auto name = entry.path().filename().string();
+    const auto first_dot = name.find('.');
+    const auto last_dot = name.rfind('.');
+    const auto format = first_dot == std::string::npos
+                            ? FileFormat::None
+                            : Extension(std::string_view(name).substr(last_dot + 1));
+    if (format == FileFormat::None || std::count(name.begin(), name.end(), '.') > 2) {
+        ++pack.stats.ignored_names;
+        return;
+    }
+    if (format == FileFormat::Dds && pack.options.skip_mipmap) {
+        ++pack.stats.ignored_dds;
+        return;
+    }
+
+    PackFile file;
+    file.path = entry.path().lexically_relative(root).generic_string();
+    file.format = format;
+    if (first_dot != last_dot && std::string_view(name).substr(first_dot + 1, last_dot - first_dot - 1) == "norm") {
+        file.type = MapType::Normal;
+    }
+    const auto mapped = mapped_hashes.find(name);
+    if (mapped != mapped_hashes.end()) {
+        file.hashes = mapped->second;
+    }
+    if (auto stem = ParseTextureStem(std::string_view(name).substr(0, first_dot))) {
+        if (std::ranges::find(file.hashes, stem->hash) == file.hashes.end()) {
+            file.hashes.push_back(stem->hash);
         }
-        parts.push_back(s.substr(begin, end - begin));
-        begin = end + 1;
     }
+    if (file.hashes.empty()) {
+        ++pack.stats.files_without_hash;
+        return;
+    }
+
+    std::error_code ec;
+    const auto size = entry.file_size(ec);
+    if (!ec) {
+        file.size = size;
+    }
+    const auto time = entry.last_write_time(ec);
+    if (!ec) {
+        file.mtime = std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+    }
+    pack.files.push_back(std::move(file));
 }
 
-// std::stoull(key, &idx, 16): leading white space, an optional 0x, the hex digits; no digits
-// means the key is invalid (Azahar logs "Key is invalid, skipping").
-std::optional<u64> ParseHashKey(const std::string& key) {
-    std::size_t pos = 0;
-    while (pos < key.size() && std::isspace(static_cast<unsigned char>(key[pos]))) {
-        ++pos;
-    }
-    if (key.compare(pos, 2, "0x") == 0 || key.compare(pos, 2, "0X") == 0) {
-        pos += 2;
-    }
-    const std::size_t begin = pos;
-    u64 value = 0;
-    if (!ParseUInt(key, pos, value, 16) || pos - begin > 16) {
-        return std::nullopt;
-    }
-    return value;
-}
-
-std::string FileName(const std::string& path) {
-    const std::size_t slash = path.find_last_of("/\\");
-    return slash == std::string::npos ? path : path.substr(slash + 1);
-}
-
-bool ReadFile(const fs::path& path, std::string& out) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        return false;
-    }
-    std::ostringstream buffer;
-    buffer << in.rdbuf();
-    out = buffer.str();
-    return true;
-}
-
-} // namespace
+}  // namespace
 
 std::optional<TextureStem> ParseTextureStem(std::string_view name) {
-    if (name.substr(0, 5) != "tex1_") {
-        return std::nullopt;
+    const std::string stem(name);
+    TextureStem result;
+    if (std::sscanf(stem.c_str(), "tex1_%" SCNu32 "x%" SCNu32 "_%" SCNx64 "_%" SCNu32,
+                    &result.width, &result.height, &result.hash, &result.format) == 4) {
+        return result;
     }
-    std::size_t pos = 5;
-    u64 width = 0;
-    u64 height = 0;
-    TextureStem stem;
-    u64 format = 0;
-    if (!ParseUInt(name, pos, width, 10) || pos >= name.size() || name[pos] != 'x') {
-        return std::nullopt;
-    }
-    ++pos;
-    if (!ParseUInt(name, pos, height, 10) || pos >= name.size() || name[pos] != '_') {
-        return std::nullopt;
-    }
-    ++pos;
-    if (pos + 1 < name.size() && name[pos] == '0' && (name[pos + 1] == 'x' || name[pos + 1] == 'X')) {
-        pos += 2; // %llX accepts a 0x prefix
-    }
-    if (!ParseUInt(name, pos, stem.hash, 16) || pos >= name.size() || name[pos] != '_') {
-        return std::nullopt;
-    }
-    ++pos;
-    if (!ParseUInt(name, pos, format, 10)) {
-        return std::nullopt;
-    }
-    stem.width = static_cast<u32>(width);
-    stem.height = static_cast<u32>(height);
-    stem.format = static_cast<u32>(format);
-    return stem;
+    return std::nullopt;
 }
 
 std::optional<PackJson> ParsePackJson(const std::string& text, std::string* error) {
-    auto fail = [&](const std::string& message) -> std::optional<PackJson> {
+    const auto document = ParseJson(text, error);
+    if (!document) {
+        return std::nullopt;
+    }
+    const auto* options = document->Find("options");
+    if (!options || !options->IsObject()) {
         if (error) {
-            *error = message;
+            *error = "pack.json requires an options object";
         }
         return std::nullopt;
-    };
-    std::string parse_error;
-    const std::optional<Json> root = ParseJson(text, &parse_error);
-    if (!root) {
-        return fail("pack.json: " + parse_error);
     }
-    const Json* options = root->Find("options");
-    if (!options || !options->IsObject()) {
-        return fail("pack.json: no \"options\" object");
-    }
-    PackJson result;
-    result.options.has_pack_json = true;
-    struct Flag {
-        const char* name;
-        bool* target;
-    };
-    for (const Flag& flag : {Flag{"skip_mipmap", &result.options.skip_mipmap},
-                             Flag{"flip_png_files", &result.options.flip_png_files},
-                             Flag{"use_new_hash", &result.options.use_new_hash}}) {
-        const Json* value = options->Find(flag.name);
-        if (!value || !value->IsBool()) {
-            return fail(fmt::format("pack.json: options.{} is missing or not a boolean", flag.name));
+
+    PackJson pack;
+    pack.options.has_pack_json = true;
+    for (const auto& [name, field] : {
+             std::pair{"flip_png_files", &PackOptions::flip_png_files},
+             std::pair{"skip_mipmap", &PackOptions::skip_mipmap},
+             std::pair{"use_new_hash", &PackOptions::use_new_hash},
+         }) {
+        const auto* option = options->Find(name);
+        if (!option || !option->IsBool()) {
+            if (error) {
+                *error = std::string("pack.json requires a boolean option ") + name;
+            }
+            return std::nullopt;
         }
-        *flag.target = value->boolean;
+        pack.options.*field = option->boolean;
     }
-    const Json* textures = root->Find("textures");
-    if (textures) {
-        if (!textures->IsObject()) {
-            return fail("pack.json: \"textures\" is not an object");
-        }
+
+    const auto* textures = document->Find("textures");
+    if (textures && textures->IsObject()) {
         for (const auto& [key, value] : textures->object) {
-            const std::optional<u64> hash = ParseHashKey(key);
-            if (!hash) {
-                MH4N_LOG(Warning, "HdPack", "pack.json: key {} is invalid, skipping", key);
+            u64 hash = 0;
+            std::string_view digits(key);
+            if (digits.starts_with("0x") || digits.starts_with("0X")) {
+                digits.remove_prefix(2);
+            }
+            const auto end = digits.data() + digits.size();
+            const auto [ptr, ec] = std::from_chars(digits.data(), end, hash, 16);
+            if (ec != std::errc{} || ptr != end) {
                 continue;
             }
-            auto add = [&](const std::string& file) {
-                result.hashes_by_file[FileName(file)].push_back(*hash);
-            };
-            if (value.IsString()) {
-                add(value.string);
-            } else if (value.IsArray()) {
-                for (const Json& entry : value.array) {
-                    if (entry.IsString()) {
-                        add(entry.string);
+            const auto add_name = [&](const Json& path) {
+                if (path.IsString()) {
+                    auto& hashes = pack.hashes_by_file[std::string(Basename(path.string))];
+                    if (std::ranges::find(hashes, hash) == hashes.end()) {
+                        hashes.push_back(hash);
                     }
                 }
-            } else {
-                MH4N_LOG(Warning, "HdPack", "pack.json: material with key {} is invalid", key);
-            }
-        }
-    }
-    return result;
-}
-
-std::optional<Pack> ScanPack(const std::string& dir, std::string* error) {
-    auto fail = [&](const std::string& message) -> std::optional<Pack> {
-        if (error) {
-            *error = message;
-        }
-        return std::nullopt;
-    };
-    std::error_code ec;
-    if (!fs::is_directory(dir, ec)) {
-        return fail(dir + ": not a directory");
-    }
-    Pack pack;
-    std::map<std::string, std::vector<u64>> mapping;
-    const fs::path config = fs::path(dir) / "pack.json";
-    if (fs::is_regular_file(config, ec)) {
-        std::string text;
-        if (!ReadFile(config, text)) {
-            return fail(config.string() + ": cannot read");
-        }
-        std::string json_error;
-        std::optional<PackJson> json = ParsePackJson(text, &json_error);
-        if (!json) {
-            return fail(json_error);
-        }
-        pack.options = json->options;
-        mapping = std::move(json->hashes_by_file);
-    }
-
-    // Azahar scans 64 levels deep.
-    std::vector<fs::path> paths;
-    fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
-    if (ec) {
-        return fail(dir + ": " + ec.message());
-    }
-    for (const fs::recursive_directory_iterator end; it != end; it.increment(ec)) {
-        if (ec) {
-            return fail(dir + ": " + ec.message());
-        }
-        if (it.depth() >= 64) {
-            it.disable_recursion_pending();
-        }
-        if (it->is_regular_file(ec)) {
-            paths.push_back(it->path());
-        }
-    }
-    std::vector<std::pair<std::string, fs::path>> sorted;
-    sorted.reserve(paths.size());
-    for (const fs::path& path : paths) {
-        sorted.emplace_back(fs::relative(path, dir, ec).generic_string(), path);
-    }
-    std::sort(sorted.begin(), sorted.end());
-
-    for (const auto& [relative, path] : sorted) {
-        const std::string name = path.filename().string();
-        // ParseFilename: more than three parts is invalid; the last is the extension.
-        std::vector<std::string> parts = Split(name, '.');
-        if (parts.size() > 3) {
-            ++pack.stats.ignored_names;
-            continue;
-        }
-        const FileFormat format = MakeFileFormat(parts.back());
-        if (format == FileFormat::None) {
-            ++pack.stats.ignored_names;
-            continue;
-        }
-        if (format == FileFormat::Dds && pack.options.skip_mipmap) {
-            ++pack.stats.ignored_dds; // "Mipmap skip is incompatible with DDS textures"
-            continue;
-        }
-        parts.pop_back();
-        MapType type = MapType::Color;
-        if (parts.size() > 1) {
-            if (parts.back() == "norm") {
-                type = MapType::Normal;
-            } else {
-                MH4N_LOG(Warning, "HdPack", "{}: unknown material extension {}, using colour",
-                         relative, parts.back());
-            }
-            parts.pop_back();
-        }
-        PackFile file;
-        file.path = relative;
-        file.format = format;
-        file.type = type;
-        const auto mapped = mapping.find(name);
-        if (mapped != mapping.end()) {
-            file.hashes = mapped->second;
-        }
-        // A pack may keep the default name and still map the file to other hashes.
-        if (const std::optional<TextureStem> stem = ParseTextureStem(parts.back())) {
-            if (std::find(file.hashes.begin(), file.hashes.end(), stem->hash) == file.hashes.end()) {
-                file.hashes.push_back(stem->hash);
-            }
-        }
-        if (file.hashes.empty()) {
-            ++pack.stats.files_without_hash;
-            continue;
-        }
-        file.size = fs::file_size(path, ec);
-        const auto mtime = fs::last_write_time(path, ec);
-        file.mtime = static_cast<s64>(mtime.time_since_epoch().count());
-        pack.files.push_back(std::move(file));
-    }
-
-    // Material::AddMapTexture: a second file for the same map of a hash is ignored.
-    for (std::size_t i = 0; i < pack.files.size(); ++i) {
-        const PackFile& file = pack.files[i];
-        for (const u64 hash : file.hashes) {
-            PackMaterial& material = pack.materials[hash];
-            int& slot = material.file[static_cast<std::size_t>(file.type)];
-            if (slot >= 0) {
-                if (slot != static_cast<int>(i)) {
-                    ++pack.stats.duplicate_maps;
-                    MH4N_LOG(Warning, "HdPack", "{} and {} are assigned to the same material, ignoring the second",
-                             pack.files[static_cast<std::size_t>(slot)].path, file.path);
+            };
+            if (value.IsArray()) {
+                for (const auto& path : value.array) {
+                    add_name(path);
                 }
-                continue;
+            } else {
+                add_name(value);
             }
-            slot = static_cast<int>(i);
         }
     }
     return pack;
 }
 
-} // namespace mh4n::hdpack
+std::optional<Pack> ScanPack(const std::string& dir, std::string* error) {
+    const fs::path root(dir);
+    const auto fail = [&](std::string message) -> std::optional<Pack> {
+        if (error) {
+            *error = std::move(message);
+        }
+        return std::nullopt;
+    };
+
+    std::error_code ec;
+    if (!fs::is_directory(root, ec)) {
+        return fail("not a pack directory: " + dir);
+    }
+
+    Pack pack;
+    PackJson settings;
+    const auto config = root / "pack.json";
+    const bool has_config = fs::exists(config, ec);
+    if (ec) {
+        return fail("cannot inspect pack.json: " + ec.message());
+    }
+    if (has_config) {
+        std::ifstream input(config, std::ios::binary);
+        if (!input) {
+            return fail("cannot open pack.json");
+        }
+        const std::string contents{std::istreambuf_iterator<char>(input), {}};
+        std::string parse_error;
+        auto parsed = ParsePackJson(contents, &parse_error);
+        if (!parsed) {
+            return fail("pack.json: " + parse_error);
+        }
+        settings = std::move(*parsed);
+    }
+    pack.options = settings.options;
+
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (it.depth() >= 63) {
+            it.disable_recursion_pending();
+        }
+        std::error_code file_ec;
+        if (it->path() != config && it->is_regular_file(file_ec)) {
+            AddFile(pack, root, *it, settings.hashes_by_file);
+        }
+    }
+    if (ec) {
+        return fail("cannot scan pack: " + ec.message());
+    }
+
+    std::ranges::sort(pack.files, {}, &PackFile::path);
+    for (std::size_t index = 0; index < pack.files.size(); ++index) {
+        const auto& file = pack.files[index];
+        for (const u64 hash : file.hashes) {
+            int& slot = pack.materials[hash].file[static_cast<std::size_t>(file.type)];
+            if (slot < 0) {
+                slot = static_cast<int>(index);
+            } else {
+                ++pack.stats.duplicate_maps;
+            }
+        }
+    }
+    return pack;
+}
+
+}  // namespace mh4n::hdpack

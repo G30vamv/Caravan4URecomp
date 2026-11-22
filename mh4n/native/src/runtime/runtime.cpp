@@ -195,10 +195,10 @@ Runtime::Runtime(RuntimeConfig config)
 }
 
 Runtime::~Runtime() {
+    RunFinishers();  // (while the scheduler can still run what they post)
     if (scheduler_) {
         scheduler_->Shutdown();
     }
-    RunFinishers();
     // Reverse order of Own(): the objects may refer to the parts below.
     while (!owned_.empty()) {
         owned_.pop_back();

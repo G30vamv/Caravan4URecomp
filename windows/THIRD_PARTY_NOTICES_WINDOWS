@@ -32,6 +32,15 @@ Python 3.12.8, the embeddable package of python.org (game-tools\python, run by t
     The package also holds OpenSSL (libssl, libcrypto), libffi, SQLite and other libraries of python.org's build, with
     their own licenses (summarised in PYTHON-LICENSE.txt).
 
+The launcher (Caravan4URecomp-Launcher.exe, windows/launcher/ in the source tree)
+    Python code adapted from the author's own other launcher project, under the GNU Affero General Public License v3
+    (the author, G30vamv, is the copyright holder of that code). It is packed with PyInstaller (GPL-2.0 with the bootloader
+    exception, https://pyinstaller.org) in one file that also holds: Python (PSF license, as above), PySide6 / Qt for Python 6
+    (The Qt Company, LGPL-3.0: https://doc.qt.io/qtforpython-6/, the Qt libraries are dynamic libraries inside the exe that you can
+    replace by building the launcher again from windows/launcher/ with build_launcher.ps1) and Pillow (HPND license,
+    https://python-pillow.org). It shows its text with the system's Segoe UI font and the Georgia title font, which are not
+    included. Its source is in SOURCE\Caravan4URecomp-source.zip.
+
 Downloaded by the setup on the player's PC the first time (not distributed with this program)
 -----------------------------------------------------------------------------------------------
 

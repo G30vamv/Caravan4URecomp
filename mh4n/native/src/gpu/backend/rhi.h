@@ -993,7 +993,9 @@ public:
     void Blit(const Image& src, Image& dst, std::span<const ImageBlitRegion> regions, bool linear);
     void ClearImage(Image& image, const ClearValue& value, u32 mip_level = 0, u32 layer = 0);
     void CopyBufferToImage(const Buffer& src, Image& dst, std::span<const BufferImageRegion> regions);
-    void CopyImageToBuffer(const Image& src, Buffer& dst, std::span<const BufferImageRegion> regions);
+    // keep_general: the image stays in (and is read in) the GENERAL layout, no layout change (an image another thread may be
+    // reading while it is shown; MODIFIED for the Windows port).
+    void CopyImageToBuffer(const Image& src, Buffer& dst, std::span<const BufferImageRegion> regions, bool keep_general = false);
     void BeginTargetPass(const TargetPassDesc& pass);
     // Ends the open pass, copies every mip of the whole target into a twin (made once per target and
     // kept; the twin has the target's format, size and mips and inherits `shadow_source`) and returns

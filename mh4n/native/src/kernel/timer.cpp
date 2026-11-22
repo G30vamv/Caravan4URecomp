@@ -1,7 +1,7 @@
-// Derived from Azahar src/core/hle/kernel/timer.cpp at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6
-// (GPL-2.0-or-later): the reset types, Set, Cancel and Clear, the signal and the rescheduling of a
-// periodic timer. The timer queue is the scheduler's (Kernel::ScheduleAt), not CoreTiming.
-// Copyright 2015-2024 Citra Emulator Project / Azahar Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: the comments of mh4n/kernel.h (Timer), 3dbrew "SVC" (CreateTimer, SetTimer, CancelTimer,
+// ClearTimer) and the black-box specification of tests/kernel_objects_test.cpp.
 #include <algorithm>
 
 #include "internal.h"
@@ -15,7 +15,7 @@ Timer::Timer(Kernel& kernel, ResetType reset_type) : WaitObject(kernel), reset_t
 
 Timer::~Timer() {
     Cancel();
-    if (resource_limit) {
+    if (resource_limit != nullptr) {
         resource_limit->Release(ResourceLimitType::Timer, 1);
     }
 }
@@ -25,7 +25,7 @@ bool Timer::ShouldWait(const Thread*) const {
 }
 
 void Timer::Acquire(Thread* thread) {
-    MH4N_ASSERT(!ShouldWait(thread), "object unavailable!");
+    MH4N_ASSERT(!ShouldWait(thread), "Timer::Acquire of a thread that has to wait");
     if (reset_type_ == ResetType::OneShot) {
         signaled_ = false;
     }
@@ -39,13 +39,14 @@ void Timer::WakeupAllWaitingThreads() {
 }
 
 void Timer::Set(s64 initial_ns, s64 interval_ns) {
-    Cancel();  // get rid of any previous shot
+    Cancel();
     initial_delay_ = std::max<s64>(initial_ns, 0);
     interval_delay_ = std::max<s64>(interval_ns, 0);
     const u64 now = kernel_.NowTicks();
-    if (initial_ns == 0) {
+    if (initial_delay_ == 0) {
+        // the first shot is now
         deadline_ = now;
-        Fire();  // the callback runs at once
+        Fire();
     } else {
         Schedule(now + kernel_detail::NsToTicks(initial_delay_));
     }
@@ -62,27 +63,20 @@ void Timer::Clear() {
     signaled_ = false;
 }
 
-void Timer::Schedule(u64 deadline) {
-    deadline_ = deadline;
-    const std::weak_ptr<Timer> weak = std::static_pointer_cast<Timer>(shared_from_this());
-    event_ = kernel_.ScheduleAt(deadline, [weak] {
-        if (auto timer = weak.lock()) {
-            timer->Fire();
-        }
-    });
-}
-
 void Timer::Fire() {
-    event_ = 0;  // the event that called us has run
+    event_ = 0;  // the event that called this one is spent
     signaled_ = true;
     WakeupAllWaitingThreads();
-    if (interval_delay_ != 0) {
-        // Azahar schedules nsToCycles(interval) - cycles_late from now, i.e. one interval after
-        // this shot was due. At least one tick, so that an interval below a tick does not make the
-        // queue run the same instant forever.
-        const u64 interval = std::max<u64>(kernel_detail::NsToTicks(interval_delay_), 1);
-        Schedule(deadline_ + interval);
+    if (interval_delay_ > 0 && event_ == 0) {
+        // one interval after this shot's deadline, so the period does not drift
+        Schedule(deadline_ + kernel_detail::NsToTicks(interval_delay_));
     }
 }
 
-} // namespace mh4n
+void Timer::Schedule(u64 deadline) {
+    deadline_ = deadline;
+    // (~Timer cancels the event, so `this` outlives it)
+    event_ = kernel_.ScheduleAt(deadline, [this] { Fire(); });
+}
+
+}  // namespace mh4n

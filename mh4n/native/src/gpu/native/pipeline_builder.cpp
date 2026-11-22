@@ -236,6 +236,35 @@ void PipelineBuilder::Translate(u64 program, VertexSource& source, bool quaterni
     std::copy(source.swizzle.begin(), source.swizzle.end(), setup->swizzle_data.begin());
     setup->biggest_program_size = static_cast<u32>(source.program.size());
     setup->biggest_swizzle_size = static_cast<u32>(source.swizzle.size());
+    // MODIFIED for the Windows port (Phase 6, independent PICA front end; default off): MH4N_DUMP_PROGRAMS=DIR writes each
+    // vertex program once as DIR/vs_<program>.pvs: "PVS1", u32 program_words, swizzle_words, main_offset, output_mask,
+    // outmap_total, outmap_attributes[7], then per input register (16) u32 conversion + u32 alias_w, then the program
+    // words and the swizzle words (all little endian), the data the offline analysis and the independent translator test use.
+    if (!quaternion_pass) {
+        static const char* dump_programs = std::getenv("MH4N_DUMP_PROGRAMS");
+        if (dump_programs != nullptr && *dump_programs != '\0') {
+            const std::string path = fmt::format("{}/vs_{:016x}.pvs", dump_programs, program);
+            if (FILE* f = std::fopen(path.c_str(), "wb")) {
+                const auto put = [&](u32 v) { std::fwrite(&v, 4, 1, f); };
+                std::fwrite("PVS1", 4, 1, f);
+                put(source.config.program_words);
+                put(source.config.swizzle_words);
+                put(source.config.main_offset);
+                put(source.config.output_mask);
+                put(source.config.outmap_total);
+                for (u32 a : source.config.outmap_attributes) {
+                    put(a);
+                }
+                for (const shader::InputRegisterConfig& in : source.config.inputs) {
+                    put(static_cast<u32>(in.conversion));
+                    put(in.alias_w ? 1u : 0u);
+                }
+                std::fwrite(source.program.data(), 4, source.program.size(), f);
+                std::fwrite(source.swizzle.data(), 4, source.swizzle.size(), f);
+                std::fclose(f);
+            }
+        }
+    }
     shader::TranslateResult generated = shader::GenerateVertexGlsl(*setup, source.config, quaternion_pass);
     double ms = 0.0;
     std::shared_ptr<const shader::TranslatedVertexShader>& out = quaternion_pass ? source.quaternion : source.stage;

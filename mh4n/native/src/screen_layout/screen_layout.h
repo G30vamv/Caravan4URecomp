@@ -29,7 +29,7 @@
 namespace mh4n::screen_layout {
 
 /// The app's layouts (the settings names `overlay`, `stacked`, `single` and `side`).
-enum class Mode { Overlay, Stacked, Single, Side };
+enum class Mode { Overlay, Stacked, Single, Side, Large };  // MODIFIED: Large = a big top screen with a small touch screen at its right, top-aligned
 
 /// The mode a settings name stands for: `overlay`, `stacked`, `single`, `side`. Any other name
 /// (`windows`, a typo) is Overlay (D62: separate windows fall back to the overlay until N3-15), and

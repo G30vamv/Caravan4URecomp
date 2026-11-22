@@ -1,307 +1,288 @@
-// Derived from Azahar src/video_core/shader/generator/pica_fs_config.cpp (FramebufferConfig::
-// FramebufferConfig, FramebufferConfig::ApplyProfile, TextureConfig::TextureConfig,
-// TextureConfig::ApplyProfile, LightConfig::LightConfig, ProcTexConfig::ProcTexConfig, FSConfig::FSConfig)
-// at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-3.0-or-later: the file says "Licensed under GPLv3 or any
-// later version"); the register positions and fields are read from src/video_core/pica/regs_internal.h,
-// regs_framebuffer.h, regs_texturing.h, regs_lighting.h and regs_rasterizer.h (each says "Licensed under GPLv2 or any
-// later version").
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (pica_fs_config.cpp)
-// Copyright 2017-2025 Citra Emulator Project / Azahar Emulator Project (regs_internal.h, regs_framebuffer.h)
-// Copyright 2017-2024 Citra Emulator Project / Azahar Emulator Project (regs_texturing.h)
-// Copyright 2017 Citra Emulator Project (regs_lighting.h)
-// Copyright 2017-2026 Citra Emulator Project / Azahar Emulator Project (regs_rasterizer.h)
-#include "gpu/fragment/key.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: fragment headers, gpu_fragment_key_test, gpu_lighting_test, 3dbrew GPU/Internal Registers, libctru GPU enums and citro3d lighting register writes.
 
+#include "key.h"
+
+#include <algorithm>
 #include <atomic>
 
-#include "gpu/fragment/feature.h"
-#include "gpu/fragment/generator.h"
+#include "feature.h"
+#include "generator.h"
 #include "gpu/pica/state.h"
 
 namespace mh4n::gpu::fragment {
 namespace {
 
-u32 R(const pica::PicaState& state, u32 id) {
-    return state.regs[id];
+using RegisterFile = decltype(pica::PicaState::regs);
+
+constexpr std::array kTevStageRegisters{
+    freg::kTevStage0, freg::kTevStage1, freg::kTevStage2,
+    freg::kTevStage3, freg::kTevStage4, freg::kTevStage5,
+};
+constexpr std::array kTextureRegisters{freg::kTexture0, freg::kTexture1, freg::kTexture2};
+
+std::atomic<bool> shaders_as_before{false};
+
+BlendConfig DecodeBlend(u32 word, u32 equation_start, u32 factors_start) {
+    BlendConfig blend{
+        static_cast<re::BlendEquation>(Bits(word, equation_start, 3)),
+        static_cast<re::BlendFactor>(Bits(word, factors_start, 4)),
+        static_cast<re::BlendFactor>(Bits(word, factors_start + 4, 4)),
+    };
+    return blend.RequiresMinMaxEmulation() ? blend : BlendConfig{};
 }
 
-float LutScale(u32 scale_field) {
-    switch (scale_field) {
-    case 0: return 1.0f;
-    case 1: return 2.0f;
-    case 2: return 4.0f;
-    case 3: return 8.0f;
-    case 6: return 0.25f;
-    case 7: return 0.5f;
-    default: return 0.0f;
-    }
-}
-
-FramebufferConfig MakeFramebuffer(const pica::PicaState& state) {
-    FramebufferConfig fb;
-    const u32 fragop = R(state, freg::kFragmentOperation);
-    const u32 blending = R(state, freg::kAlphaBlending);
-    const u32 alpha_test = R(state, freg::kAlphaTest);
-
-    fb.set_scissor_test_mode(static_cast<re::ScissorMode>(Bits(R(state, freg::kScissorMode), 0, 2)));
-    fb.set_depthmap_enable(static_cast<re::DepthBuffering>(Bits(R(state, freg::kDepthmapEnable), 0, 1)));
-    fb.set_depth_identity(fb.depthmap_enable() == re::DepthBuffering::ZBuffering &&
-                                  pica::Float24ToFloat(Bits(R(state, freg::kViewportDepthRange), 0, 24)) == -1.0f &&
-                                  pica::Float24ToFloat(Bits(R(state, freg::kViewportDepthNearPlane), 0, 24)) == 0.0f
-                              ? 1
-                              : 0);
-    fb.set_shadow_rendering(Bits(fragop, 0, 2) == static_cast<u32>(re::FragmentOperationMode::Shadow) ? 1 : 0);
-    fb.set_alpha_test_func(Bits(alpha_test, 0, 1) != 0 ? static_cast<re::CompareFunc>(Bits(alpha_test, 4, 3))
-                                                        : re::CompareFunc::Always);
-    fb.set_alphablend_enable(Bits(fragop, 8, 1));
-    fb.set_logic_op(re::LogicOp::Copy);
-
-    if (fb.alphablend_enable() != 0) {
-        fb.requested_rgb_blend.eq = static_cast<re::BlendEquation>(Bits(blending, 0, 3));
-        fb.requested_rgb_blend.src_factor = static_cast<re::BlendFactor>(Bits(blending, 16, 4));
-        fb.requested_rgb_blend.dst_factor = static_cast<re::BlendFactor>(Bits(blending, 20, 4));
-        fb.requested_alpha_blend.eq = static_cast<re::BlendEquation>(Bits(blending, 8, 3));
-        fb.requested_alpha_blend.src_factor = static_cast<re::BlendFactor>(Bits(blending, 24, 4));
-        fb.requested_alpha_blend.dst_factor = static_cast<re::BlendFactor>(Bits(blending, 28, 4));
-        // The canonical rule (design 4.3): the logic op register is ignored while blending is on, and a half's
-        // requested blend matters only for Min and Max (ApplyProfile reads the factors for nothing else).
-        fb.requested_logic_op = re::LogicOp{};
-        if (!fb.requested_rgb_blend.RequiresMinMaxEmulation()) {
-            fb.requested_rgb_blend = BlendConfig{};
-        }
-        if (!fb.requested_alpha_blend.RequiresMinMaxEmulation()) {
-            fb.requested_alpha_blend = BlendConfig{};
-        }
+FramebufferConfig DecodeFramebuffer(const RegisterFile& regs) {
+    const u32 operation = regs[freg::kFragmentOperation];
+    const u32 alpha_test = regs[freg::kAlphaTest];
+    FramebufferConfig result{};
+    result.set_alpha_test_func(Bits(alpha_test, 0, 1) != 0
+                                   ? static_cast<re::CompareFunc>(Bits(alpha_test, 4, 3))
+                                   : re::CompareFunc::Always);
+    result.set_scissor_test_mode(static_cast<re::ScissorMode>(Bits(regs[freg::kScissorMode], 0, 2)));
+    result.set_depthmap_enable(static_cast<re::DepthBuffering>(Bits(regs[freg::kDepthmapEnable], 0, 1)));
+    result.set_depth_identity(result.depthmap_enable() == re::DepthBuffering::ZBuffering
+                              && Bits(regs[freg::kViewportDepthRange], 0, 24) == 0xBF0000u
+                              && Bits(regs[freg::kViewportDepthNearPlane], 0, 23) == 0);
+    result.set_shadow_rendering(Bits(operation, 0, 2) == static_cast<u32>(re::FragmentOperationMode::Shadow));
+    result.set_logic_op(re::LogicOp::Copy);
+    result.set_alphablend_enable(Bits(operation, 8, 1));
+    if (result.alphablend_enable()) {
+        const u32 blend = regs[freg::kAlphaBlending];
+        result.requested_rgb_blend = DecodeBlend(blend, 0, 16);
+        result.requested_alpha_blend = DecodeBlend(blend, 8, 24);
     } else {
-        fb.requested_logic_op = static_cast<re::LogicOp>(Bits(R(state, freg::kLogicOp), 0, 4));
+        result.requested_logic_op = static_cast<re::LogicOp>(Bits(regs[freg::kLogicOp], 0, 4));
     }
-    return fb;
+    return result;
 }
 
-TextureConfig MakeTexture(const pica::PicaState& state) {
-    TextureConfig tex;
-    const u32 main_config = R(state, freg::kMainConfig);
-    const u32 fog_word = R(state, freg::kFogModeAndCombiner);
-    tex.set_texture0_type(static_cast<re::TextureType>(Bits(R(state, freg::kTexture0 + freg::kTextureParams), 28, 3)));
-    tex.set_texture2_use_coord1(Bits(main_config, 13, 1) != 0 ? 1 : 0);
-    // update_mask_rgb | update_mask_a << 4, the two nibbles of bits 8-15
-    tex.set_combiner_buffer_input(Bits(fog_word, 8, 4) | (Bits(fog_word, 12, 4) << 4));
-    tex.set_fog_mode(static_cast<re::FogMode>(Bits(fog_word, 0, 3)));
-    tex.set_fog_flip(Bits(fog_word, 16, 1) != 0 ? 1 : 0);
-    tex.set_shadow_texture_orthographic(Bits(R(state, freg::kShadowTexture), 0, 1) != 0 ? 1 : 0);
+TextureConfig DecodeTexture(const RegisterFile& regs) {
+    TextureConfig result{};
+    result.set_texture0_type(static_cast<re::TextureType>(
+        Bits(regs[freg::kTexture0 + freg::kTextureParams], 28, 3)));
+    result.set_texture2_use_coord1(Bits(regs[freg::kMainConfig], 13, 1));
+    result.set_shadow_texture_orthographic(Bits(regs[freg::kShadowTexture], 0, 1));
+    const u32 fog_buffer = regs[freg::kFogModeAndCombiner];
+    result.set_combiner_buffer_input(Bits(fog_buffer, 8, 8));
+    result.set_fog_mode(static_cast<re::FogMode>(Bits(fog_buffer, 0, 3)));
+    result.set_fog_flip(Bits(fog_buffer, 16, 1));
 
-    const u32 unit_base[3] = {freg::kTexture0, freg::kTexture1, freg::kTexture2};
-    for (u32 i = 0; i < 3; ++i) {
-        const u32 params = R(state, unit_base[i] + freg::kTextureParams);
-        tex.requested_wrap[i].s = static_cast<re::WrapMode>(Bits(params, 12, 3));
-        tex.requested_wrap[i].t = static_cast<re::WrapMode>(Bits(params, 8, 3));
-        tex.texture_border_color[i].set_enable_s(0);
-        tex.texture_border_color[i].set_enable_t(0);
-        // the native renderer's textures have one level (level 0: rhi::ImageDesc::mip_levels is 1 for every image it
-        // makes; Azahar's lod.max_level + 1 levels are not uploaded), so whatever the sampler's [lod_min, lod_max] the
-        // lookup reads level 0, and the LOD only chooses the magnification or the minification filter: when the two
-        // are the same filter, it changes nothing (MakeKey keeps the bit only for a unit the stage reads). (gpu5: the
-        // levels were tested too, 0 and 0, which most of a field's lit draws are not.)
-        const u32 lod = R(state, unit_base[i] + freg::kTextureLod);
-        const bool levels = !ShadersAsBefore() || (Bits(lod, 16, 4) == 0 && Bits(lod, 24, 4) == 0);
-        tex.set_lod_free(i, levels && Bits(params, 1, 1) == Bits(params, 2, 1) ? 1 : 0);
-    }
-
-    const u32 stage_base[6] = {freg::kTevStage0, freg::kTevStage1, freg::kTevStage2,
-                               freg::kTevStage3, freg::kTevStage4, freg::kTevStage5};
-    for (u32 i = 0; i < 6; ++i) {
-        TevStageConfigRaw& stage = tex.tev_stages[i];
-        stage.sources_raw = R(state, stage_base[i] + freg::kTevSources);
-        stage.modifiers_raw = R(state, stage_base[i] + freg::kTevModifiers);
-        stage.ops_raw = R(state, stage_base[i] + freg::kTevOps);
-        stage.scales_raw = R(state, stage_base[i] + freg::kTevScales);
+    for (size_t i = 0; i < kTevStageRegisters.size(); ++i) {
+        const u32 base = kTevStageRegisters[i];
+        TevStageConfigRaw stage{
+            regs[base + freg::kTevSources],
+            regs[base + freg::kTevModifiers],
+            regs[base + freg::kTevOps],
+            regs[base + freg::kTevScales],
+        };
         if (stage.color_op() == re::TevOperation::Dot3_RGBA) {
             stage.sources_raw &= 0xFFF;
             stage.modifiers_raw &= 0xFFF;
             stage.ops_raw &= 0xF;
         }
+        result.tev_stages[i] = stage;
     }
-    return tex;
+    for (u32 i = 0; i < kTextureRegisters.size(); ++i) {
+        const u32 params = regs[kTextureRegisters[i] + freg::kTextureParams];
+        result.requested_wrap[i] = {
+            static_cast<re::WrapMode>(Bits(params, 12, 3)),
+            static_cast<re::WrapMode>(Bits(params, 8, 3)),
+        };
+    }
+    return result;
 }
 
-LightConfig MakeLighting(const pica::PicaState& state) {
-    LightConfig light;
-    if (Bits(R(state, freg::kLightingDisable), 0, 1) != 0) {
-        return light;
-    }
-
-    const u32 config0 = R(state, freg::kLightingConfig0);
-    const u32 config1 = R(state, freg::kLightingConfig1);
-    const u32 max_light_index = Bits(R(state, freg::kLightingMaxLightIndex), 0, 3);
-
-    light.set_enable(1);
-    light.set_src_num(max_light_index + 1);
-    light.set_config(static_cast<re::LightingConfig>(Bits(config0, 4, 4)));
-    light.set_enable_primary_alpha(Bits(config0, 2, 1));
-    light.set_enable_secondary_alpha(Bits(config0, 3, 1));
-    light.set_bump_mode(static_cast<re::LightingBumpMode>(Bits(config0, 28, 2)));
-    light.set_bump_selector(Bits(config0, 22, 2));
-    light.set_bump_renorm(Bits(config0, 30, 1) == 0 ? 1 : 0);
-    light.set_clamp_highlights(Bits(config0, 27, 1) != 0 ? 1 : 0);
-
-    light.set_enable_shadow(Bits(config0, 0, 1) != 0 ? 1 : 0);
-    if (light.enable_shadow() != 0) {
-        light.set_shadow_primary(Bits(config0, 16, 1) != 0 ? 1 : 0);
-        light.set_shadow_secondary(Bits(config0, 17, 1) != 0 ? 1 : 0);
-        light.set_shadow_invert(Bits(config0, 18, 1) != 0 ? 1 : 0);
-        light.set_shadow_alpha(Bits(config0, 19, 1) != 0 ? 1 : 0);
-        light.set_shadow_selector(Bits(config0, 24, 2));
-    }
-
-    const u32 enable_slots = R(state, freg::kLightingLightEnable);
-    for (u32 light_index = 0; light_index <= max_light_index; ++light_index) {
-        const u32 num = Bits(enable_slots, 4 * light_index, 3);
-        const u32 light_config = R(state, freg::kLight0 + freg::kLightStride * num + freg::kLightConfig);
-        Light& l = light.lights[light_index];
-        l.SetField(0, 3, num);
-        l.SetField(3, 1, Bits(light_config, 0, 1) != 0 ? 1 : 0);   // directional
-        l.SetField(4, 1, Bits(light_config, 1, 1) != 0 ? 1 : 0);   // two_sided_diffuse
-        l.SetField(7, 1, Bits(light_config, 2, 1) != 0 ? 1 : 0);   // geometric_factor_0
-        l.SetField(8, 1, Bits(light_config, 3, 1) != 0 ? 1 : 0);   // geometric_factor_1
-        l.SetField(5, 1, Bits(config1, 24 + num, 1) == 0 ? 1 : 0);  // dist_atten_enable: !IsDistAttenDisabled
-        l.SetField(6, 1, Bits(config1, 8 + num, 1) == 0 ? 1 : 0);   // spot_atten_enable: !IsSpotAttenDisabled
-        l.SetField(9, 1, Bits(config1, num, 1) == 0 ? 1 : 0);       // shadow_enable: !IsShadowDisabled
-    }
-
-    const u32 abs_input = R(state, freg::kLightingAbsLutInput);
-    const u32 lut_input = R(state, freg::kLightingLutInput);
-    const u32 lut_scale = R(state, freg::kLightingLutScale);
-
-    // (the LUT config, its disable bit in config1 (or none), the abs-input disable bit, the input field, the scale field)
-    auto fill = [&](LutConfig& lut, int disable_bit, u32 abs_bit, u32 field) {
-        lut.set_enable(disable_bit < 0 ? 1 : (Bits(config1, static_cast<u32>(disable_bit), 1) == 0 ? 1 : 0));
-        if (lut.enable() != 0) {
-            lut.set_abs_input(Bits(abs_input, abs_bit, 1) == 0 ? 1 : 0);
-            lut.set_type(static_cast<re::LightingLutInput>(Bits(lut_input, field, 3)));
-            lut.SetScale(LutScale(Bits(lut_scale, field, 3)));
+// Claude fix 2026-11-19 (differential oracle vs production, golden/keyfuzz): the lod_free bit follows every source slot of a stage that
+// is not a pass-through (all six: three colour and three alpha), not only the operands its operation reads.
+bool TevMentionsSource(const FragmentKey& key, u32 source) {
+    for (const auto& stage : key.texture.tev_stages) {
+        if (TevStageIsPassThrough(stage)) {
+            continue;
         }
-    };
-    fill(light.lut_d0, 16, 1, 0);
-    fill(light.lut_d1, 17, 5, 4);
-    // lut_sp: "a dummy field due to lack of the corresponding register": always enabled
-    fill(light.lut_sp, -1, 9, 8);
-    fill(light.lut_fr, 19, 13, 12);
-    fill(light.lut_rr, 20, 25, 24);
-    fill(light.lut_rg, 21, 21, 20);
-    fill(light.lut_rb, 22, 17, 16);
-    return light;
+        for (u32 i = 0; i < 3; ++i) {
+            if (stage.color_source(i) == source || stage.alpha_source(i) == source) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
-ProcTexConfig MakeProcTex(const pica::PicaState& state) {
-    ProcTexConfig pt;
-    const u32 main_config = R(state, freg::kMainConfig);
-    if (Bits(main_config, 10, 1) == 0) {
-        return pt;
+// Claude fix 2026-11-19 (differential oracle): the units that the lighting reads (the bump map, the shadow map) count as read too.
+bool LightingReadsUnit(const FragmentKey& key, u32 unit) {
+    const auto& light = key.lighting;
+    if (!light.enable()) {
+        return false;
     }
-    const u32 proctex = R(state, freg::kProcTex);
-    const u32 lut = R(state, freg::kProcTexLut);
-    const u32 offsets = R(state, freg::kProcTexLutOffset);
+    return (static_cast<u32>(light.bump_mode()) != 0 && light.bump_selector() == unit) ||
+           (light.enable_shadow() && light.shadow_selector() == unit);
+}
 
-    pt.set_enable(1);
-    pt.set_coord(Bits(main_config, 8, 2));
-    pt.set_u_clamp(static_cast<re::ProcTexClamp>(Bits(proctex, 0, 3)));
-    pt.set_v_clamp(static_cast<re::ProcTexClamp>(Bits(proctex, 3, 3)));
-    pt.set_color_combiner(static_cast<re::ProcTexCombiner>(Bits(proctex, 6, 4)));
-    pt.set_alpha_combiner(static_cast<re::ProcTexCombiner>(Bits(proctex, 10, 4)));
-    pt.set_separate_alpha(Bits(proctex, 14, 1));
-    pt.set_noise_enable(Bits(proctex, 15, 1));
-    pt.set_u_shift(static_cast<re::ProcTexShift>(Bits(proctex, 16, 2)));
-    pt.set_v_shift(static_cast<re::ProcTexShift>(Bits(proctex, 18, 2)));
-    pt.lut_width = static_cast<s32>(Bits(lut, 11, 8));
-    pt.lut_offset0 = static_cast<s32>(Bits(offsets, 0, 8));
-    pt.lut_offset1 = static_cast<s32>(Bits(offsets, 8, 8));
-    pt.lut_offset2 = static_cast<s32>(Bits(offsets, 16, 8));
-    pt.lut_offset3 = static_cast<s32>(Bits(offsets, 24, 8));
-    pt.lod_min = static_cast<u16>(Bits(lut, 3, 4));
-    pt.lod_max = static_cast<u16>(Bits(lut, 7, 4));
-    pt.set_lut_filter(static_cast<re::ProcTexFilter>(Bits(lut, 0, 3)));
-    return pt;
+void FindLodFreeUnits(const RegisterFile& regs, FragmentKey& key, bool legacy) {
+    for (u32 i = 0; i < kTextureRegisters.size(); ++i) {
+        const u32 base = kTextureRegisters[i];
+        const u32 params = regs[base + freg::kTextureParams];
+        const bool same_filter = Bits(params, 1, 1) == Bits(params, 2, 1);
+        const u32 lod = regs[base + freg::kTextureLod];
+        const bool base_level_only = Bits(lod, 16, 4) == 0 && Bits(lod, 24, 4) == 0;
+        const bool read = same_filter && (!legacy || base_level_only) && (TevMentionsSource(key, 3 + i) || LightingReadsUnit(key, i));
+        key.texture.set_lod_free(i, read);
+    }
+}
+
+LightConfig DecodeLighting(const RegisterFile& regs) {
+    LightConfig result{};
+    if (Bits(regs[freg::kLightingDisable], 0, 1)) {
+        return result;
+    }
+    const u32 config = regs[freg::kLightingConfig0];
+    const u32 disabled = regs[freg::kLightingConfig1];
+    result.set_enable(1);
+    result.set_src_num(Bits(regs[freg::kLightingMaxLightIndex], 0, 3) + 1);
+    result.set_enable_primary_alpha(Bits(config, 2, 1));
+    result.set_enable_secondary_alpha(Bits(config, 3, 1));
+    result.set_config(static_cast<re::LightingConfig>(Bits(config, 4, 4)));
+    result.set_enable_shadow(Bits(config, 0, 1));
+    // Claude fix 2026-11-19 (differential oracle vs production, golden/keyfuzz): the shadow fields are zero unless enable_shadow.
+    if (Bits(config, 0, 1)) {
+        result.set_shadow_primary(Bits(config, 16, 1));
+        result.set_shadow_secondary(Bits(config, 17, 1));
+        result.set_shadow_invert(Bits(config, 18, 1));
+        result.set_shadow_alpha(Bits(config, 19, 1));
+        result.set_shadow_selector(Bits(config, 24, 2));
+    }
+    result.set_bump_selector(Bits(config, 22, 2));
+    result.set_clamp_highlights(Bits(config, 27, 1));
+    result.set_bump_mode(static_cast<re::LightingBumpMode>(Bits(config, 28, 2)));
+    result.set_bump_renorm(!Bits(config, 30, 1));
+
+    for (u32 slot = 0; slot < result.src_num(); ++slot) {
+        const u32 light = Bits(regs[freg::kLightingLightEnable], slot * 4, 3);
+        const u32 flags = regs[freg::kLight0 + light * freg::kLightStride + freg::kLightConfig];
+        auto& dest = result.lights[slot];
+        dest.SetField(0, 3, light);
+        dest.SetField(3, 2, Bits(flags, 0, 2));
+        dest.SetField(5, 1, !Bits(disabled, 24 + light, 1));
+        dest.SetField(6, 1, !Bits(disabled, 8 + light, 1));
+        dest.SetField(7, 2, Bits(flags, 2, 2));
+        dest.SetField(9, 1, !Bits(disabled, light, 1));
+    }
+
+    constexpr std::array fields{
+        &LightConfig::lut_d0, &LightConfig::lut_d1, &LightConfig::lut_sp, &LightConfig::lut_fr,
+        &LightConfig::lut_rb, &LightConfig::lut_rg, &LightConfig::lut_rr,
+    };
+    // Reflection input and scale fields are ordered B, G, R. The disable bits are ordered R, G, B.
+    constexpr std::array disable_bits{16u, 17u, 0u, 19u, 22u, 21u, 20u};
+    constexpr u32 spotlight_slot = 2;
+    // Claude fix 2026-11-19: the reserved codes 4 and 5 give scale 0 in production (differential oracle).
+    constexpr std::array scales{1.0f, 2.0f, 4.0f, 8.0f, 0.0f, 0.0f, 0.25f, 0.5f};
+    for (u32 slot = 0; slot < fields.size(); ++slot) {
+        if (slot != spotlight_slot && Bits(disabled, disable_bits[slot], 1)) {
+            continue;
+        }
+        auto& lut = result.*fields[slot];
+        const u32 shift = 4 * slot;
+        lut.set_enable(1);
+        lut.set_abs_input(!Bits(regs[freg::kLightingAbsLutInput], shift + 1, 1));
+        lut.set_type(static_cast<re::LightingLutInput>(Bits(regs[freg::kLightingLutInput], shift, 3)));
+        lut.SetScale(scales[Bits(regs[freg::kLightingLutScale], shift, 3)]);
+    }
+    return result;
+}
+
+ProcTexConfig DecodeProcTex(const RegisterFile& regs) {
+    ProcTexConfig result{};
+    const u32 main = regs[freg::kMainConfig];
+    if (!Bits(main, 10, 1)) {
+        return result;
+    }
+    const u32 config = regs[freg::kProcTex];
+    const u32 lut = regs[freg::kProcTexLut];
+    const u32 offsets = regs[freg::kProcTexLutOffset];
+    result.set_enable(1);
+    result.set_coord(Bits(main, 8, 2));
+    result.set_u_clamp(static_cast<re::ProcTexClamp>(Bits(config, 0, 3)));
+    result.set_v_clamp(static_cast<re::ProcTexClamp>(Bits(config, 3, 3)));
+    result.set_color_combiner(static_cast<re::ProcTexCombiner>(Bits(config, 6, 4)));
+    result.set_alpha_combiner(static_cast<re::ProcTexCombiner>(Bits(config, 10, 4)));
+    result.set_separate_alpha(Bits(config, 14, 1));
+    result.set_noise_enable(Bits(config, 15, 1));
+    result.set_u_shift(static_cast<re::ProcTexShift>(Bits(config, 16, 2)));
+    result.set_v_shift(static_cast<re::ProcTexShift>(Bits(config, 18, 2)));
+    result.set_lut_filter(static_cast<re::ProcTexFilter>(Bits(lut, 0, 3)));
+    result.lod_min = static_cast<u16>(Bits(lut, 3, 4));
+    result.lod_max = static_cast<u16>(Bits(lut, 7, 4));
+    result.lut_width = static_cast<s32>(Bits(lut, 11, 8));
+    result.lut_offset0 = static_cast<s32>(Bits(offsets, 0, 8));
+    result.lut_offset1 = static_cast<s32>(Bits(offsets, 8, 8));
+    result.lut_offset2 = static_cast<s32>(Bits(offsets, 16, 8));
+    result.lut_offset3 = static_cast<s32>(Bits(offsets, 24, 8));
+    return result;
+}
+
+bool NeedsBlendEmulation(const BlendConfig& blend, const DeviceProfile& profile) {
+    return blend.RequiresMinMaxEmulation() && !profile.has_blend_minmax_factor && !blend.UsesNoOpFactors();
+}
+
+bool WrapUsesBorder(re::WrapMode wrap) {
+    return wrap == re::WrapMode::ClampToBorder || wrap == re::WrapMode::ClampToBorder2;
 }
 
 } // namespace
 
-FragmentKey MakeKey(const pica::PicaState& state) {
-    return MakeKey(state, FeatureRegistry::Global());
-}
-
-FragmentKey MakeKey(const pica::PicaState& state, const FeatureRegistry& features) {
-    FragmentKey key;
-    key.framebuffer = MakeFramebuffer(state);
-    key.texture = MakeTexture(state);
-    key.lighting = MakeLighting(state);
-    key.proctex = MakeProcTex(state);
-    // lod_free of a unit nothing reads would only tell keys apart
-    for (u32 unit = 0; unit < 3; ++unit) {
-        const LightConfig& l = key.lighting;
-        const bool lighting_reads = l.enable() != 0 && ((l.bump_mode() != re::LightingBumpMode::None && l.bump_selector() == unit) ||
-                                                        (l.enable_shadow() != 0 && l.shadow_selector() == unit));
-        if (!lighting_reads && !TevUsesSource(key, 3 + unit)) {
-            key.texture.set_lod_free(unit, 0);
-        }
-    }
-    for (const FeatureModule* feature : features.All()) {
-        feature->Key(state, key, ReservedWords{key.user.raw, key.gas.raw});
-    }
-    if (ShadersAsBefore()) {
-        key.user.raw |= kUserShadersAsBefore;
-    }
-    return key;
-}
-
-namespace {
-std::atomic<bool> g_shaders_as_before{false};
-}
 void SetShadersAsBefore(bool on) {
-    g_shaders_as_before.store(on, std::memory_order_relaxed);
+    shaders_as_before.store(on, std::memory_order_relaxed);
 }
+
 bool ShadersAsBefore() {
-    return g_shaders_as_before.load(std::memory_order_relaxed);
+    return shaders_as_before.load(std::memory_order_relaxed);
 }
 
 void FramebufferConfig::ApplyProfile(const DeviceProfile& profile) {
-    // Emulate the logic op in the shader if needed and not supported.
-    if (!profile.logic_op && alphablend_enable() == 0) {
-        set_logic_op(requested_logic_op);
-    }
-
-    if (alphablend_enable() == 0) {
-        return;
-    }
-
-    // Check if we don't need blend min/max emulation. (The profile is always a Vulkan one.)
-    if (profile.has_blend_minmax_factor) {
-        requested_rgb_blend.SetMinMaxEmulationDisabled();
-        requested_alpha_blend.SetMinMaxEmulationDisabled();
-    } else {
-        // VK_BLEND_OP_MIN/MAX ignore the blend factors, unlike the PICA hardware.
-        if (requested_rgb_blend.UsesNoOpFactors()) {
-            requested_rgb_blend.SetMinMaxEmulationDisabled();
-        }
-        if (requested_alpha_blend.UsesNoOpFactors()) {
-            requested_alpha_blend.SetMinMaxEmulationDisabled();
+    set_logic_op((alphablend_enable() || profile.logic_op) ? re::LogicOp::Copy : requested_logic_op);
+    if (alphablend_enable()) {
+        for (auto* blend : {&requested_rgb_blend, &requested_alpha_blend}) {
+            if (!NeedsBlendEmulation(*blend, profile)) {
+                blend->SetMinMaxEmulationDisabled();
+            }
         }
     }
 }
 
 void TextureConfig::ApplyProfile(const DeviceProfile& profile) {
-    // Emulate the custom border colour if needed and not supported.
-    if (profile.custom_border_color) {
-        return;
-    }
-    for (u32 i = 0; i < 3; ++i) {
-        texture_border_color[i].set_enable_s(requested_wrap[i].s == re::WrapMode::ClampToBorder ? 1 : 0);
-        texture_border_color[i].set_enable_t(requested_wrap[i].t == re::WrapMode::ClampToBorder ? 1 : 0);
+    for (size_t i = 0; i < requested_wrap.size(); ++i) {
+        texture_border_color[i].set_enable_s(!profile.custom_border_color && WrapUsesBorder(requested_wrap[i].s));
+        texture_border_color[i].set_enable_t(!profile.custom_border_color && WrapUsesBorder(requested_wrap[i].t));
     }
 }
 
 void FragmentKey::ApplyProfile(const DeviceProfile& profile) {
     framebuffer.ApplyProfile(profile);
     texture.ApplyProfile(profile);
+}
+
+FragmentKey MakeKey(const pica::PicaState& state) {
+    return MakeKey(state, FeatureRegistry::Global());
+}
+
+FragmentKey MakeKey(const pica::PicaState& state, const FeatureRegistry& features) {
+    const bool legacy = ShadersAsBefore();
+    FragmentKey key{};
+    key.framebuffer = DecodeFramebuffer(state.regs);
+    key.lighting = DecodeLighting(state.regs);
+    key.texture = DecodeTexture(state.regs);
+    key.proctex = DecodeProcTex(state.regs);
+    FindLodFreeUnits(state.regs, key, legacy);
+    for (const auto* feature : features.All()) {
+        feature->Key(state, key, {key.user.raw, key.gas.raw});
+    }
+    if (legacy) {
+        key.user.raw |= kUserShadersAsBefore;
+    }
+    return key;
 }
 
 void Needs::Merge(const Needs& other) {
@@ -311,29 +292,20 @@ void Needs::Merge(const Needs& other) {
     lut_lf |= other.lut_lf;
     lut_rg |= other.lut_rg;
     lut_rgba |= other.lut_rgba;
-    texture_units = texture_units > other.texture_units ? texture_units : other.texture_units;
+    texture_units = std::max(texture_units, other.texture_units);
     ordered_rmw |= other.ordered_rmw;
 }
 
 Needs CoreNeedsOf(const FragmentKey& key, const DeviceProfile& profile) {
-    Needs needs;
-    const FramebufferConfig& fb = key.framebuffer;
+    const auto& fb = key.framebuffer;
+    Needs needs{};
     needs.shadow_write_pass = fb.shadow_rendering() != 0;
     needs.fixup_gs = key.lighting.enable() != 0;
-
-    if (fb.shadow_rendering() == 0) {
-        // A logic op the profile emulates (blending off) reads the destination for eleven of the 16.
-        if (!profile.logic_op && fb.alphablend_enable() == 0 && LogicOpReadsDestination(fb.requested_logic_op)) {
-            needs.dst_copy = true;
-        }
-        // A min/max half that the profile emulates (both factors not One: hardware MIN and MAX ignore them).
-        if (fb.alphablend_enable() != 0) {
-            const bool rgb = fb.requested_rgb_blend.RequiresMinMaxEmulation() &&
-                             (profile.has_blend_minmax_factor ? false : !fb.requested_rgb_blend.UsesNoOpFactors());
-            const bool alpha = fb.requested_alpha_blend.RequiresMinMaxEmulation() &&
-                               (profile.has_blend_minmax_factor ? false : !fb.requested_alpha_blend.UsesNoOpFactors());
-            needs.dst_copy = needs.dst_copy || rgb || alpha;
-        }
+    if (!needs.shadow_write_pass) {
+        needs.dst_copy = fb.alphablend_enable()
+            ? NeedsBlendEmulation(fb.requested_rgb_blend, profile)
+                || NeedsBlendEmulation(fb.requested_alpha_blend, profile)
+            : !profile.logic_op && LogicOpReadsDestination(fb.requested_logic_op);
     }
     return needs;
 }
@@ -344,7 +316,7 @@ Needs NeedsOf(const FragmentKey& key, const DeviceProfile& profile) {
 
 Needs NeedsOf(const FragmentKey& key, const DeviceProfile& profile, const FeatureRegistry& features) {
     Needs needs = CoreNeedsOf(key, profile);
-    for (const FeatureModule* feature : features.All()) {
+    for (const auto* feature : features.All()) {
         needs.Merge(feature->NeedsOf(key, profile));
     }
     return needs;

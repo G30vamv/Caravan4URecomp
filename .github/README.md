@@ -1,4 +1,4 @@
-<p align="center"><img src="icon.png" alt="Caravan4URecomp icon" width="160"></p>
+<p align="center"><img src="images/banner.png" alt="Caravan4URecomp: Monster Hunter 4 Ultimate on Windows" width="100%"></p>
 
 # Caravan4URecomp
 
@@ -7,38 +7,58 @@
 Caravan4URecomp is my Windows port of [4u-native](https://github.com/khorne-hub/4u-native) by khorne-hub. It is a **modified
 version**: it is not the official 4u-native, and it is not made or endorsed by khorne-hub. All the hard work (the
 recompiler, the runtime and the original app) is theirs and CompaLarios18's, and I'm very grateful for it. What I added is
-a Windows shell around that runtime.
+a Windows shell around that runtime, a launcher, and my own code for a large part of what the runtime did with code
+derived from Azahar.
 
 [Leer en español](#español)
 
 **This project includes no game code, game files, ROMs or keys. You need your own copy of the game.**
 
+<p align="center">
+  <img src="images/launcher-play.png" alt="The launcher: Play tab" width="48%">
+  <img src="images/launcher-graphics.png" alt="The launcher: Graphics tab" width="48%">
+</p>
+
+## What's new in 0.4.0
+
+This is a big one: it collects everything I did since 0.3.1.
+
+- **A launcher** (`Caravan4URecomp-Launcher.exe`). It opens before the game, lets you change every option of the in-game menu and also the ones that only apply when the game starts (internal resolution, HD textures, the render thread...), manages your mods and shows your saves and the game's log. It updates the program by itself, downloading only the files that changed instead of the whole zip. See [The launcher](#the-launcher).
+- **The cutscene skip works.** Tab skips the cutscene when you eat and the one after a monster dies (it taps the Skip button of the touch screen). You can choose the key and a controller button in the launcher or in the in-game menu (Controls), and the button you choose keeps doing what it does in the game.
+- **Music no longer drags in the village.** The sound could lose a few percent of its frames when the game was busy, which made the music slow and uneven and the audio stutter. The audio now catches up and has a larger safety buffer.
+- **The frame counter shows the frames the game really runs.** With a 30 fps limit it shows 30 (before it counted screen refreshes, so it said 60).
+- **Two new screen layouts:** *large* (a big top screen with the small touch screen beside it) and a real *overlay* (the touch screen always over the picture). The old "overlay" with no size drew two fixed-size screens in a corner.
+- **More of the runtime is my own code.** The kernel, many services, the DSP and the renderer's main parts now have independent implementations that I checked against the previous behaviour (traces, audio comparisons, screenshots). The online part still uses Azahar's room protocol on purpose, so rooms stay compatible.
+- **An optional render thread** (`gpu_thread` in the ini, or in the launcher) that sends the drawing to its own thread.
+- **Controllers:** my own reader for DualSense, DualShock 4 and generic HID pads (only used when nothing else sees the controller), and an offer to add the program to HidHide's list if it is hiding your PlayStation controller.
+- **Smaller things:** `F8` (or Share + R3) puts a time mark in the log, to find what happened when you noticed a problem; Discord Rich Presence (off with `discord_presence = off`); `hd_textures = off` to skip the texture pack; a tidier `.ini`; and a fix for the controller's duplicated presses in the menu.
+
 ## Status
 
 I'd rather be upfront about what I have actually tested.
 
-**Working (tested on Windows 11, NVIDIA RTX 4070):**
-- The game boots and runs at 60 fps with the USA version, v1.3.0.
-- Character creation, a full quest and a complete hunt, without crashes.
-- Keyboard, mouse (as the stylus of the touch screen) and controller, including typing a hunter's name with a controller.
-- Windowed and fullscreen (F11 or Alt+Enter), resizing, and a 3x internal resolution by default.
-- The top screen fills the window; the touch screen appears as a small popup over it only when the game is waiting for you
-  there (the save selection and character creation, the game's keyboard, a few town pages), and the mouse works on it.
-- An in-game settings menu (see below).
-- Network rooms that speak the same protocol as Azahar's: I joined a real public room from the in-game menu while the game was running, and I played Local Play in a Gathering Hall with another player.
-- Scales up to 8x the 3DS's resolution, and a frame counter that shows the frames you actually see.
+**Working (tested on Windows 11, NVIDIA RTX 4070, mostly with the USA version v1.3.0):**
+- The game boots and runs; character creation, quests and complete hunts, without crashes. In the village with HD textures at 6x it runs at about 90 to 115 fps; in cutscenes it reaches my display's 165.
+- Keyboard, mouse (as the stylus of the touch screen) and controller, including a DualSense over Bluetooth and typing a hunter's name with a controller.
+- Windowed and fullscreen (F11 or Alt+Enter), resizing, and an internal resolution of 1x to 8x.
+- The skip button for the cutscene of eating and the one after killing a monster.
+- The in-game menu and the launcher: I checked each page, changed options and saw them applied.
+- Network rooms that speak the same protocol as Azahar's: I joined a real public room from the menu while the game was running, and I played Local Play in a Gathering Hall with another player.
+- Saves backups, and mods listed, turned on and off and ordered from the launcher.
 
 **Not tested yet:**
-- The new Controls, Saves and Mods pages: I tested them with the keyboard and with a copy of my saves; remapping a controller button, restoring a backup and dropping a mod have not been tried by other people yet.
-- The one-click **Host a room** and **Join with the copied address** buttons of the Online page (new in 0.2.0), and the touch screen staying up while you are in a room.
-- The mouse as the camera (**F3**, or `mouse_camera = on` in the ini).
+- The **update system of the launcher** against a real release: 0.4.0 is the first one that has it, so there is nothing newer to update to yet. It has been tested with local files.
+- The launcher on other PCs and on Windows 10, and with other languages than English and Spanish.
+- The new controller reader with real controllers (a DualSense over Bluetooth works through the usual path), and the HidHide offer.
+- The Discord card on a real profile (I checked the protocol with a test client).
+- The skip button in cutscenes other than the two above, and the mouse as the camera (**F3**, or `mouse_camera = on`).
 - Resolutions of 9x and 10x: the picture still comes out black there.
-- Other GPUs and drivers, Windows 10, and building with MSVC (I build with clang from llvm-mingw).
-- Windows and Android crossplay.
+- Other GPUs and drivers, building with MSVC (I build with clang from llvm-mingw), and Windows and Android crossplay.
+- A few moments still stutter a little (the roar of some monsters, and very high frame-rate limits); I'm looking into them.
 
 ## Getting it
 
-The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.3.1**, tagged `windows-v0.3.1`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.4.0**, tagged `windows-v0.4.0`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
@@ -52,16 +72,40 @@ SmartScreen warning: "More info", then "Run anyway". You can also build it yours
 
 ## First start
 
-Open `Caravan4URecomp.exe`. The first time it asks for the two game files and builds the game's code library for your PC,
-which takes a few minutes and downloads only the part of a compiler that it needs (about 50 MB; each file is checked against its SHA-256). After that the game starts
-straight away. `--setup` repeats this step if you change files. What it builds is made from your game: keep it for
-yourself and don't share it.
+Unzip everything in a folder you can write to, and open `Caravan4URecomp-Launcher.exe` (or `Caravan4URecomp.exe` directly:
+it works the same). The first time you press Play, the game asks for the two game files and builds the game's code library for
+your PC, which takes a few minutes and downloads only the part of a compiler that it needs (about 50 MB; each file is checked
+against its SHA-256). After that the game starts straight away. `--setup` (or the button in the launcher) repeats this step if
+you change files. What it builds is made from your game: keep it for yourself and don't share it.
+
+## The launcher
+
+`Caravan4URecomp-Launcher.exe` sits next to the program and edits `Caravan4URecomp.ini`, the same file the in-game menu uses.
+Everything is saved as soon as you change it.
+
+- **Play:** a summary of your settings, the Play button, quick actions and the last lines of the game's log.
+- **Graphics, Game, Controls, Audio, Online, Saves, System:** every option of the in-game menu, and the ones that only apply
+  when the game starts (the game is closed while the launcher is open, so it can always change them). Hover an option for
+  its explanation.
+- **Mods:** add a mod as a `.zip` or a folder, turn mods on and off, change their order and remove them. A mod that changes the
+  game's files works; a mod that changes its code is installed turned off, because the game's library is built without it.
+- **Saves:** opens your saves, your guild cards and quests, and the automatic backups.
+- **Updates:** it looks for a new version when it opens (you can turn that off in the gear menu) and, if you accept, downloads
+  only the files that changed, checks each one against its SHA-256, replaces them and opens again. Your settings, your saves
+  and your game folder are never touched, and the files it replaces are kept in a backup folder next to the program.
+- The gear menu has the launcher's own options: its language (English or Spanish), animations, the Acrylic effect of Windows 11
+  and whether it minimizes while you play.
+
+<p align="center"><img src="images/launcher-mods.png" alt="The launcher: Mods tab" width="70%"></p>
+
+The launcher is Python (PySide6) code adapted from the launcher of my MH3U port, in this project's colours. You can build it with
+`windows\launcher\build_launcher.ps1` (it needs Python with PySide6-Essentials, Pillow and PyInstaller).
 
 ## Controls
 
 Keyboard: F = A, Space = B, V = X, E = Y, Enter = Start, Backspace = Select, arrows = D-pad, W A S D = left stick,
 O L K ; = right stick, Q = ZL, C = ZR, left Ctrl = L, left Shift = R, Tab = skip a cutscene. The mouse is the stylus on
-the bottom screen. A controller works as it is.
+the bottom screen. A controller works as it is. Every button can be changed in the launcher or in the in-game menu.
 
 ### In-game menu
 
@@ -69,43 +113,52 @@ Press **F1** or **L3 + R3** on a controller. It works with the keyboard, the mou
 right click to go back) and the controller (D-pad or left stick, A and B; LB and RB, or Q and E, change the page). The
 design comes from the menu of my MH3U port, with this game's colours, in the Cinzel font (SIL Open Font License).
 
+<p align="center">
+  <img src="images/menu-graphics.png" alt="The in-game menu: Graphics" width="48%">
+  <img src="images/menu-controls.png" alt="The in-game menu: Controls" width="48%">
+</p>
+
 - **Graphics:** fullscreen, VSync, screen layout, picture shape (the 3DS's own 5:3 with bars on a wide screen, stretched to fill the window, or a fixed ratio), internal resolution (auto, or 1x to 8x the 3DS's; needs a restart), FPS counter.
 - **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 120, 180, 240, 300, 360 or unlimited), steady
   frame rate, particle effects.
 - **Audio:** volume.
-- **Controls:** every 3DS button with its key and its controller button. Press Enter on one, then the key or the controller's button or trigger you want (Backspace puts it back). The sticks and F1, F2, F3 and F11 stay as they are.
+- **Controls:** the key and the controller's button that skip a cutscene, and every 3DS button with its key and its controller button. Press Enter on one, then the key or the controller's button or trigger you want (Backspace puts it back). The sticks and F1, F2, F3 and F11 stay as they are.
 - **Saves:** backups of your saves. One is made by hand, or automatically each time the game starts if the saves changed (the newest 5 automatic ones are kept). Enter twice on a backup puts it back the next time the game starts, after a backup of what was there.
 - **Mods:** drop a mod's folder or .zip on the window to install it, turn mods on and off and set their order (they apply the next time the game starts). Mods that change the game's files work; mods that change its code are installed turned off, because the game's library is built without them.
 - **System:** the language of the menu (English or Spanish; "auto" follows Windows), resume and quit.
 - **Online:** nickname, host a room, join with the copied address, public rooms, join by address, leave.
 
-The default screen layout is the **popup** one described above: **F2** shows or hides the touch screen by hand, and the
-menu lets you choose when it shows (auto, always, hidden), its size and its corner. The classic layouts (stacked, overlay,
-single, side) are still there. Every change is saved to `Caravan4URecomp.ini`, next to the program, as soon as you make it, so it survives closing the game
-normally or not. A few settings (the internal resolution, HD textures, and going back to "default" in the game options) only
-apply the next time the game starts: the menu saves them, says so, and lists them until you close the game; it never
-restarts anything by itself. **Graphics > Open the HD textures folder** opens the folder for texture packs.
+The default screen layout is the **popup** one: the top screen fills the window and the touch screen appears over it, only when
+the game is waiting for you there; **F2** shows or hides it by hand, and the menu lets you choose when it shows (auto, always,
+hidden), its size and its corner. The other layouts are **stacked**, **overlay** (the touch screen always over the picture),
+**single**, **side** and **large** (a big top screen with a small touch screen at its right). Every change is saved to
+`Caravan4URecomp.ini` as soon as you make it. A few settings (the internal resolution, HD textures, the render thread and going
+back to "default" in the game options) only apply the next time the game starts: the menu saves them, says so, and lists them
+until you close the game; it never restarts anything by itself. **Graphics > Open the HD textures folder** opens the folder for
+texture packs.
 
-## Frame rate and resolution
+## Frame rate, resolution and sound
 
-- **Frame rate:** the limit goes up to 360 fps. The counter shows the frames that reach your screen, not the ones the game
-  makes: with a heavy internal resolution the two can differ, and then it feels choppy even if the game runs fast. With VSync
-  on you get at most your display's refresh rate, so "display" in the limit setting is the natural choice. If it feels
-  uneven at a high refresh rate, lower the internal resolution (on my screen 3x and 5x showed almost no lost frames at 144 fps, and 7x lost about 15 %). Each frame the game shows is read back from the GPU, so the highest rate the game can show depends on the internal resolution: about 580 fps at 3x, 160 at 6x and 97 at 8x. A higher limit, including unlimited, is held at that. Before 0.3.0, unlimited (or a very high limit) with a high internal resolution could leave the picture black.
+- **Frame rate:** the limit goes up to 360 fps. The counter shows the frames the game really runs (with a 30 fps limit, 30), which
+  can be lower than the screen's refresh. With VSync on you can see at most your display's refresh rate, so "display" in the
+  limit setting is the natural choice. If it feels uneven at a high refresh rate, lower the internal resolution. Each frame the
+  game shows is read back from the GPU, so the highest rate depends on the internal resolution: about 580 fps at 3x, 160 at 6x and
+  97 at 8x. In a busy scene (the village with HD textures at 6x on my PC) the game runs at about 90 to 115 fps whatever the limit.
 - **Internal resolution (1x to 8x):** everything the GPU draws (the 3D scene, the HUD and the text) is rendered at that multiple
   of the 3DS's resolution; "auto" picks the one closest to your window. The game's own textures stay at their original
   resolution, so edges get sharper but not more detailed. HD texture packs made for Azahar and Citra (PNG, their folder
   layout and hashes) are supported by the runtime: put them under `game\user\load\textures`. At 9x and 10x the picture
-  is still black on my card (8x works since 0.2.0), so the menu stops at 8x.
+  is still black on my card, so the menu stops at 8x.
 - **Picture shape:** the 3DS's top screen is 5:3, so on a 16:9 screen there are black bars at the sides. **Graphics > Picture
   shape > stretch** fills the whole window (the picture is stretched a little); the fixed ratios are there too.
+- **Sound:** the audio buffer is 60 ms by default; `options = --audio-latency 100` in the ini makes it larger if you hear cuts.
 
 ## Playing online
 
 The rooms are the same kind Azahar uses, so players on this port, on Azahar and on 4u-native for Android can share a
 room. Everyone needs MH4U USA v1.3.0.
 
-1. Open the menu, **Online**, and choose a nickname.
+1. Open the menu (or the launcher's Online page), and choose a nickname.
 2. To **host**: choose **Host a room**. The program looks for a Radmin VPN, Hamachi, ZeroTier or Tailscale address on your PC
    (with one of those there is no router to open) and otherwise for your local network's, and **copies the address with
    its port** (for example `26.1.2.3:24872`) to the clipboard. Send it to your friends. Without a VPN you need the UDP port (24872 by default) open on your router.
@@ -124,27 +177,26 @@ You need CMake, Ninja, [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) (UCR
 PowerShell window:
 
 ```
-powershell -ExecutionPolicy Bypass -File windows\build.ps1
-powershell -ExecutionPolicy Bypass -File windows\package.ps1
+powershell -ExecutionPolicy Bypass -File windows\build.ps1 [-Launcher]
+powershell -ExecutionPolicy Bypass -File windows\package.ps1 -Version 0.4.0
 ```
 
-`build.ps1` downloads SDL3 and builds the program; `package.ps1` makes the zip. The game's code library is built on each
-player's PC from their own files, and it is never part of this repository.
+`build.ps1` downloads SDL3 and builds the program (with `-Launcher` it builds the launcher too); `package.ps1` makes the zip.
+The game's code library is built on each player's PC from their own files, and it is never part of this repository.
 
 ## What I changed in 4u-native
 
-- New: the `windows/` folder (the Windows shell, the in-game menu, the build and packaging scripts).
+- New: the `windows/` folder (the Windows shell, the in-game menu, the launcher in `windows/launcher/`, the build and packaging scripts).
+- New: `mh4n/native/own/`, my own implementations of services and of the DSP (apt, cfg, ptm, fs, ir, y2r, small services, the DSP core and its service), and in `mh4n/native/src/` the new parts of the kernel, the renderer and the loader that replace code derived from Azahar. The previous implementations stay in the source tree (the tests still use them).
 - New: `mh4n/native/src/applets/extrapad.{h,cpp}`, a minimal Extrapad applet so the Circle Pad Pro option in the game's
   settings doesn't close the game.
-- Changed: `mh4n/port/src/hooks.cpp` and `hooks.h` (one counter, `TouchScreenObjects`, of the layout objects the game draws on
-  the touch screen, which the shell uses to know when the touch screen has something on it).
-- Changed: `mh4n/native/src/gpu/native/native_gpu.cpp` (the renderer uses the Vulkan device the window shell already has, and the
+- Changed: `mh4n/port/src/hooks.cpp` and `hooks.h` (a counter of the objects the game draws on the touch screen, the skip button, the frame counter and the frame limiter's own numbers).
+- Changed: `mh4n/native/src/gpu/native/native_gpu.cpp` and the files around it (the renderer uses the Vulkan device the window shell already has, and the
   screen is read out without a one-pixel shift that Azahar's software renderer has and that drew a wrong line along the top
-  of the picture; the same fix is in `gpu_capture/image.cpp` and `display_mem/display_mem.cpp`, and in the two tests that
-  expected the old index),
+  of the picture).
+- Changed: `mh4n/native/src/screen_layout/` (the *large* layout and the fixed overlay) and `mh4n/native/app/audio/`, `mh4n/native/src/audio_out/` (the audio buffer and its diagnostics).
 - Changed: `mh4n/port/src/onescreen_table.h` (a generated table, edited by hand: the Gathering Hall's player list stays on
-  the touch screen instead of covering the top one),
-  `mh4n/native/src/services/apt/applet_manager.cpp` and `mh4n/native/src/applets/CMakeLists.txt`.
+  the touch screen instead of covering the top one), `mh4n/native/src/services/apt/applet_manager.cpp` and `mh4n/native/src/applets/CMakeLists.txt`.
 
 Every changed file says so in its header. The Android app is untouched.
 
@@ -162,7 +214,9 @@ Every changed file says so in its header. The Android app is untouched.
 Free software under the [GNU General Public License, version 3](../LICENSE) or (at your option) any later version. The code
 by khorne-hub carries [additional terms](../ADDITIONAL-TERMS), which still apply: keep the author's credits, mark a changed
 version as changed and don't present it as the official one, and give the license and the complete source code with
-every copy of the program. New code of this port: Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors.
+every copy of the program. New code of this port: Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. The launcher's
+Python code is mine, under the GNU Affero General Public License v3, and it bundles PySide6 (LGPL-3.0), Pillow and PyInstaller
+(see `windows/THIRD_PARTY_NOTICES_WINDOWS`).
 
 This project is not affiliated with, endorsed by or sponsored by the Great C or the Great N. Monster Hunter is a trademark
 of the Great C. The 3DS is a trademark of the Great N. It contains no game code, game data, ROMs or keys. Use it only with
@@ -177,18 +231,22 @@ a copy of the game you own.
 Caravan4URecomp es mi port para Windows de [4u-native](https://github.com/khorne-hub/4u-native), de khorne-hub. Es una
 **versión modificada**: no es la oficial ni está hecha ni respaldada por khorne-hub. El trabajo difícil (el recompilador,
 el runtime y la app original) es de ellos y de CompaLarios18, y se lo agradezco mucho. Yo añadí un shell para Windows
-alrededor de ese runtime.
+alrededor de ese runtime, un launcher y código propio para buena parte de lo que el runtime hacía con código derivado de Azahar.
 
 **No incluye el juego.** Necesitas tu propia copia descifrada de Monster Hunter 4 Ultimate (USA) y su update v1.3.0.
 
-**Estado:** probado en Windows 11 con una RTX 4070: el juego corre a 60 fps, he completado una misión y una cacería,
-funciona con teclado, ratón y mando, y entré a una sala pública real de Azahar desde el menú del juego. Todavía no he
-probado Local Play con otras personas, otras GPU, Windows 10 ni MSVC.
+**Novedades de la 0.4.0:**
+- **Un launcher** (`Caravan4URecomp-Launcher.exe`): cambia todas las opciones del menú del juego y también las que solo valen al abrirlo (escala de resolución, texturas HD, hilo de render...), gestiona tus mods, enseña tus partidas y el registro del juego, y **se actualiza solo** bajando únicamente los archivos que cambian, sin tener que descargar el zip completo.
+- **El skip de cinemáticas funciona:** Tab salta la de comer y la de la muerte del monstruo. Puedes elegir la tecla y un botón del mando en el launcher o en el menú del juego, y ese botón sigue haciendo lo suyo en el juego.
+- **La música ya no se arrastra en la aldea:** el sonido perdía unos puntos porcentuales de sus frames cuando el juego iba justo, y sonaba lento y entrecortado. Ahora los recupera y tiene un colchón mayor.
+- **El contador de fps muestra los fotogramas reales del juego** (con límite 30 marca 30).
+- **Dos disposiciones de pantalla nuevas:** *large* (pantalla de arriba grande con la táctil pequeña a su lado) y un *overlay* de verdad (la táctil siempre sobre la imagen).
+- **Más código propio:** el kernel, varios servicios, el DSP y las partes principales del renderizador tienen implementaciones independientes que comprobé contra el comportamiento anterior. La parte online sigue usando el protocolo de salas de Azahar a propósito, para ser compatible.
+- Hilo de render opcional, lector propio de mandos DualSense/DualShock 4/HID, aviso de HidHide, marca de tiempo en el log con `F8`, Discord Rich Presence, opción `hd_textures` y un `.ini` más ordenado.
 
-**Cómo se usa:** la última versión es la 0.3.1, en la página de Releases (con su suma SHA-256). Abre `Caravan4URecomp.exe`: la
-primera vez pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con
-**F1** o **L3 + R3**, y tiene gráficos, juego, audio y online. Online usa las mismas salas que Azahar: menú → Online →
-**Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
+**Estado:** probado en Windows 11 con una RTX 4070: el juego corre, he completado misiones y cacerías, funciona con teclado, ratón y mando (también un DualSense por Bluetooth), entré a una sala pública real de Azahar y jugué Local Play con otra persona. En la aldea con texturas HD a 6x va a unos 90–115 fps. **Sin probar todavía:** el sistema de actualización del launcher contra una release real (la 0.4.0 es la primera que lo trae), el launcher en otros PC y en Windows 10, el lector de mandos nuevo con mandos reales, la tarjeta de Discord, 9x y 10x (siguen en negro), otras GPU y MSVC. Algunos momentos aún se entrecortan un poco (el rugido de algunos monstruos y los límites de fps muy altos).
 
-Para compilarlo: `windows\build.ps1` y `windows\package.ps1` (CMake, Ninja, llvm-mingw y Python). Los créditos y la licencia
+**Cómo se usa:** la última versión es la 0.4.0, en la página de Releases (con su suma SHA-256). Descomprime todo en una carpeta y abre `Caravan4URecomp-Launcher.exe` (o `Caravan4URecomp.exe` directamente). La primera vez que pulses Jugar te pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con **F1** o **L3 + R3**. Online usa las mismas salas que Azahar: menú → Online → **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
+
+Para compilarlo: `windows\build.ps1 [-Launcher]` y `windows\package.ps1 -Version 0.4.0` (CMake, Ninja, llvm-mingw y Python). Los créditos y la licencia
 están arriba; los términos adicionales de khorne-hub siguen aplicando.

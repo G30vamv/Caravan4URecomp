@@ -108,6 +108,9 @@ public:
     double Factor() const { return factor_.load(std::memory_order_relaxed); }
     double SteeredFill() const { return steered_fill_.load(std::memory_order_relaxed); }
     u64 Callbacks() const { return callbacks_.load(std::memory_order_relaxed); }
+    // MODIFIED (diagnostic): the largest block SDL asked for, and the longest time between two requests (ms), since the last call
+    u64 TakeMaxRequest() { return max_request_.exchange(0, std::memory_order_relaxed); }
+    u64 TakeMaxRequestGapUs() { return max_request_gap_us_.exchange(0, std::memory_order_relaxed); }
     u64 DiscardedFrames() const { return discarded_.load(std::memory_order_relaxed); }
     audio_out::StreamSink& Stream() { return *stream_; }
 
@@ -130,6 +133,8 @@ private:
     std::atomic<double> factor_{1.0};
     std::atomic<double> steered_fill_{0.0};
     std::atomic<u64> callbacks_{0};
+    std::atomic<u64> max_request_{0};
+    std::atomic<u64> max_request_gap_us_{0};
     std::atomic<u64> discarded_{0};
 };
 

@@ -61,19 +61,26 @@ inline constexpr u32 kBottomHeight = 240;
 //               - ix), that is, each column is stored bottom to top. (Scaled sizes: use the
 //               screen's height in image pixels.)
 // CPU pixels are always upright.
-enum class Orientation : u32 { Upright = 0, Rotated90 = 1 };
+enum class Orientation : u32 {
+    Upright = 0,
+    Rotated90 = 1,
+    // As Rotated90, and the rows (the displayed x) run the other way: image row iy holds displayed column
+    // (displayed width - 1 - iy). (A display transfer that did not flip its input; MODIFIED for the Windows port.)
+    Rotated90Mirrored = 2,
+};
+constexpr bool IsRotated(Orientation o) { return o != Orientation::Upright; }
 
 // A pixel position in a rotated image, from a displayed one. `x` and `y` are in scaled displayed
 // pixels (displayed pixels times the scale, so 0..width*scale-1 and 0..height*scale-1), and
-// `scaled_height`: the displayed height in image pixels (the screen's height at 1x times the scale).
+// `scaled_width` and `scaled_height`: the displayed size in image pixels (the screen's size at 1x times the scale).
 struct PixelPos {
     u32 x;
     u32 y;
     friend bool operator==(const PixelPos&, const PixelPos&) = default;
 };
-constexpr PixelPos ToImagePixel(Orientation orientation, u32 scaled_height, u32 x, u32 y) {
-    return orientation == Orientation::Upright ? PixelPos{x, y}
-                                               : PixelPos{scaled_height - 1 - y, x};
+constexpr PixelPos ToImagePixel(Orientation orientation, u32 scaled_width, u32 scaled_height, u32 x, u32 y) {
+    if (orientation == Orientation::Upright) return {x, y};
+    return {scaled_height - 1 - y, orientation == Orientation::Rotated90Mirrored ? scaled_width - 1 - x : x};
 }
 
 // A rectangle of a backend image, in image pixels, in the image's own (stored) orientation.
@@ -182,10 +189,10 @@ struct ScreenImage {
     }
     // The size `region` must have for this screen, in the stored orientation.
     u32 StoredWidth() const {
-        return orientation == Orientation::Rotated90 ? ScaledHeight() : ScaledWidth();
+        return IsRotated(orientation) ? ScaledHeight() : ScaledWidth();
     }
     u32 StoredHeight() const {
-        return orientation == Orientation::Rotated90 ? ScaledWidth() : ScaledHeight();
+        return IsRotated(orientation) ? ScaledWidth() : ScaledHeight();
     }
     // True when exactly one form is set and its sizes agree: a nonzero displayed size and scale;
     // for a backend image, a region of StoredWidth x StoredHeight; for CPU pixels, scale 1 and
@@ -237,6 +244,11 @@ public:
     // sinks all say so may give a screen in that form (the native renderer's screens on Android); the screens it has no
     // such picture of still come as before. Asked when the sink is added.
     virtual bool WantsSharedPictures() const {
+        return false;
+    }
+    // The sink draws screens given as images of the shared backend (ScreenImage::image) on its own device: a display whose
+    // sinks all say so may publish the renderer's own pictures with no read back (the Windows presenter).
+    virtual bool WantsBackendImages() const {
         return false;
     }
     // Nothing shows screen `screen`'s picture now (0 the top screen, 1 the touch screen): the Android app's touch screen

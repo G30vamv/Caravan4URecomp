@@ -1,1039 +1,835 @@
-// Written for N2-16: nothing is copied from Azahar here (see caching_provider.h for what was read).
-#include "gpu/pipeline/caching_provider.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: caching_provider.h, provider_host.h, gpu_pipeline_test, existing cache files and the Vulkan pipeline cache header specification.
+
+#include "caching_provider.h"
 
 #include <algorithm>
-#include <atomic>
+#include <array>
+#include <tuple>
 #include <chrono>
-#include <cstdlib>
 #include <condition_variable>
-#include <deque>
+#include <cstdlib>
+#include <list>
 #include <mutex>
-#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
-#include <fmt/format.h>
-
-#include "common/utf8.h"
-#include "gpu/pipeline/files.h"
-#include "gpu/pipeline/key_codec.h"
+#include "cache_bytes.h"
+#include "files.h"
+#include "key_codec.h"
 #include "mh4n/log.h"
-#include "mh4n/registry.h"
-
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#elif defined(__linux__)
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
-#include "mh4n/host_thread_name.h"
-#include "mh4n/pipeline_progress.h"
-
-namespace mh4n::pipeline_progress {
-namespace {
-std::atomic<uint32_t> g_done{0}, g_total{0};
-std::atomic<bool> g_compiling{false};
-}  // namespace
-State Get() {
-    return State{g_done.load(std::memory_order_relaxed), g_total.load(std::memory_order_relaxed),
-                 g_compiling.load(std::memory_order_relaxed)};
-}
-}  // namespace mh4n::pipeline_progress
 
 namespace mh4n::gpu::pipeline {
 namespace {
 
-using native::PipelineKey;
-using native::ShaderTextHash;
 using Clock = std::chrono::steady_clock;
+using native::PipelineHandle;
+using native::PipelineKey;
+using native::PipelineReadiness;
 
-constexpr const char* kLog = "Pipelines";
-constexpr u64 kListFormat = 1;
-constexpr u64 kVertexFormat = 1;
-constexpr u64 kSpirvFormat = 1;
-// Past this many SPIR-V entries the ones no run asked for since the store was read are not written again.
-constexpr size_t kSpirvKeep = 4096;
+constexpr char kLog[] = "Pipelines";
+constexpr u64 kFileVersion = 1;
 
-double MsSince(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Clock::now() - start).count(); }
+enum class BuildState { New, Queued, Building, Ready, Failed };
+enum class Queue { Urgent, Startup };
 
-// The workers yield to the renderer and the game's threads.
-void LowerThreadPriority() {
-#if defined(_WIN32)
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-#elif defined(__linux__)
-    setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 5);
-#endif
+struct Entry {
+    explicit Entry(const PipelineKey& key_) : key(key_) {}
+
+    PipelineKey key;
+    BuildState state = BuildState::New;
+    Queue queue = Queue::Urgent;
+    std::list<Entry*>::iterator position;
+    std::shared_ptr<rhi::Pipeline> pipeline;
+    std::string error;
+    u32 uses = 0;
+    u32 order = 0;
+    bool listed = false;
+};
+
+double Milliseconds(Clock::duration duration) {
+    return std::chrono::duration<double, std::milli>(duration).count();
 }
 
-void Put32(std::vector<u8>& out, u32 v) {
-    for (u32 i = 0; i < 4; ++i) out.push_back(static_cast<u8>(v >> (8 * i)));
+u32 DefaultWorkers() {
+    const u32 cores = std::thread::hardware_concurrency();
+    return std::clamp(cores / 2, 2u, 5u) - 1;
 }
-void Put64(std::vector<u8>& out, u64 v) {
-    Put32(out, static_cast<u32>(v));
-    Put32(out, static_cast<u32>(v >> 32));
-}
-u32 Get32(const u8* p) {
-    u32 v = 0;
-    for (u32 i = 0; i < 4; ++i) v |= static_cast<u32>(p[i]) << (8 * i);
-    return v;
-}
-u64 Get64(const u8* p) { return Get32(p) | (static_cast<u64>(Get32(p + 4)) << 32); }
 
-// The driver's file is named after the device the empty cache's header names (VkPipelineCacheHeaderVersionOne: the
-// header's size and version, vendorID, deviceID, pipelineCacheUUID), so two devices of one machine keep a file each.
-std::string DriverFileName(const std::vector<u8>& empty_cache) {
-    if (empty_cache.size() < 32) {
-        return "driver.bin";
+std::filesystem::path DriverFile(rhi::Backend& backend) {
+    // The version-one Vulkan header identifies the blob even before the first pipeline is built.
+    const auto header = backend.SavePipelineCache();
+    if (header.size() < 32) {
+        return {};
     }
-    std::string uuid;
-    for (u32 i = 16; i < 24; ++i) uuid += fmt::format("{:02x}", empty_cache[i]);
-    return fmt::format("driver-{:04x}-{:04x}-{}.bin", Get32(empty_cache.data() + 8), Get32(empty_cache.data() + 12), uuid);
+    disk::Reader in(header);
+    const u32 size = in.Read<u32>();
+    const u32 version = in.Read<u32>();
+    if (size < 32 || size > header.size() || version != 1) {
+        return {};
+    }
+    const u32 vendor = in.Read<u32>();
+    const u32 device = in.Read<u32>();
+    std::string name = fmt::format("driver-{:04x}-{:04x}-", vendor, device);
+    for (const u8 byte : in.Take(8)) {
+        name += fmt::format("{:02x}", byte);
+    }
+    return name + ".bin";
 }
 
-// ---- the SPIR-V store ------------------------------------------------------------------------------------------------
-
-class SpirvFileStore final : public native::SpirvStore {
+class SpirvCache final : public native::SpirvStore {
 public:
-    bool Find(const ShaderTextHash& hash, std::vector<u32>& spirv) override {
+    bool Find(const native::ShaderTextHash& hash, std::vector<u32>& spirv) override {
         std::lock_guard lock(mutex_);
-        const auto it = map_.find(hash);
-        if (it == map_.end()) {
-            ++misses_;
+        const auto it = shaders_.find(hash);
+        if (it == shaders_.end()) {
             return false;
         }
         it->second.used = true;
         spirv = it->second.words;
-        ++hits_;
         return true;
     }
-    void Put(const ShaderTextHash& hash, std::span<const u32> spirv) override {
+
+    void Put(const native::ShaderTextHash& hash, std::span<const u32> spirv) override {
         std::lock_guard lock(mutex_);
-        Entry& e = map_[hash];
-        e.words.assign(spirv.begin(), spirv.end());
-        e.used = true;
-        dirty_ = true;
+        auto [it, inserted] = shaders_.try_emplace(hash);
+        auto& entry = it->second;
+        entry.used = true;
+        if (inserted || !std::ranges::equal(spirv, entry.words)) {
+            words_ -= entry.words.size();
+            entry.words.assign(spirv.begin(), spirv.end());
+            words_ += entry.words.size();
+            ++revision_;
+        }
     }
 
-    // A record: the hash (a, b, length, stage) and the words.
     void Load(const Records& records) {
-        std::lock_guard lock(mutex_);
-        for (const auto& r : records) {
-            if (r.size() < 24 || (r.size() - 24) % 4 != 0) {
+        for (const auto& record : records) {
+            constexpr size_t kHashSize = 24;
+            if (record.size() <= kHashSize || (record.size() - kHashSize) % sizeof(u32) != 0) {
                 continue;
             }
-            ShaderTextHash h;
-            h.a = Get64(r.data());
-            h.b = Get64(r.data() + 8);
-            h.length = Get32(r.data() + 16);
-            h.stage = static_cast<native::ShaderStage>(Get32(r.data() + 20) & 0xFF);
-            Entry& e = map_[h];
-            e.words.resize((r.size() - 24) / 4);
-            for (size_t i = 0; i < e.words.size(); ++i) e.words[i] = Get32(r.data() + 24 + 4 * i);
-        }
-    }
-    bool Dirty() const {
-        std::lock_guard lock(mutex_);
-        return dirty_;
-    }
-    Records Snapshot() {
-        std::lock_guard lock(mutex_);
-        dirty_ = false;
-        const bool keep_all = map_.size() <= kSpirvKeep;
-        Records out;
-        out.reserve(map_.size());
-        for (const auto& [h, e] : map_) {
-            if (!keep_all && !e.used) {
+            disk::Reader in(record);
+            native::ShaderTextHash hash;
+            hash.a = in.Read<u64>();
+            hash.b = in.Read<u64>();
+            hash.length = in.Read<u32>();
+            const u32 stage = in.Read<u32>();
+            if (stage > static_cast<u32>(native::ShaderStage::Compute)) {
                 continue;
             }
-            std::vector<u8> r;
-            r.reserve(24 + 4 * e.words.size());
-            Put64(r, h.a);
-            Put64(r, h.b);
-            Put32(r, h.length);
-            Put32(r, static_cast<u32>(h.stage));
-            for (u32 w : e.words) Put32(r, w);
-            out.push_back(std::move(r));
+            hash.stage = static_cast<native::ShaderStage>(stage);
+            if (auto [it, inserted] = shaders_.try_emplace(hash); inserted) {
+                auto& words = it->second.words;
+                words.resize(in.Remaining() / sizeof(u32));
+                for (u32& word : words) {
+                    word = in.Read<u32>();
+                }
+                words_ += words.size();
+            }
         }
-        return out;
     }
-    size_t size() const {
-        std::lock_guard lock(mutex_);
-        return map_.size();
-    }
-    std::pair<u64, u64> HitsMisses() const {
-        std::lock_guard lock(mutex_);
-        return {hits_, misses_};
+
+    bool Save(const std::filesystem::path& path, u64 version, std::string& error) {
+        Records records;
+        u64 revision;
+        {
+            std::lock_guard lock(mutex_);
+            if (revision_ == saved_) {
+                return false;
+            }
+            if (words_ > (64 * 1024 * 1024) / sizeof(u32)) {
+                std::erase_if(shaders_, [&](const auto& item) {
+                    if (item.second.used) {
+                        return false;
+                    }
+                    words_ -= item.second.words.size();
+                    return true;
+                });
+            }
+            revision = revision_;
+            records.reserve(shaders_.size());
+            for (const auto& [hash, entry] : shaders_) {
+                auto& bytes = records.emplace_back();
+                bytes.reserve(24 + entry.words.size() * sizeof(u32));
+                disk::Append(bytes, hash.a);
+                disk::Append(bytes, hash.b);
+                disk::Append(bytes, hash.length);
+                disk::Append(bytes, static_cast<u32>(hash.stage));
+                for (const u32 word : entry.words) {
+                    disk::Append(bytes, word);
+                }
+            }
+        }
+        if (!WriteRecords(path, kKindSpirv, kFileVersion, version, records, &error)) {
+            return false;
+        }
+        saved_ = revision;
+        return true;
     }
 
 private:
-    struct Entry {
+    struct Shader {
         std::vector<u32> words;
         bool used = false;
     };
-    mutable std::mutex mutex_;
-    std::unordered_map<ShaderTextHash, Entry, native::ShaderTextHashHasher> map_;
-    bool dirty_ = false;
-    u64 hits_ = 0, misses_ = 0;
+
+    std::mutex mutex_;
+    std::unordered_map<native::ShaderTextHash, Shader, native::ShaderTextHashHasher> shaders_;
+    size_t words_ = 0;
+    u64 revision_ = 0;
+    u64 saved_ = 0;
 };
 
 }  // namespace
 
-// ---- the provider ----------------------------------------------------------------------------------------------------
-
 class CachingProvider final : public native::PipelineProvider {
 public:
-    CachingProvider(const native::ProviderHost& host, const CachingOptions& options);
-    ~CachingProvider() override;
-    CachingProvider(const CachingProvider&) = delete;
-    CachingProvider& operator=(const CachingProvider&) = delete;
+    CachingProvider(const native::ProviderHost& host, const CachingOptions& options)
+        : host_(host), options_(options),
+          worker_count_(options_.background ? (options_.workers == 0 ? DefaultWorkers() : options_.workers) : 0) {
+        Load();
+        if (options_.spirv_cache && host_.set_spirv_store) {
+            host_.set_spirv_store(&spirv_);
+        }
+    }
 
-    rhi::Result<native::PipelineHandle> Lookup(const PipelineKey& key) override;
-    native::PipelineReadiness Prepare(const PipelineKey& key, const PipelineKey& fallback) override;
-    void ReportMiss(const PipelineKey& key, std::string_view reason) override;
-    void Hurry(const PipelineKey& key) override;
-    native::ProviderCounters Counters() const override;
-    std::vector<native::FrameCounter> TakeFrameCounters() override;
+    void Start() {
+        for (u32 i = 0; i < worker_count_; ++i) {
+            workers_.emplace_back([this, i](std::stop_token stop) { Worker(stop, i); });
+        }
+        if (options_.warm) {
+            if (worker_count_ == 0) {
+                std::unique_lock lock(mutex_);
+                while (!startup_.empty()) {
+                    Build(lock, *startup_.front(), false);
+                }
+            }
+            WaitIdle();
+        }
+        if (!options_.folder.empty() && options_.save_seconds != 0) {
+            saver_ = std::jthread([this](std::stop_token stop) { Saver(stop); });
+        }
+    }
+
+    ~CachingProvider() override {
+        saver_.request_stop();
+        if (saver_.joinable()) {
+            saver_.join();
+        }
+        for (auto& worker : workers_) {
+            worker.request_stop();
+        }
+        workers_.clear();
+        Save();
+        if (options_.spirv_cache && host_.set_spirv_store) {
+            host_.set_spirv_store(nullptr);
+        }
+    }
+
+    rhi::Result<PipelineHandle> Lookup(const PipelineKey& key) override {
+        std::unique_lock lock(mutex_);
+        ++counters_.lookups;
+        const bool can_fallback = !key.IsFallback() && key.vertex.kind != native::VertexStageKind::QuaternionPass;
+        const bool forced = options_.force_ubershader && can_fallback;
+        if (forced) {
+            ++counters_.forced_uber;
+            ++frame_[Forced];
+        }
+
+        if (can_fallback && !forced && options_.background && !entries_.contains(key)) {
+            Get(key.AsFallback(), false);
+        }
+        auto& entry = Get(forced ? key.AsFallback() : key, true);
+        if (entry.state == BuildState::Ready) {
+            ++counters_.hits;
+            return PipelineHandle{entry.pipeline, forced, false};
+        }
+        if (!can_fallback || forced || !options_.background) {
+            if (options_.background && options_.never_wait && IsUnbuilt(entry)) {
+                Enqueue(entry);
+                return Skipped();
+            }
+            EnsureBuilt(lock, entry);
+            return Handle(entry, forced);
+        }
+
+        auto& fallback = Get(key.AsFallback(), false);
+        if (fallback.state == BuildState::Ready) {
+            Enqueue(entry);
+            if (entry.state != BuildState::Failed && !AllowFallback()) {
+                return Skipped();
+            }
+            ++counters_.hits;
+            return Handle(fallback, true);
+        }
+        if (options_.never_wait && (entry.state != BuildState::Failed || IsUnbuilt(fallback))) {
+            Enqueue(entry);
+            Enqueue(fallback);
+            return Skipped();
+        }
+        Enqueue(fallback);
+        EnsureBuilt(lock, entry);
+        if (entry.state == BuildState::Ready) {
+            return Handle(entry, false);
+        }
+        EnsureBuilt(lock, fallback);
+        return fallback.state == BuildState::Ready ? Handle(fallback, true) : Handle(entry, false);
+    }
+
+    PipelineReadiness Prepare(const PipelineKey& key, const PipelineKey& fallback_key) override {
+        std::unique_lock lock(mutex_);
+        const bool forced = options_.force_ubershader && key.vertex.kind != native::VertexStageKind::QuaternionPass;
+        if (!forced && options_.background && key != fallback_key &&
+            key.vertex.kind != native::VertexStageKind::QuaternionPass && !entries_.contains(key)) {
+            Get(fallback_key, false);
+        }
+        auto& entry = Get(forced ? key.AsFallback() : key, false);
+        if (entry.state == BuildState::Ready) {
+            return PipelineReadiness::Ready;
+        }
+        if (entry.state == BuildState::Failed) {
+            return PipelineReadiness::Failed;
+        }
+        if (forced || !options_.background || key == fallback_key || key.vertex.kind == native::VertexStageKind::QuaternionPass) {
+            if (options_.background && options_.never_wait) {
+                Enqueue(entry);
+                return PipelineReadiness::Pending;
+            }
+            EnsureBuilt(lock, entry);
+            return entry.state == BuildState::Ready ? PipelineReadiness::Ready : PipelineReadiness::Failed;
+        }
+
+        auto& fallback = Get(fallback_key, false);
+        if (fallback.state == BuildState::Ready) {
+            Enqueue(entry);
+            ++frame_[Pending];
+            return AllowFallback() ? PipelineReadiness::Fallback : PipelineReadiness::Pending;
+        }
+        Enqueue(fallback);
+        if (options_.never_wait) {
+            Enqueue(entry);
+            ++frame_[Pending];
+            return PipelineReadiness::Pending;
+        }
+        EnsureBuilt(lock, entry);
+        return entry.state == BuildState::Ready ? PipelineReadiness::Ready : PipelineReadiness::Failed;
+    }
+
+    void ReportMiss(const PipelineKey& key, std::string_view reason) override {
+        std::lock_guard lock(mutex_);
+        ++counters_.reported_misses;
+        Get(key, true);
+        MH4N_LOG(Debug, kLog, "pipeline {:016x} left out: {}", key.Hash(), reason);
+    }
+
+    void Hurry(const PipelineKey& key) override {
+        std::lock_guard lock(mutex_);
+        const auto found = entries_.find(key);
+        if (found == entries_.end() || found->second.state != BuildState::Queued) {
+            return;
+        }
+        auto& entry = found->second;
+        auto& from = entry.queue == Queue::Urgent ? urgent_ : startup_;
+        urgent_.splice(urgent_.begin(), from, entry.position);
+        entry.queue = Queue::Urgent;
+        work_.notify_all();
+    }
+
+    native::ProviderCounters Counters() const override {
+        std::lock_guard lock(mutex_);
+        return counters_;
+    }
+
+    std::vector<native::FrameCounter> TakeFrameCounters() override {
+        static constexpr std::array names{
+            "pipeline_sync_builds", "pipeline_sync_waits", "pipeline_sync_us", "pipeline_async_builds",
+            "pipeline_pending", "pipeline_forced_uber", "pipeline_skipped",
+        };
+        std::lock_guard lock(mutex_);
+        std::vector<native::FrameCounter> result;
+        for (size_t i = 0; i < names.size(); ++i) {
+            result.push_back({names[i], frame_[i]});
+        }
+        frame_.fill(0);
+        return result;
+    }
 
     CachingStats Stats() const {
         std::lock_guard lock(mutex_);
         return stats_;
     }
+
     void WaitIdle() {
         std::unique_lock lock(mutex_);
-        done_cv_.wait(lock, [&] { return stop_ || (urgent_.empty() && background_.empty() && building_ == 0); });
+        idle_.wait(lock, [this] { return urgent_.empty() && startup_.empty() && active_ == 0; });
     }
-    void Save(bool final) { WriteFiles(final); }
+
+    void Save();
 
 private:
-    enum class State : u8 { Queued, Building, Ready, Failed };
-    struct Entry {
-        State state = State::Queued;
-        bool urgent = false;  // in the urgent queue
-        std::shared_ptr<rhi::Pipeline> pipeline;
-        std::string error;
-        u32 uses = 0;
-        u32 order = 0;
-    };
-    struct Frame {
-        u64 sync_builds = 0, sync_waits = 0, sync_us = 0, async_builds = 0, pending = 0, forced_uber = 0, skipped = 0;
-    };
-    using Built = rhi::Result<std::shared_ptr<rhi::Pipeline>>;
+    enum Frame { SyncBuild, SyncWait, SyncTime, AsyncBuild, Pending, Forced, SkippedDraw, FrameCount };
 
-    // mutex_ held for all of these.
-    Entry& Insert(const PipelineKey& key, State state);
-    void Enqueue(const PipelineKey& key, Entry& entry, bool urgent);
-    void NoteWanted(const PipelineKey& key);  // a miss of the renderer: queued (urgent) unless it is under way
-    bool IsReady(const PipelineKey& key) const;
-    void QueueFallback(const PipelineKey& fallback);  // at the front of the background queue, unless it is known
-    void QueueUrgent(const PipelineKey& key);         // in the urgent queue, unless it is built or being built
-    bool FallbackAllowed();                           // one more fallback draw in this 8 ms (fallback_per_window)
-    Clock::time_point fallback_window_{};
-    u32 fallback_used_ = 0;
-    void Finish(Entry& entry, Built& built);
-    // Builds on the calling thread, or takes a Queued entry over, or waits for a worker; releases the lock meanwhile.
-    Built GetNow(std::unique_lock<std::mutex>& lock, const PipelineKey& key);
-
-    void Worker();
-    void Saver();
-    void ReportProgress();  // (mutex_ held: the saver's turn)
-    void Load();
-    void WriteFiles(bool final);
-
-    native::ProviderHost host_;
-    CachingOptions options_;
-    std::unique_ptr<SpirvFileStore> spirv_;
-    std::filesystem::path driver_path_;
-    Clock::time_point start_ = Clock::now();
-
-    mutable std::mutex mutex_;
-    std::condition_variable work_cv_, done_cv_, saver_cv_;
-    std::unordered_map<PipelineKey, Entry, native::PipelineKeyHash> table_;
-    PipelineKey last_ready_{};      // Prepare: the last key it found ready (under mutex_)
-    bool last_ready_valid_ = false;
-    std::deque<PipelineKey> urgent_, background_;
-    u32 building_ = 0;
-    u32 background_building_ = 0;  // builds taken from the background queue (one worker is kept for the urgent one)
-    u32 background_limit_ = 1;
-    u32 next_order_ = 0;
-    bool stop_ = false;
-    bool list_dirty_ = false;
-    u64 built_since_blob_ = 0;
-    bool precompile_reported_ = true;
-    u64 precompile_failures_ = 0;  // keys of the list the driver refused (the line "the list is compiled")
-    native::ProviderCounters total_;
-    Frame frame_;
-    CachingStats stats_;
-    // The builds and the draws left out since the saver's last progress line (ReportProgress), and its lines so far.
-    struct Progress {
-        u64 builds = 0, skipped = 0;
-        double ms = 0.0, longest_ms = 0.0;
-    } progress_;
-    u32 progress_lines_ = 0;
-    std::mutex save_mutex_;  // one WriteFiles at a time
-    std::vector<std::thread> workers_;
-    std::thread saver_;
-};
-
-CachingProvider::CachingProvider(const native::ProviderHost& host, const CachingOptions& options)
-    : host_(host), options_(options) {
-    host_.options = nullptr;  // valid only while the factory ran
-    Load();
-    u32 workers = options_.workers;
-    if (workers == 0) {
-        const u32 cores = std::max(1u, std::thread::hardware_concurrency());
-        workers = std::clamp(cores / 2, 2u, 5u) - 1;
-    }
-    background_limit_ = std::max(1u, workers - 1);
-    if (options_.background || !background_.empty()) {
-        for (u32 i = 0; i < workers; ++i) {
-            workers_.emplace_back([this] {
-                SetHostThreadName("mh4n-pipeline");
-                Worker();
-            });
+    Entry& Get(const PipelineKey& key, bool count_use) {
+        auto [it, inserted] = entries_.try_emplace(key, key);
+        auto& entry = it->second;
+        if (inserted) {
+            entry.order = next_order_++;
         }
+        if (count_use && entry.uses != UINT32_MAX) {
+            ++entry.uses;
+        }
+        if (inserted || count_use) {
+            ++list_revision_;
+        }
+        return entry;
     }
-    if (!options_.folder.empty()) {
-        saver_ = std::thread([this] {
-            SetHostThreadName("mh4n-pipesave");
-            Saver();
-        });
-    }
-    MH4N_LOG(Info, kLog, "{} worker{}, {}{}{}", workers_.size(), workers_.size() == 1 ? "" : "s",
-             options_.background ? "background compilation behind the ubershader" : "a miss is built on the renderer thread",
-             options_.force_ubershader ? ", every draw takes the ubershader" : "", options_.warm ? ", the list compiled first" : "");
-    if (options_.warm && !background_.empty()) {
-        const auto t0 = Clock::now();
-        WaitIdle();
-        MH4N_LOG(Info, kLog, "--warm: the list compiled in {:.0f} ms", MsSince(t0));
-    }
-}
 
-CachingProvider::~CachingProvider() {
-    {
-        std::lock_guard lock(mutex_);
-        stop_ = true;
+    static bool IsUnbuilt(const Entry& entry) {
+        return entry.state != BuildState::Ready && entry.state != BuildState::Failed;
     }
-    work_cv_.notify_all();
-    done_cv_.notify_all();
-    saver_cv_.notify_all();
-    for (std::thread& t : workers_) {
-        t.join();
-    }
-    if (saver_.joinable()) {
-        saver_.join();
-    }
-    WriteFiles(true);
-    {
-        std::lock_guard lock(mutex_);
-        MH4N_LOG(Info, kLog,
-                 "{} built on workers ({:.0f} ms), {} on the renderer thread ({:.0f} ms with {} waits), {} failed; {} keys known",
-                 stats_.async_builds, stats_.async_ms, stats_.sync_builds, stats_.sync_ms, stats_.sync_waits, stats_.failures,
-                 table_.size());
-    }
-    if (host_.set_spirv_store) {
-        host_.set_spirv_store(nullptr);
-    }
-}
 
-// ---- the table ----
-
-CachingProvider::Entry& CachingProvider::Insert(const PipelineKey& key, State state) {
-    Entry& e = table_.try_emplace(key).first->second;
-    e.state = state;
-    e.order = next_order_++;
-    list_dirty_ = true;
-    return e;
-}
-
-void CachingProvider::Enqueue(const PipelineKey& key, Entry& entry, bool urgent) {
-    if (urgent) {
-        entry.urgent = true;
-        urgent_.push_back(key);
-    } else {
-        background_.push_back(key);
+    static rhi::Result<PipelineHandle> Handle(const Entry& entry, bool fallback) {
+        if (entry.state == BuildState::Ready) {
+            return PipelineHandle{entry.pipeline, fallback, false};
+        }
+        return rhi::Error{entry.error};
     }
-    work_cv_.notify_one();
-}
 
-void CachingProvider::NoteWanted(const PipelineKey& key) {
-    const auto it = table_.find(key);
-    if (it == table_.end()) {
-        Entry& e = Insert(key, State::Queued);
-        e.uses = 1;
-        Enqueue(key, e, true);
-        return;
+    rhi::Result<PipelineHandle> Skipped() {
+        ++frame_[SkippedDraw];
+        return PipelineHandle{nullptr, false, true};
     }
-    Entry& e = it->second;
-    ++e.uses;
-    if (e.state == State::Queued && !e.urgent) {
-        Enqueue(key, e, true);  // from the start-up list to the front
-    }
-}
 
-bool CachingProvider::IsReady(const PipelineKey& key) const {
-    const auto it = table_.find(key);
-    return it != table_.end() && it->second.state == State::Ready;
-}
-
-bool CachingProvider::FallbackAllowed() {
-    if (!options_.use_fallback) {
-        return false;
-    }
-    if (options_.fallback_per_window == 0) {
+    bool AllowFallback() {
+        if (!options_.never_wait) {
+            return true;
+        }
+        if (!options_.use_fallback) {
+            return false;
+        }
+        if (options_.fallback_per_window == 0) {
+            return true;
+        }
+        const auto now = Clock::now();
+        if (now - fallback_window_ >= std::chrono::milliseconds(8)) {
+            fallback_window_ = now;
+            fallback_used_ = 0;
+        }
+        if (fallback_used_ >= options_.fallback_per_window) {
+            return false;
+        }
+        ++fallback_used_;
         return true;
     }
-    const Clock::time_point now = Clock::now();
-    if (now - fallback_window_ > std::chrono::milliseconds(8)) {
-        fallback_window_ = now;
-        fallback_used_ = 0;
-    }
-    if (fallback_used_ >= options_.fallback_per_window) {
-        return false;
-    }
-    ++fallback_used_;
-    return true;
-}
 
-void CachingProvider::QueueUrgent(const PipelineKey& key) {
-    const auto it = table_.find(key);
-    if (it == table_.end()) {
-        Entry& e = Insert(key, State::Queued);
-        e.uses = 1;
-        Enqueue(key, e, true);
-        return;
-    }
-    Entry& e = it->second;
-    ++e.uses;
-    if (e.state == State::Queued && !e.urgent) {
-        Enqueue(key, e, true);
-    }
-}
-
-void CachingProvider::Hurry(const PipelineKey& key) {
-    std::lock_guard lock(mutex_);
-    const auto it = table_.find(key);
-    if (it == table_.end() || it->second.state != State::Queued) {
-        return;  // (being built, built, failed or never asked for)
-    }
-    const auto at = std::find(urgent_.begin(), urgent_.end(), key);
-    if (at == urgent_.end() || at == urgent_.begin()) {
-        return;
-    }
-    urgent_.erase(at);
-    urgent_.push_front(key);
-}
-
-void CachingProvider::QueueFallback(const PipelineKey& fallback) {
-    if (table_.find(fallback) != table_.end()) {
-        return;  // queued, being built or failed
-    }
-    Insert(fallback, State::Queued);
-    background_.push_front(fallback);
-    work_cv_.notify_one();
-}
-
-void CachingProvider::Finish(Entry& entry, Built& built) {
-    if (built.ok() && *built != nullptr) {
-        entry.state = State::Ready;
-        entry.pipeline = *built;
-    } else {
-        entry.state = State::Failed;
-        entry.error = built.ok() ? "the build callback returned no pipeline" : built.error();
-        ++stats_.failures;
-        ++total_.build_failures;
-        // (the first 10, then one in 100 with the count: a driver that refuses every pipeline would fill the log)
-        if (stats_.failures <= 10 || stats_.failures % 100 == 0) {
-            MH4N_LOG(Warning, kLog, "a pipeline could not be built{}: {}",
-                     stats_.failures < 10    ? std::string()
-                     : stats_.failures == 10 ? std::string(" (10 so far; from now on one line in 100)")
-                                             : fmt::format(" ({} so far)", stats_.failures),
-                     entry.error);
-        }
-    }
-    ++built_since_blob_;
-}
-
-CachingProvider::Built CachingProvider::GetNow(std::unique_lock<std::mutex>& lock, const PipelineKey& key) {
-    bool counted = false;
-    for (;;) {
-        auto it = table_.find(key);
-        Entry* e = nullptr;
-        if (it == table_.end()) {
-            e = &Insert(key, State::Building);
-            e->uses = 1;
-            counted = true;
-        } else {
-            e = &it->second;
-            if (!counted) {
-                ++e->uses;
-                counted = true;
-            }
-            if (e->state == State::Ready) {
-                ++total_.hits;
-                return e->pipeline;
-            }
-            if (e->state == State::Failed) {
-                return rhi::Error{e->error};
-            }
-            if (e->state == State::Building) {
-                // A worker is building it: wait for that build rather than make it twice.
-                const auto t0 = Clock::now();
-                done_cv_.wait(lock, [&] { return e->state != State::Building || stop_; });
-                const double ms = MsSince(t0);
-                ++stats_.sync_waits;
-                stats_.sync_ms += ms;
-                ++frame_.sync_waits;
-                frame_.sync_us += static_cast<u64>(ms * 1000.0);
-                if (stop_ && e->state == State::Building) {
-                    return rhi::Error{"the pipeline provider is stopping"};
-                }
-                continue;
-            }
-            e->state = State::Building;  // Queued: built here, the worker skips it
-        }
-        ++building_;
-        lock.unlock();
-        const auto t0 = Clock::now();
-        Built built = host_.build(key);
-        const double ms = MsSince(t0);
-        lock.lock();
-        --building_;
-        Finish(*e, built);
-        ++stats_.sync_builds;
-        stats_.sync_ms += ms;
-        ++total_.sync_builds;
-        ++frame_.sync_builds;
-        frame_.sync_us += static_cast<u64>(ms * 1000.0);
-        done_cv_.notify_all();
-        if (e->state != State::Ready) {
-            return rhi::Error{e->error};
-        }
-        return e->pipeline;
-    }
-}
-
-// ---- the provider interface (the renderer thread) ----
-
-rhi::Result<native::PipelineHandle> CachingProvider::Lookup(const PipelineKey& key) {
-    std::unique_lock lock(mutex_);
-    ++total_.lookups;
-    native::PipelineHandle handle;
-    if (options_.force_ubershader) {
-        ++total_.forced_uber;
-        ++frame_.forced_uber;
-        Built fallback = GetNow(lock, key.AsFallback());
-        if (!fallback.ok()) {
-            return rhi::Error{fallback.error()};
-        }
-        handle.pipeline = *fallback;
-        handle.fallback = !key.IsFallback();
-        return handle;
-    }
-    const auto it = table_.find(key);
-    if (it != table_.end() && it->second.state == State::Ready) {
-        ++it->second.uses;
-        ++total_.hits;
-        handle.pipeline = it->second.pipeline;
-        return handle;
-    }
-    const PipelineKey fallback = key.AsFallback();
-    const bool failed = it != table_.end() && it->second.state == State::Failed;
-    if (options_.background && options_.never_wait && !failed && !key.IsFallback() &&
-        (!IsReady(fallback) || !FallbackAllowed())) {
-        // (no fallback, or this frame's few fallback draws are taken: the draw waits for its own pipeline, left out)
-        QueueUrgent(key);
-        if (!IsReady(fallback)) {
-            QueueFallback(fallback);
-        }
-        ++frame_.skipped, ++progress_.skipped;
-        handle.pending = true;
-        return handle;
-    }
-    if (options_.background && !key.IsFallback() && (failed || IsReady(fallback))) {
-        // The fallback while the own pipeline is built on a worker (for good when it failed).
-        if (!failed) {
-            NoteWanted(key);
-        } else if (options_.never_wait && !IsReady(fallback)) {  // (not built here either: the urgent queue)
-            QueueUrgent(fallback);
-            ++frame_.skipped, ++progress_.skipped;
-            handle.pending = true;
-            return handle;
-        }
-        Built made = GetNow(lock, fallback);
-        if (!made.ok()) {
-            return rhi::Error{made.error()};
-        }
-        handle.pipeline = *made;
-        handle.fallback = true;
-        return handle;
-    }
-    // No fallback yet (its first build can take seconds: the ubershader is large). By default the draw is left out: the
-    // key's own pipeline goes to the urgent queue (a specialised pipeline builds in tens of milliseconds) and the
-    // fallback to the background one, and the renderer thread neither builds nor waits (a fallback key asked for itself,
-    // a CPU-path draw's, goes to the urgent queue). With --pipeline-wait the key's own pipeline is built here, once.
-    if (options_.background && options_.never_wait && !failed) {
-        QueueUrgent(key);
-        if (!key.IsFallback()) {
-            QueueFallback(fallback);
-        }
-        ++frame_.skipped, ++progress_.skipped;
-        handle.pending = true;
-        return handle;
-    }
-    if (options_.background && !key.IsFallback()) {
-        QueueFallback(fallback);
-    }
-    Built own = GetNow(lock, key);
-    if (!own.ok()) {
-        return rhi::Error{own.error()};
-    }
-    handle.pipeline = *own;
-    return handle;
-}
-
-native::PipelineReadiness CachingProvider::Prepare(const PipelineKey& key, const PipelineKey& fallback) {
-    std::unique_lock lock(mutex_);
-    if (options_.force_ubershader) {
-        return native::PipelineReadiness::Ready;  // Lookup answers with this key's fallback
-    }
-    // The draw before mostly had the same key, and a pipeline once ready stays ready (nothing leaves the table): no
-    // hash and no table for it again.
-    if (last_ready_valid_ && last_ready_ == key) {
-        return native::PipelineReadiness::Ready;
-    }
-    const auto it = table_.find(key);
-    if (it != table_.end()) {
-        if (it->second.state == State::Ready) {
-            last_ready_ = key;
-            last_ready_valid_ = true;
-            return native::PipelineReadiness::Ready;
-        }
-        if (it->second.state == State::Failed) {
-            return native::PipelineReadiness::Failed;
-        }
-    }
-    if (options_.background) {
-        if (options_.never_wait && (!IsReady(fallback) || !FallbackAllowed())) {
-            QueueUrgent(key);
-            if (!IsReady(fallback)) {
-                QueueFallback(fallback);
-            }
-            ++frame_.skipped, ++progress_.skipped;
-            return native::PipelineReadiness::Pending;
-        }
-        if (IsReady(fallback)) {
-            NoteWanted(key);
-            ++frame_.pending;
-            return native::PipelineReadiness::Fallback;
-        }
-        QueueFallback(fallback);
-        if (options_.never_wait) {  // (Lookup's reason: nothing is built or waited for on the renderer thread)
-            QueueUrgent(key);
-            ++frame_.skipped, ++progress_.skipped;
-            return native::PipelineReadiness::Pending;
-        }
-    }
-    return GetNow(lock, key).ok() ? native::PipelineReadiness::Ready : native::PipelineReadiness::Failed;
-}
-
-void CachingProvider::ReportMiss(const PipelineKey&, std::string_view) {
-    std::lock_guard lock(mutex_);
-    ++total_.reported_misses;
-}
-
-native::ProviderCounters CachingProvider::Counters() const {
-    std::lock_guard lock(mutex_);
-    return total_;
-}
-
-std::vector<native::FrameCounter> CachingProvider::TakeFrameCounters() {
-    std::lock_guard lock(mutex_);
-    std::vector<native::FrameCounter> out;
-    out.reserve(6);
-    out.push_back({"pipeline_sync_builds", frame_.sync_builds});
-    out.push_back({"pipeline_forced_uber", frame_.forced_uber});
-    out.push_back({"pipeline_sync_waits", frame_.sync_waits});
-    out.push_back({"pipeline_sync_us", frame_.sync_us});
-    out.push_back({"pipeline_async_builds", frame_.async_builds});
-    out.push_back({"pipeline_pending", frame_.pending});
-    out.push_back({"pipeline_skipped", frame_.skipped});
-    frame_ = Frame{};
-    return out;
-}
-
-// ---- the workers and the saver ----
-
-void CachingProvider::Worker() {
-    LowerThreadPriority();
-    std::unique_lock lock(mutex_);
-    for (;;) {
-        work_cv_.wait(lock, [&] {
-            return stop_ || !urgent_.empty() || (!background_.empty() && background_building_ < background_limit_);
-        });
-        if (stop_) {
+    void Enqueue(Entry& entry, Queue queue = Queue::Urgent) {
+        if (entry.state == BuildState::Queued && entry.queue == Queue::Startup && queue == Queue::Urgent) {
+            urgent_.splice(urgent_.end(), startup_, entry.position);
+            entry.queue = Queue::Urgent;
+            work_.notify_all();
             return;
         }
-        const bool from_list = urgent_.empty();
-        std::deque<PipelineKey>& queue = from_list ? background_ : urgent_;
-        const PipelineKey key = std::move(queue.front());
-        queue.pop_front();
-        const auto it = table_.find(key);
-        if (it == table_.end() || it->second.state != State::Queued) {
-            continue;  // built meanwhile (the renderer took it over, or it was queued twice)
+        if (entry.state != BuildState::New) {
+            return;
         }
-        Entry& e = it->second;
-        e.state = State::Building;
-        ++building_;
-        background_building_ += from_list ? 1 : 0;
-        lock.unlock();
-        const auto t0 = Clock::now();
-        Built built = host_.build(key);
-        const double ms = MsSince(t0);
-        lock.lock();
-        --building_;
-        background_building_ -= from_list ? 1 : 0;
-        Finish(e, built);
+        auto& list = queue == Queue::Urgent ? urgent_ : startup_;
+        entry.queue = queue;
+        entry.position = list.insert(list.end(), &entry);
+        entry.state = BuildState::Queued;
+        work_.notify_all();
+    }
+
+    void EnsureBuilt(std::unique_lock<std::mutex>& lock, Entry& entry) {
+        if (entry.state == BuildState::Building) {
+            const auto start = Clock::now();
+            ++stats_.sync_waits;
+            ++frame_[SyncWait];
+            idle_.wait(lock, [&] { return entry.state != BuildState::Building; });
+            AddSyncTime(Clock::now() - start);
+        } else if (IsUnbuilt(entry)) {
+            Build(lock, entry, false);
+        }
+    }
+
+    void AddSyncTime(Clock::duration duration) {
+        stats_.sync_ms += Milliseconds(duration);
+        frame_[SyncTime] += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(duration).count());
+    }
+
+    void Build(std::unique_lock<std::mutex>& lock, Entry& entry, bool async);
+    void Worker(std::stop_token stop, u32 index);
+    void Saver(std::stop_token stop);
+    void Load();
+
+    const native::ProviderHost host_;
+    const CachingOptions options_;
+    const u32 worker_count_;
+    mutable std::mutex mutex_;
+    std::condition_variable_any work_;
+    std::condition_variable idle_;
+    std::unordered_map<PipelineKey, Entry, native::PipelineKeyHash> entries_;
+    std::list<Entry*> urgent_, startup_;
+    size_t active_ = 0;
+    size_t startup_fallbacks_ = 0;
+    u32 next_order_ = 0;
+    native::ProviderCounters counters_;
+    CachingStats stats_;
+    std::array<u64, FrameCount> frame_{};
+    Clock::time_point fallback_window_;
+    u32 fallback_used_ = 0;
+    u64 period_builds_ = 0;
+    double period_ms_ = 0;
+    double longest_ms_ = 0;
+
+    std::mutex save_mutex_;
+    SpirvCache spirv_;
+    std::filesystem::path driver_file_;
+    u64 list_revision_ = 0, list_saved_ = 0;
+    u64 driver_revision_ = 0, driver_saved_ = 0;
+    std::vector<std::jthread> workers_;
+    std::jthread saver_;
+};
+
+void CachingProvider::Build(std::unique_lock<std::mutex>& lock, Entry& entry, bool async) {
+    if (entry.state == BuildState::Queued) {
+        (entry.queue == Queue::Urgent ? urgent_ : startup_).erase(entry.position);
+    }
+    entry.state = BuildState::Building;
+    ++active_;
+    lock.unlock();
+    const auto start = Clock::now();
+    auto built = [&]() -> rhi::Result<std::shared_ptr<rhi::Pipeline>> {
+        try {
+            return host_.build(entry.key);
+        } catch (const std::exception& error) {
+            return rhi::Error{error.what()};
+        }
+    }();
+    const auto duration = Clock::now() - start;
+    lock.lock();
+
+    if (built && *built) {
+        entry.pipeline = std::move(*built);
+        entry.state = BuildState::Ready;
+        ++driver_revision_;
+    } else {
+        entry.error = built ? "builder returned an empty pipeline" : built.error();
+        entry.state = BuildState::Failed;
+        ++stats_.failures;
+        ++counters_.build_failures;
+    }
+    if (async) {
         ++stats_.async_builds;
-        stats_.async_ms += ms;
-        ++frame_.async_builds;
-        ++progress_.builds;
-        progress_.ms += ms;
-        progress_.longest_ms = std::max(progress_.longest_ms, ms);
-        if (from_list) {
-            ++stats_.precompiled;
-            precompile_failures_ += e.state == State::Failed ? 1 : 0;
-            pipeline_progress::g_done.store(static_cast<uint32_t>(stats_.precompiled), std::memory_order_relaxed);
-            work_cv_.notify_one();  // the background queue may go on
+        ++frame_[AsyncBuild];
+        const double elapsed = Milliseconds(duration);
+        stats_.async_ms += elapsed;
+        ++period_builds_;
+        period_ms_ += elapsed;
+        longest_ms_ = std::max(longest_ms_, elapsed);
+    } else {
+        ++stats_.sync_builds;
+        ++counters_.sync_builds;
+        ++frame_[SyncBuild];
+        AddSyncTime(duration);
+    }
+    if (entry.listed) {
+        if (entry.key.IsFallback()) {
+            --startup_fallbacks_;
         }
-        if (!precompile_reported_ && urgent_.empty() && background_.empty() && building_ == 0) {
-            precompile_reported_ = true;
-            pipeline_progress::g_compiling.store(false, std::memory_order_relaxed);
-            MH4N_LOG(Info, kLog, "the list is compiled ({} keys built on workers, {} failed, {:.0f} ms after the start)",
-                     stats_.precompiled, precompile_failures_, MsSince(start_));
+        if (++stats_.precompiled == stats_.listed) {
+            MH4N_LOG(Info, kLog, "the list is compiled ({} pipelines)", stats_.listed);
+            period_builds_ = 0;
+            period_ms_ = 0;
+            longest_ms_ = 0;
         }
-        done_cv_.notify_all();
+    }
+    --active_;
+    work_.notify_all();
+    idle_.notify_all();
+}
+
+void CachingProvider::Worker(std::stop_token stop, u32 index) {
+    const bool can_precompile = options_.warm || worker_count_ == 1 || index != 0;
+    std::unique_lock lock(mutex_);
+    const auto startup_ready = [&] {
+        return can_precompile && !startup_.empty() &&
+               (startup_fallbacks_ == 0 || startup_.front()->key.IsFallback());
+    };
+    while (work_.wait(lock, stop, [&] { return !urgent_.empty() || startup_ready(); }) && !stop.stop_requested()) {
+        Entry& entry = *(urgent_.empty() ? startup_.front() : urgent_.front());
+        Build(lock, entry, true);
     }
 }
 
-void CachingProvider::Saver() {
+void CachingProvider::Saver(std::stop_token stop) {
     std::unique_lock lock(mutex_);
-    while (!stop_) {
-        saver_cv_.wait_for(lock, std::chrono::seconds(std::max(1u, options_.save_seconds)), [&] { return stop_; });
-        if (stop_) {
+    while (!stop.stop_requested()) {
+        work_.wait_for(lock, stop, std::chrono::seconds(options_.save_seconds), [] { return false; });
+        if (stop.stop_requested()) {
             break;
         }
-        ReportProgress();
-        const bool dirty = list_dirty_ || built_since_blob_ > 0 || (spirv_ != nullptr && spirv_->Dirty());
-        if (!dirty) {
-            continue;
+        const bool compiling = stats_.precompiled < stats_.listed;
+        if (compiling || period_ms_ >= 1000.0) {
+            const double average = period_builds_ == 0 ? 0 : period_ms_ / static_cast<double>(period_builds_);
+            if (compiling) {
+                MH4N_LOG(Info, kLog, "{} builds, {:.1f} ms each (the longest {:.1f} ms), the list not compiled yet ({}/{})",
+                         period_builds_, average, longest_ms_, stats_.precompiled, stats_.listed);
+            } else {
+                MH4N_LOG(Info, kLog, "{} builds, {:.1f} ms each (the longest {:.1f} ms)", period_builds_, average, longest_ms_);
+            }
         }
+        period_builds_ = 0;
+        period_ms_ = 0;
+        longest_ms_ = 0;
         lock.unlock();
-        WriteFiles(false);
+        Save();
         lock.lock();
     }
 }
-
-// At the saver's turn (every save_seconds), while the list is still being compiled, or when the builds since the last
-// turn took a second or more of the workers' time: how far the list is, the builds of that time and how long each took,
-// the draws left out meanwhile (no pipeline yet) and what is still queued. The list is done within 0.3-3 s on the
-// phones' logs (an Adreno 610 on 0.1.8 included); a phone where it is never done in a session of minutes (4u-native #43:
-// an Adreno 610 at 7-8 FPS at 1x as at 3x, no "the list is compiled" line) then says whether its builds each take long
-// (the driver's cache missed: full compiles) or few are made (the workers kept from the cores). The first 15 lines, then
-// one in 15.
-void CachingProvider::ReportProgress() {
-    const Progress p = progress_;
-    progress_ = Progress{};
-    const bool listing = !precompile_reported_;
-    if (!listing && p.ms < 1000.0) {
-        return;
-    }
-    const u32 n = ++progress_lines_;
-    if (n > 15 && n % 15 != 0) {
-        return;
-    }
-    MH4N_LOG(Info, kLog, "{:.0f} s after the start, {}the last {} s: {} builds, {:.0f} ms each (the longest {:.0f} ms), {} draws "
-                         "left out; {} urgent and {} more queued{}",
-             MsSince(start_) / 1000.0,
-             listing ? fmt::format("the list not compiled yet ({} built from it so far, {} failed); ", stats_.precompiled,
-                                   precompile_failures_)
-                     : std::string(),
-             std::max(1u, options_.save_seconds), p.builds, p.builds > 0 ? p.ms / static_cast<double>(p.builds) : 0.0,
-             p.longest_ms, p.skipped, urgent_.size(), background_.size(),
-             n == 15 ? " (from now on one line in 15)" : "");
-}
-
-// ---- the files ----
 
 void CachingProvider::Load() {
     if (options_.folder.empty()) {
-        MH4N_LOG(Info, kLog, "no folder (no --user or --pipeline-dir, or --no-pipeline-files): nothing is read or written");
         return;
     }
-    const std::filesystem::path& dir = options_.folder;
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    const bool geometry_shader = host_.backend == nullptr || host_.backend->Caps().geometry_shader;
-
-    // The driver's blob, before any pipeline is made.
-    std::string driver = "off";
-    if (options_.driver_cache && host_.backend != nullptr) {
-        driver_path_ = dir / DriverFileName(host_.backend->SavePipelineCache());
-        if (std::optional<std::vector<u8>> blob = ReadBytes(driver_path_)) {
-            stats_.driver_blob_loaded = host_.backend->LoadPipelineCache(*blob);
-            driver = fmt::format("{} KiB {}", blob->size() / 1024, stats_.driver_blob_loaded ? "loaded" : "refused");
-        } else {
-            driver = "none";
+    if (options_.driver_cache && host_.backend) {
+        const auto name = DriverFile(*host_.backend);
+        if (!name.empty()) {
+            driver_file_ = options_.folder / name;
+            if (const auto bytes = ReadBytes(driver_file_)) {
+                stats_.driver_blob_loaded = host_.backend->LoadPipelineCache(*bytes);
+            }
         }
     }
 
-    // The SPIR-V.
-    std::string spirv = "off";
-    if (options_.spirv_cache) {
-        spirv_ = std::make_unique<SpirvFileStore>();
-        Records records;
-        const ReadStatus status = ReadRecords(dir / "spirv.bin", kKindSpirv, kSpirvFormat, host_.spirv_compiler_version, records);
-        spirv_->Load(records);
-        spirv = status == ReadStatus::Ok ? fmt::format("{} shaders", spirv_->size()) : ToString(status);
-        if (host_.set_spirv_store) {
-            host_.set_spirv_store(spirv_.get());
+    Records records;
+    if (options_.spirv_cache &&
+        ReadRecords(options_.folder / "spirv.bin", kKindSpirv, kFileVersion, host_.spirv_compiler_version, records) ==
+            ReadStatus::Ok) {
+        spirv_.Load(records);
+    }
+    if (!options_.list) {
+        return;
+    }
+    std::unordered_set<u64> sources;
+    if (host_.load_vertex_source &&
+        ReadRecords(options_.folder / "vertex.bin", kKindVertex, kFileVersion, host_.vertex_source_version, records) ==
+            ReadStatus::Ok) {
+        for (const auto& record : records) {
+            if (const auto id = host_.load_vertex_source(record)) {
+                sources.insert(*id);
+            }
         }
     }
 
-    // The vertex sources and the list.
-    std::string list = "off";
-    if (options_.list) {
-        Records sources;
-        const ReadStatus vstatus =
-            ReadRecords(dir / "vertex.bin", kKindVertex, kVertexFormat, host_.vertex_source_version, sources);
-        std::unordered_set<u64> restored;
-        for (const auto& r : sources) {
-            if (host_.load_vertex_source) {
-                if (std::optional<u64> id = host_.load_vertex_source(r)) {
-                    restored.insert(*id);
-                }
-            }
-        }
-        Records records;
-        const ReadStatus status = ReadRecords(dir / "keys.bin", kKindKeys, kListFormat, native::kPipelineKeyVersion, records);
-        struct Item {
-            PipelineKey key;
-            u32 uses, order;
-        };
-        std::vector<Item> items;
-        u64 dropped = 0;
-        for (const auto& r : records) {
-            if (r.size() < 8) {
-                ++dropped;
-                continue;
-            }
-            std::optional<PipelineKey> key = DecodeKey(std::span<const u8>(r).subspan(8));
-            if (!key || (key->vertex.kind == native::VertexStageKind::Translated && restored.count(key->vertex.program) == 0) ||
-                (key->fixup == native::FixupStage::FixedGeometry && !geometry_shader) || table_.count(*key) != 0) {
-                ++dropped;  // not a key of this build, or a vertex stage that cannot be made here
-                continue;
-            }
-            if (key->IsFallback() && !options_.background) {
-                ++dropped;  // (no ubershader here, --no-ubershader: a PowerVR's compiler crashed building it)
-                continue;
-            }
-            items.push_back(Item{*key, Get32(r.data()), Get32(r.data() + 4)});
-        }
-        // The fallbacks first (they stop a first draw from stalling), then by decreasing use count.
-        std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
-            if (a.key.IsFallback() != b.key.IsFallback()) return a.key.IsFallback();
-            return a.uses > b.uses;
-        });
-        for (const Item& item : items) {
-            Entry& e = table_.try_emplace(item.key).first->second;
-            e.state = State::Queued;
-            e.uses = item.uses;
-            e.order = item.order;
-            next_order_ = std::max(next_order_, item.order + 1);
-            Enqueue(item.key, e, false);
-        }
-        stats_.listed = items.size();
-        precompile_reported_ = items.empty();
-        pipeline_progress::g_done.store(0, std::memory_order_relaxed);
-        pipeline_progress::g_total.store(static_cast<uint32_t>(items.size()), std::memory_order_relaxed);
-        pipeline_progress::g_compiling.store(!items.empty(), std::memory_order_relaxed);
-        list = status == ReadStatus::Ok
-                   ? fmt::format("{} keys ({} fallbacks; {} dropped), {} vertex sources", items.size(),
-                                 std::count_if(items.begin(), items.end(), [](const Item& i) { return i.key.IsFallback(); }),
-                                 dropped, restored.size())
-                   : fmt::format("{} (vertex sources: {})", ToString(status), ToString(vstatus));
+    if (ReadRecords(options_.folder / "keys.bin", kKindKeys, kFileVersion, native::kPipelineKeyVersion, records) != ReadStatus::Ok) {
+        return;
     }
-    MH4N_LOG(Info, kLog, "{}: list {}; SPIR-V {}; driver cache {}", utf8::PathToUtf8(dir), list, spirv, driver);
+    std::vector<Entry*> listed;
+    for (const auto& record : records) {
+        disk::Reader in(record);
+        const u32 uses = in.Read<u32>();
+        const u32 order = in.Read<u32>();
+        const auto key = DecodeKey(in.Take(in.Remaining()));
+        if (!key || (key->vertex.kind != native::VertexStageKind::Trivial && !sources.contains(key->vertex.program))) {
+            continue;
+        }
+        auto [it, inserted] = entries_.try_emplace(*key, *key);
+        if (inserted) {
+            auto& entry = it->second;
+            entry.uses = uses;
+            entry.order = order;
+            next_order_ = std::max(next_order_, order + 1);
+            if (options_.background || options_.warm) {
+                entry.listed = true;
+                listed.push_back(&entry);
+            }
+        }
+    }
+    stats_.listed = listed.size();
+    std::ranges::stable_sort(listed, [](const Entry* a, const Entry* b) {
+        if (a->key.IsFallback() != b->key.IsFallback()) {
+            return a->key.IsFallback();
+        }
+        if (a->uses != b->uses && !a->key.IsFallback()) {
+            return a->uses > b->uses;
+        }
+        return a->order < b->order;
+    });
+    for (auto* entry : listed) {
+        startup_fallbacks_ += entry->key.IsFallback();
+        Enqueue(*entry, Queue::Startup);
+    }
 }
 
-void CachingProvider::WriteFiles(bool final) {
+void CachingProvider::Save() {
     if (options_.folder.empty()) {
         return;
     }
     std::lock_guard save_lock(save_mutex_);
-    const auto t0 = Clock::now();
-    struct Item {
-        PipelineKey key;
-        u32 uses, order;
-    };
-    std::vector<Item> items;
-    u64 built = 0;
-    {
-        std::lock_guard lock(mutex_);
-        items.reserve(table_.size());
-        for (const auto& [key, e] : table_) {
-            if (e.state != State::Failed) {
-                items.push_back(Item{key, e.uses, e.order});
-            }
-        }
-        list_dirty_ = false;
-        built = built_since_blob_;
-        built_since_blob_ = 0;
-    }
-    const std::filesystem::path& dir = options_.folder;
     std::string error;
+    bool wrote = false;
     if (options_.list) {
-        std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.order < b.order; });
-        Records records;
-        records.reserve(items.size());
-        std::vector<u64> programs;
-        std::unordered_set<u64> seen;
-        for (const Item& item : items) {
-            std::vector<u8> r;
-            Put32(r, item.uses);
-            Put32(r, item.order);
-            EncodeKey(item.key, r);
-            records.push_back(std::move(r));
-            if (item.key.vertex.kind == native::VertexStageKind::Translated && seen.insert(item.key.vertex.program).second) {
-                programs.push_back(item.key.vertex.program);
+        u64 revision;
+        std::vector<std::tuple<u32, u32, PipelineKey>> entries;
+        {
+            std::lock_guard lock(mutex_);
+            revision = list_revision_;
+            if (revision != list_saved_) {
+                entries.reserve(entries_.size());
+                for (const auto& [key, entry] : entries_) {
+                    entries.emplace_back(entry.order, entry.uses, key);
+                }
             }
         }
-        Records sources;
-        for (u64 program : programs) {
-            std::vector<u8> bytes = host_.save_vertex_source ? host_.save_vertex_source(program) : std::vector<u8>{};
-            if (!bytes.empty()) {
-                sources.push_back(std::move(bytes));
+        if (!entries.empty()) {
+            std::ranges::sort(entries, {}, [](const auto& row) { return std::get<0>(row); });
+            Records keys, vertices;
+            keys.reserve(entries.size());
+            std::unordered_set<u64> sources;
+            for (const auto& [order, uses, key] : entries) {
+                if (key.vertex.kind != native::VertexStageKind::Trivial && host_.save_vertex_source &&
+                    sources.insert(key.vertex.program).second) {
+                    auto source = host_.save_vertex_source(key.vertex.program);
+                    if (!source.empty()) {
+                        vertices.push_back(std::move(source));
+                    }
+                }
+                auto& record = keys.emplace_back();
+                disk::Append(record, uses);
+                disk::Append(record, order);
+                EncodeKey(key, record);
+            }
+            if (WriteRecords(options_.folder / "vertex.bin", kKindVertex, kFileVersion, host_.vertex_source_version, vertices, &error) &&
+                WriteRecords(options_.folder / "keys.bin", kKindKeys, kFileVersion, native::kPipelineKeyVersion, keys, &error)) {
+                list_saved_ = revision;
+                wrote = true;
+            } else {
+                MH4N_LOG(Warning, kLog, "could not save the pipeline list: {}", error);
             }
         }
-        // The sources first: a list whose sources are missing would drop its translated keys at the next start.
-        if (!WriteRecords(dir / "vertex.bin", kKindVertex, kVertexFormat, host_.vertex_source_version, sources, &error) ||
-            !WriteRecords(dir / "keys.bin", kKindKeys, kListFormat, native::kPipelineKeyVersion, records, &error)) {
-            MH4N_LOG(Warning, kLog, "the list was not written: {}", error);
+    }
+    error.clear();
+    if (options_.spirv_cache) {
+        wrote |= spirv_.Save(options_.folder / "spirv.bin", host_.spirv_compiler_version, error);
+        if (!error.empty()) {
+            MH4N_LOG(Warning, kLog, "could not save the SPIR-V cache: {}", error);
         }
     }
-    if (spirv_ != nullptr && (final || spirv_->Dirty())) {
-        if (!WriteRecords(dir / "spirv.bin", kKindSpirv, kSpirvFormat, host_.spirv_compiler_version, spirv_->Snapshot(), &error)) {
-            MH4N_LOG(Warning, kLog, "the SPIR-V was not written: {}", error);
+    if (!driver_file_.empty()) {
+        u64 revision;
+        {
+            std::lock_guard lock(mutex_);
+            revision = driver_revision_;
+        }
+        if (revision != driver_saved_) {
+            const auto blob = host_.backend->SavePipelineCache();
+            if (!blob.empty() && WriteBytes(driver_file_, blob, &error)) {
+                driver_saved_ = revision;
+                wrote = true;
+            } else if (!error.empty()) {
+                MH4N_LOG(Warning, kLog, "could not save the driver cache: {}", error);
+            }
         }
     }
-    size_t blob_bytes = 0;
-    if (options_.driver_cache && host_.backend != nullptr && built > 0) {
-        const std::vector<u8> blob = host_.backend->SavePipelineCache();
-        blob_bytes = blob.size();
-        if (blob.size() > 32 && !WriteBytes(driver_path_, blob, &error)) {
-            MH4N_LOG(Warning, kLog, "the driver cache was not written: {}", error);
-        }
-    }
-    std::lock_guard lock(mutex_);
-    ++stats_.saves;
-    if (final) {
-        MH4N_LOG(Info, kLog, "saved {} keys{} in {:.0f} ms", items.size(),
-                 blob_bytes > 0 ? fmt::format(", driver cache {} KiB", blob_bytes / 1024) : std::string(), MsSince(t0));
+    if (wrote) {
+        std::lock_guard lock(mutex_);
+        ++stats_.saves;
     }
 }
 
-// ---- the options and the registration ----
-
 CachingOptions CachingOptionsFrom(const Options& options, bool force_ubershader) {
-    CachingOptions out;
-    out.force_ubershader = force_ubershader;
-    out.background = !options.Has("--no-ubershader");
-    {
-        const char* wait = std::getenv("MH4N_PIPELINE_WAIT");
-        out.never_wait = !options.Has("--pipeline-wait") && !options.Has("--deterministic") && !(wait != nullptr && *wait == '1');
-        const char* fallback = std::getenv("MH4N_PIPELINE_FALLBACK");
-        const long n = fallback != nullptr ? std::strtol(fallback, nullptr, 10) : 0;
-        out.use_fallback = !out.never_wait || n != 0;
-        out.fallback_per_window = !out.never_wait || n == 1 ? 0 : static_cast<u32>(std::clamp<long>(n, 0, 100000));
-    }
-    out.warm = options.Has("--warm");
-    out.list = !options.Has("--no-pipeline-list");
-    out.driver_cache = !options.Has("--no-driver-cache");
-    out.spirv_cache = !options.Has("--no-spirv-cache");
-    try {
-        out.workers = static_cast<u32>(std::min<u64>(options.GetUInt("--pipeline-workers", 0), 16));
-    } catch (const OptionError& e) {
-        MH4N_LOG(Error, kLog, "--pipeline-workers: {}", e.what());
-    }
+    CachingOptions cache;
     if (!options.Has("--no-pipeline-files")) {
-        if (std::optional<std::string> dir = options.Get("--pipeline-dir")) {
-            out.folder = utf8::PathFromUtf8(*dir);
-        } else if (std::optional<std::string> user = options.Get("--user")) {
-            std::error_code ec;
-            const std::filesystem::path root = utf8::PathFromUtf8(*user);
-            if (std::filesystem::is_directory(root, ec)) {
-                out.folder = root / "cache" / "pipelines";
+        if (auto dir = options.Get("--pipeline-dir")) {
+            cache.folder = std::filesystem::path(std::u8string(dir->begin(), dir->end()));
+        } else if (auto user = options.Get("--user"); user && !user->empty()) {
+            cache.folder = std::filesystem::path(std::u8string(user->begin(), user->end())) / "cache" / "pipelines";
+        }
+    }
+    cache.list = !options.Has("--no-pipeline-list");
+    cache.driver_cache = !options.Has("--no-driver-cache");
+    cache.spirv_cache = !options.Has("--no-spirv-cache");
+    cache.background = !options.Has("--no-ubershader");
+    const char* wait = std::getenv("MH4N_PIPELINE_WAIT");
+    cache.never_wait = !options.Has("--pipeline-wait") && !options.Has("--deterministic") &&
+                       !(wait && std::string_view(wait) == "1");
+    cache.use_fallback = !cache.never_wait;
+    if (cache.never_wait) {
+        if (const char* value = std::getenv("MH4N_PIPELINE_FALLBACK")) {
+            char* end = nullptr;
+            const long long limit = std::strtoll(value, &end, 10);
+            cache.use_fallback = end != value && limit != 0;
+            if (limit > 1) {
+                cache.fallback_per_window = static_cast<u32>(std::min(limit, 100000ll));
             }
         }
     }
-    return out;
+    cache.warm = options.Has("--warm");
+    cache.force_ubershader = force_ubershader;
+    try {
+        cache.workers = static_cast<u32>(std::min<u64>(options.GetUInt("--pipeline-workers"), 16));
+    } catch (const OptionError& error) {
+        MH4N_LOG(Error, kLog, "--pipeline-workers: {}", error.what());
+    }
+    return cache;
 }
 
 std::unique_ptr<native::PipelineProvider> MakeCachingProvider(const native::ProviderHost& host, const CachingOptions& options) {
-    if (!host.build || (host.backend == nullptr && !options.folder.empty() && options.driver_cache)) {
-        return nullptr;
-    }
-    return std::make_unique<CachingProvider>(host, options);
+    auto provider = std::make_unique<CachingProvider>(host, options);
+    provider->Start();
+    return provider;
 }
 
 std::optional<CachingStats> StatsOf(const native::PipelineProvider& provider) {
-    if (const auto* p = dynamic_cast<const CachingProvider*>(&provider)) {
-        return p->Stats();
+    if (const auto* cache = dynamic_cast<const CachingProvider*>(&provider)) {
+        return cache->Stats();
     }
     return std::nullopt;
 }
 
 void WaitIdle(native::PipelineProvider& provider) {
-    if (auto* p = dynamic_cast<CachingProvider*>(&provider)) {
-        p->WaitIdle();
+    if (auto* cache = dynamic_cast<CachingProvider*>(&provider)) {
+        cache->WaitIdle();
     }
 }
 
 void SaveNow(native::PipelineProvider& provider) {
-    if (auto* p = dynamic_cast<CachingProvider*>(&provider)) {
-        p->Save(true);
+    if (auto* cache = dynamic_cast<CachingProvider*>(&provider)) {
+        cache->Save();
     }
 }
 
-MH4N_REGISTER(native::PipelineProviderFactory, native::kCachingProviderName,
-              [](const native::ProviderHost& host) -> std::unique_ptr<native::PipelineProvider> {
-                  static const Options none;
-                  return MakeCachingProvider(host, CachingOptionsFrom(host.options != nullptr ? *host.options : none,
-                                                                      host.force_ubershader));
-              });
+namespace {
 
-#define MH4N_PIPELINE_OPTION(name, arg, help) \
-    MH4N_OPTION("runner", name, arg, help);   \
+std::unique_ptr<native::PipelineProvider> MakeFromHost(const native::ProviderHost& host) {
+    const auto options = CachingOptionsFrom(host.options ? *host.options : Options{}, host.force_ubershader);
+    return MakeCachingProvider(host, options);
+}
+
+MH4N_REGISTER(native::PipelineProviderFactory, native::kCachingProviderName, MakeFromHost);
+
+#define MH4N_CACHE_OPTION(name, arg, help) \
+    MH4N_OPTION("runner", name, arg, help); \
     MH4N_OPTION("capture-player", name, arg, help)
 
-MH4N_PIPELINE_OPTION("--no-ubershader", "",
-                     "pipelines (N2-16): no background compilation; a pipeline that is missing is built on the renderer thread");
-MH4N_PIPELINE_OPTION("--pipeline-wait", "",
-                     "pipelines: a draw with neither its pipeline nor its fallback built builds it on the renderer thread "
-                     "(the default leaves the draw out and queues both; MH4N_PIPELINE_WAIT=1 does the same)");
-MH4N_PIPELINE_OPTION("--warm", "", "pipelines (N2-16): compile the whole list of pipelines before the first draw");
-MH4N_PIPELINE_OPTION("--pipeline-dir", "DIR", "pipelines (N2-16): where the pipeline cache lives (default <--user>/cache/pipelines)");
-MH4N_PIPELINE_OPTION("--no-pipeline-files", "", "pipelines (N2-16): no pipeline cache is read or written");
-MH4N_PIPELINE_OPTION("--no-pipeline-list", "", "pipelines (N2-16): the list of pipelines seen is neither compiled at start nor written");
-MH4N_PIPELINE_OPTION("--no-driver-cache", "", "pipelines (N2-16): the driver's pipeline cache is neither loaded nor written");
-MH4N_PIPELINE_OPTION("--no-spirv-cache", "", "pipelines (N2-16): every shader goes through glslang (no SPIR-V cache)");
-MH4N_PIPELINE_OPTION("--pipeline-workers", "N", "pipelines (N2-16): the threads that compile pipelines (default: from the cores)");
+MH4N_CACHE_OPTION("--no-driver-cache", "", "disable the driver pipeline cache");
+MH4N_CACHE_OPTION("--no-pipeline-files", "", "disable pipeline cache files");
+MH4N_CACHE_OPTION("--no-pipeline-list", "", "disable the pipeline list");
+MH4N_CACHE_OPTION("--no-spirv-cache", "", "disable shader binary caching");
+MH4N_CACHE_OPTION("--no-ubershader", "", "compile missing pipelines on the renderer thread");
+MH4N_CACHE_OPTION("--pipeline-dir", "DIR", "pipeline cache directory");
+MH4N_CACHE_OPTION("--pipeline-wait", "", "wait for pipeline builds during rendering");
+MH4N_CACHE_OPTION("--pipeline-workers", "N", "pipeline compilation worker count");
+MH4N_CACHE_OPTION("--warm", "", "compile the pipeline list before the first draw");
 
+#undef MH4N_CACHE_OPTION
+
+}  // namespace
 }  // namespace mh4n::gpu::pipeline
+
+
+
+

@@ -1,5 +1,10 @@
-// The registry of the five fragment features (N2-33). Written for this package: nothing is copied from Azahar.
-#include "gpu/fragment/feature.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: feature.h and the gpu_fragment_key_test black-box cases.
+
+#include "feature.h"
+
+#include <algorithm>
 
 namespace mh4n::gpu::fragment {
 
@@ -8,55 +13,50 @@ FeatureRegistry& FeatureRegistry::Global() {
     return registry;
 }
 
-bool FeatureRegistry::Add(const FeatureModule& feature) {
-    const std::string_view name = feature.Name();
-    for (size_t i = 0; i < kFeatureNames.size(); ++i) {
-        if (kFeatureNames[i] == name) {
-            if (features_[i] != nullptr) {
-                return false;
-            }
-            features_[i] = &feature;
-            Rebuild();
-            return true;
-        }
-    }
-    return false;
+const FeatureModule* FeatureRegistry::Find(std::string_view name) const {
+    const auto slot = std::ranges::find(kFeatureNames, name);
+    return slot == kFeatureNames.end() ? nullptr : features_[slot - kFeatureNames.begin()];
 }
 
-const FeatureModule* FeatureRegistry::Find(std::string_view name) const {
-    for (size_t i = 0; i < kFeatureNames.size(); ++i) {
-        if (kFeatureNames[i] == name) {
-            return features_[i];
-        }
+bool FeatureRegistry::Add(const FeatureModule& feature) {
+    const auto slot = std::ranges::find(kFeatureNames, feature.Name());
+    if (slot == kFeatureNames.end()) {
+        return false;
     }
-    return nullptr;
+    auto& entry = features_[slot - kFeatureNames.begin()];
+    if (entry != nullptr) {
+        return false;
+    }
+    entry = &feature;
+    Rebuild();
+    return true;
 }
 
 void FeatureRegistry::Rebuild() {
     count_ = 0;
-    for (const FeatureModule* feature : features_) {
+    for (const auto* feature : features_) {
         if (feature != nullptr) {
             ordered_[count_++] = feature;
         }
     }
 }
 
-size_t StubbedFeatures(const FragmentKey& key, const FeatureRegistry& features, std::span<const char*> out) {
-    size_t n = 0;
-    for (const FeatureModule* feature : features.All()) {
-        if (const char* what = feature->Stubbed(key); what != nullptr && n < out.size()) {
-            out[n++] = what;
+size_t StubbedFeatures(const FragmentKey& key, const FeatureRegistry& features,
+                       std::span<const char*> out) {
+    size_t written = 0;
+    for (const auto* feature : features.All()) {
+        if (written == out.size()) {
+            break;
+        }
+        if (const char* name = feature->Stubbed(key)) {
+            out[written++] = name;
         }
     }
-    return n;
+    return written;
 }
 
-namespace detail {
-
-FeatureRegistrar::FeatureRegistrar(const FeatureModule& feature) {
+detail::FeatureRegistrar::FeatureRegistrar(const FeatureModule& feature) {
     FeatureRegistry::Global().Add(feature);
 }
-
-} // namespace detail
 
 } // namespace mh4n::gpu::fragment

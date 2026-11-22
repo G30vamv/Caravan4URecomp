@@ -1,9 +1,8 @@
-// Derived from Azahar src/core/hle/kernel/thread.cpp and svc.cpp at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-3.0-or-later: svc.cpp says so, thread.cpp says
-// GPL-2.0-or-later): the thread as a wait object, its priority rules, the wake-up, the
-// bookkeeping of Stop, and the wait set-up that SVC::WaitSynchronization1/N does (BeginSynchWait).
-// The queues, the context switch and the creation (N1-27) are not here.
-// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project (thread.cpp, svc.cpp)
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: the comments of mh4n/kernel.h (Thread, Scheduler::Wake/OnPriorityChanged, WakeHook),
+// 3dbrew "Thread" and "SVC" (priority inheritance, wait timeouts) and the black-box specification of
+// tests/kernel_objects_test.cpp and tests/threads_test.cpp.
 #include <algorithm>
 
 #include "internal.h"
@@ -13,75 +12,99 @@
 
 namespace mh4n {
 
-Thread::Thread(Kernel& kernel, u32 thread_id_, u32 priority, s32 processor_id_)
-    : WaitObject(kernel),
-      thread_id(thread_id_),
-      nominal_priority(priority),
-      current_priority(priority),
-      processor_id(processor_id_) {}
+namespace {
 
-Thread::~Thread() {
-    // A thread dropped while it holds mutexes (it was never stopped): do not leave them pointing at us.
-    for (const auto& mutex : held_mutexes) {
-        mutex->lock_count_ = 0;
-        mutex->holding_thread_ = nullptr;
-    }
-    if (timeout_event_ != 0) {
-        kernel_.Cancel(timeout_event_);
+bool IsWaiting(ThreadStatus status) {
+    switch (status) {
+    case ThreadStatus::WaitArb:
+    case ThreadStatus::WaitSleep:
+    case ThreadStatus::WaitIPC:
+    case ThreadStatus::WaitSynchAny:
+    case ThreadStatus::WaitSynchAll:
+    case ThreadStatus::WaitHleEvent:
+        return true;
+    default:
+        return false;
     }
 }
 
+}  // namespace
+
+Thread::Thread(Kernel& kernel, u32 thread_id, u32 priority, s32 processor_id)
+    : WaitObject(kernel),
+      thread_id(thread_id),
+      nominal_priority(priority),
+      current_priority(priority),
+      processor_id(processor_id) {}
+
+Thread::~Thread() = default;
+
 bool Thread::ShouldWait(const Thread*) const {
+    // signalled when the thread has ended
     return status != ThreadStatus::Dead;
 }
 
 void Thread::Acquire(Thread* thread) {
-    MH4N_ASSERT(!ShouldWait(thread), "object unavailable!");
+    MH4N_ASSERT(!ShouldWait(thread), "Thread::Acquire of a thread that has to wait");
 }
 
 void Thread::SetPriority(u32 priority) {
-    MH4N_ASSERT(priority <= kThreadPrioLowest, "Invalid priority value {}.", priority);
-    const u32 old_priority = current_priority;
+    MH4N_ASSERT(priority <= kThreadPrioLowest, "thread priority {} out of range", priority);
+    const u32 old = current_priority;
     nominal_priority = current_priority = priority;
-    kernel_.GetScheduler().OnPriorityChanged(*this, old_priority);
+    kernel_.GetScheduler().OnPriorityChanged(*this, old);
+    // the owners of the mutexes this thread waits for may now inherit another priority
+    const std::set<std::shared_ptr<Mutex>> pending = pending_mutexes;
+    for (const std::shared_ptr<Mutex>& mutex : pending) {
+        mutex->UpdatePriority();
+    }
 }
 
 void Thread::UpdatePriority() {
-    u32 best_priority = nominal_priority;
-    for (const auto& mutex : held_mutexes) {
-        if (mutex->Priority() < best_priority) {
-            best_priority = mutex->Priority();
-        }
+    // the best of the nominal priority and the priorities of the mutexes held
+    u32 best = nominal_priority;
+    for (const std::shared_ptr<Mutex>& mutex : held_mutexes) {
+        best = std::min(best, mutex->Priority());
     }
-    BoostPriority(best_priority);
+    BoostPriority(best);
 }
 
 void Thread::BoostPriority(u32 priority) {
-    const u32 old_priority = current_priority;
+    const u32 old = current_priority;
     current_priority = priority;
-    kernel_.GetScheduler().OnPriorityChanged(*this, old_priority);
+    kernel_.GetScheduler().OnPriorityChanged(*this, old);
 }
 
 void Thread::BeginSynchWait(std::vector<std::shared_ptr<WaitObject>> objects, bool wait_all) {
     status = wait_all ? ThreadStatus::WaitSynchAll : ThreadStatus::WaitSynchAny;
-    const auto self = std::static_pointer_cast<Thread>(shared_from_this());
-    for (auto& object : objects) {
+    wait_objects = std::move(objects);
+    const std::shared_ptr<Thread> self = std::static_pointer_cast<Thread>(shared_from_this());
+    for (const std::shared_ptr<WaitObject>& object : wait_objects) {
         object->AddWaitingThread(self);
     }
-    wait_objects = std::move(objects);
 }
 
 void Thread::ArmTimeout(s64 ns) {
     CancelTimeout();
     if (ns == -1) {
-        return;  // wait forever
+        return;  // never
     }
+    // a negative value other than -1 expires at once
+    const u64 due = kernel_.NowTicks() + kernel_detail::NsToTicks(ns);
     const std::weak_ptr<Thread> weak = std::static_pointer_cast<Thread>(shared_from_this());
-    timeout_event_ = kernel_.ScheduleAt(kernel_.NowTicks() + kernel_detail::NsToTicks(ns), [weak] {
-        if (auto thread = weak.lock()) {
+    // (the scheduler may run the callback inside ScheduleAt when `due` is not in the future: then it has already
+    // cleared timeout_event_ and the id it returns is stale)
+    const auto fired = std::make_shared<bool>(false);
+    const u64 id = kernel_.ScheduleAt(due, [weak, fired] {
+        *fired = true;
+        if (const std::shared_ptr<Thread> thread = weak.lock()) {
+            thread->timeout_event_ = 0;
             thread->OnWaitTimeout();
         }
     });
+    if (!*fired) {
+        timeout_event_ = id;
+    }
 }
 
 void Thread::CancelTimeout() {
@@ -92,100 +115,77 @@ void Thread::CancelTimeout() {
 }
 
 void Thread::OnWaitTimeout() {
-    timeout_event_ = 0;  // this event has run
+    timeout_event_ = 0;
+    std::optional<Result> result;
     switch (status) {
     case ThreadStatus::WaitSynchAny:
     case ThreadStatus::WaitSynchAll:
     case ThreadStatus::WaitArb:
-    case ThreadStatus::WaitHleEvent: {
-        std::optional<Result> result = kResultTimeout;
-        s32 index = -1;
-        // Before the wait objects are cleared, as Azahar invokes the wake-up callback.
-        if (wake_hook) {
-            wake_hook(ThreadWakeupReason::Timeout, nullptr, result, index);
-        }
-        for (auto& object : wait_objects) {
-            object->RemoveWaitingThread(this);
-        }
-        wait_objects.clear();
-        ResumeFromWait(result, index);
+    case ThreadStatus::WaitHleEvent:
+        result = kResultTimeout;
         break;
-    }
     case ThreadStatus::WaitSleep:
     case ThreadStatus::WaitIPC:
-        ResumeFromWait(std::nullopt);
-        break;
+        break;  // these waits end without a result
     default:
-        break;  // already woken some other way
+        return;  // the thread is not in a wait that has a timeout
     }
+    s32 index = -1;
+    if (wake_hook) {
+        wake_hook(ThreadWakeupReason::Timeout, nullptr, result, index);
+    }
+    for (const std::shared_ptr<WaitObject>& object : wait_objects) {
+        object->RemoveWaitingThread(this);
+    }
+    wait_objects.clear();
+    ResumeFromWait(result, index);
 }
 
 void Thread::ResumeFromWait(std::optional<Result> result, s32 index) {
-    MH4N_ASSERT(wait_objects.empty(), "Thread {} is waking up while waiting for objects",
-                thread_id);
-    switch (status) {
-    case ThreadStatus::WaitSynchAll:
-    case ThreadStatus::WaitSynchAny:
-    case ThreadStatus::WaitHleEvent:
-    case ThreadStatus::WaitArb:
-    case ThreadStatus::WaitSleep:
-    case ThreadStatus::WaitIPC:
-    case ThreadStatus::Dormant:
-        break;
-    case ThreadStatus::Ready:
-        // Woken more than once before it ran (several objects signalled): the first wake counts.
-        return;
-    case ThreadStatus::Running:
-        MH4N_LOG(Error, "Kernel", "Thread {} has already resumed", thread_id);
-        return;
-    case ThreadStatus::Dead:
-        MH4N_LOG(Error, "Kernel", "Thread {} cannot be resumed: it is dead", thread_id);
+    if (status == ThreadStatus::Ready || status == ThreadStatus::Running || status == ThreadStatus::Dead) {
+        MH4N_LOG(Warning, "Kernel", "ResumeFromWait of thread {} in status {}", thread_id, static_cast<int>(status));
         return;
     }
-    wake_hook = nullptr;
     CancelTimeout();
+    wake_hook = nullptr;
     status = ThreadStatus::Ready;
     kernel_.GetScheduler().Wake(std::static_pointer_cast<Thread>(shared_from_this()), result, index);
 }
 
 s32 Thread::GetWaitObjectIndex(const WaitObject* object) const {
-    const auto match = std::find_if(wait_objects.rbegin(), wait_objects.rend(),
-                                    [object](const auto& p) { return p.get() == object; });
-    if (match == wait_objects.rend()) {
-        return -1;
+    for (std::size_t i = wait_objects.size(); i > 0; --i) {
+        if (wait_objects[i - 1].get() == object) {
+            return static_cast<s32>(i - 1);
+        }
     }
-    return static_cast<s32>(std::distance(match, wait_objects.rend()) - 1);
+    return -1;
 }
 
 void Thread::Stop() {
-    if (status == ThreadStatus::Dead) {
-        return;
-    }
-    const auto keep_alive = std::static_pointer_cast<Thread>(shared_from_this());
-    CancelTimeout();
-    if (wake_hook) {
+    // a thread that is stopped while it waits: whoever blocked it learns that (the arbiter takes it off its list)
+    if (IsWaiting(status) && wake_hook) {
         std::optional<Result> result;
         s32 index = -1;
         wake_hook(ThreadWakeupReason::Terminated, nullptr, result, index);
         wake_hook = nullptr;
     }
+    const std::shared_ptr<Thread> self = std::static_pointer_cast<Thread>(shared_from_this());
+    ReleaseThreadMutexes(this);
     status = ThreadStatus::Dead;
     WakeupAllWaitingThreads();
-    // Dangling references in the objects it was waiting for.
-    for (auto& object : wait_objects) {
+    // no dangling references in the objects the thread was waiting for
+    for (const std::shared_ptr<WaitObject>& object : wait_objects) {
         object->RemoveWaitingThread(this);
     }
     wait_objects.clear();
-    ReleaseThreadMutexes(this);
-
-    // A thread made by ThreadManager (N1-27) has a TLS slot and counts against the process's
-    // resource limit. Azahar gives both back here; the slot is found free by its thread being Dead
-    // (see threads.h), the count is released now. A bare thread (tls_address 0) never reserved one.
-    if (tls_address != 0) {
-        if (const auto process = owner_process.lock()) {
-            process->resource_limit->Release(ResourceLimitType::Thread, 1);
+    CancelTimeout();
+    // the thread's slot of its process's resource limit is free again (the TLS slot is found free by looking at the
+    // thread: Dead)
+    if (const std::shared_ptr<Process> owner = owner_process.lock()) {
+        if (owner->resource_limit != nullptr) {
+            owner->resource_limit->Release(ResourceLimitType::Thread, 1);
         }
     }
 }
 
-} // namespace mh4n
+}  // namespace mh4n

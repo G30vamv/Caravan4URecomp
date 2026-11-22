@@ -188,6 +188,7 @@ struct SourceImage {
     // The stored region, in image pixels.
     double x = 0, y = 0, width = 0, height = 0;
     bool rotated = false;
+    bool mirrored = false;  // Rotated90Mirrored
     double scaled_width = 0;  // the displayed size in image pixels (scale * width, scale * height)
     double scaled_height = 0;
 };
@@ -200,7 +201,7 @@ void SourceCoord(const SourceImage& src, double fx, double fy, float uv[2]) {
     const double X = fx * src.scaled_width;
     const double Y = fy * src.scaled_height;
     const double ix = src.rotated ? src.scaled_height - Y : X;
-    const double iy = src.rotated ? X : Y;
+    const double iy = src.rotated ? (src.mirrored ? src.scaled_width - X : X) : Y;
     uv[0] = static_cast<float>((src.x + ix) / src.image->Width());
     uv[1] = static_cast<float>((src.y + iy) / src.image->Height());
 }
@@ -323,7 +324,8 @@ ComposeResult Compositor::Compose(rhi::Recorder& recorder, rhi::Image& target, c
             out.src.y = region.y;
             out.src.width = region.width;
             out.src.height = region.height;
-            out.src.rotated = screen->orientation == Orientation::Rotated90;
+            out.src.rotated = IsRotated(screen->orientation);
+            out.src.mirrored = screen->orientation == Orientation::Rotated90Mirrored;
             result.frame_images_->push_back(screen->image);
             if (screen->timeline_value != 0) {
                 bool merged = false;

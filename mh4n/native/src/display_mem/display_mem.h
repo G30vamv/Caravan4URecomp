@@ -24,12 +24,13 @@
 // its drawing was submitted, finished or not (the sink waits for the GPU on its side): nothing is read back or copied
 // by the CPU. Any other screen comes as before.
 //
-// Threads (principle 6): only the scheduler thread calls it; sinks are added before the run and
-// removed after it.
+// Threads (principle 6): the synchronous display runs on the scheduler thread. The queued display
+// runs this same display on its renderer thread, including sink registration and removal.
 #pragma once
 
 #include <atomic>
 #include <functional>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -50,11 +51,11 @@ namespace mh4n::display_mem {
 struct RuntimeLink {
     Runtime* runtime = nullptr;
     // The game's frame counter at its last change (0 until the first; a program that does not map
-    // the counter never sees one). Written by the frame callback, read at VBlank: same thread.
+    // the counter never sees one). Written by the frame callback, sampled when VBlank is requested.
     std::atomic<u32> game_frame{0};
 };
 
-class DisplayMemGpu final : public gpu::Gpu, public present::Display {
+class DisplayMemGpu : public gpu::Gpu, public present::Display {
 public:
     // `inner` is the GPU every call is forwarded to; its register file seeds the shadow.
     DisplayMemGpu(gpu::Host& host, std::unique_ptr<gpu::Gpu> inner);
@@ -77,19 +78,29 @@ public:
     void Attach(std::shared_ptr<RuntimeLink> link);
     gpu::Gpu& Inner() { return *inner_; }
 
+    struct FrameInfo {
+        u32 game_frame = 0;
+        u64 tick = 0;
+        u32 top_columns = present::kTopWidth;
+    };
+
+protected:
+    void RefreshDisplayRegisters();
+    void PublishVBlank(u32 screen, const FrameInfo* frame_info);
+
 private:
-    std::optional<present::ScreenImage> BuildScreen(u32 screen);
+    std::optional<present::ScreenImage> BuildScreen(u32 screen, u32 columns, u32 game_frame);
     // The screen from guest memory, decoded straight to RGBA; the last picture again (the same pixels) when the
     // framebuffer and its registers are as they were. nullopt: the slow path decides (a fill, an error).
-    std::optional<present::ScreenImage> BuildMemoryScreen(u32 screen);
-    void LogMemoryScreen(u32 screen);
+    std::optional<present::ScreenImage> BuildMemoryScreen(u32 screen, u32 columns, u32 game_frame);
+    void LogMemoryScreen(u32 screen, u32 game_frame);
     // The screen from the inner GPU's picture at its scale; nullopt when it has none.
-    std::optional<present::ScreenImage> BuildScaledScreen(u32 screen);
+    std::optional<present::ScreenImage> BuildScaledScreen(u32 screen, u32 columns);
     // The same as a shared picture (shared screens); nullopt when the renderer has none of that framebuffer.
-    std::optional<present::ScreenImage> BuildSharedScreen(u32 screen);
+    std::optional<present::ScreenImage> BuildSharedScreen(u32 screen, u32 columns);
     // The framebuffer the screen shows is about to be read from guest memory: the inner GPU writes it first if it still
     // owes it (asynchronous screens).
-    void PrepareScreenMemory(u32 screen);
+    void PrepareScreenMemory(u32 screen, u32 columns);
 
     gpu::Host& host_;
     std::unique_ptr<gpu::Gpu> inner_;
@@ -99,7 +110,14 @@ private:
     gpu_capture::DisplayShadow shadow_;
     std::vector<present::ScreenSink*> sinks_;
     bool shared_wanted_ = false;  // every sink shows shared pictures
+    bool direct_wanted_ = false;  // every sink draws backend images
+    bool direct_asked_ = false;
+    std::optional<present::ScreenImage> BuildBackendScreen(u32 screen, u32 columns);
     bool shared_asked_ = false;   // what the renderer was last asked (on its own thread, at a VBlank)
+    u64 skipped_builds_ = 0;
+    std::chrono::steady_clock::time_point last_vblank_time_{};
+    u32 stall_logs_ = 0;
+    double build_ms_ = 0;         // the recent cost of building both screens, in ms (VBlank: skips every second one when it is high)
     bool touch_hidden_ = false;   // a sink hides the touch screen (ScreenHidden(1)), as the renderer was last told
     std::shared_ptr<RuntimeLink> link_;
     u64 next_sequence_ = 0;
@@ -126,5 +144,9 @@ private:
     };
     LastScaled last_scaled_[2];
 };
+
+/// A moment the player marks (F8, Share + R3): one numbered log line with the time (same clock as "frame gap ... at t=") and the VBlank.
+/// Returns "mark #N at HH:MM:SS" (the local clock), for the shell to show.
+std::string Mark(const char* how);
 
 }  // namespace mh4n::display_mem

@@ -17,8 +17,8 @@ namespace mh4n::audio_out {
 
 class DriftController {
 public:
-    static constexpr double kMinFactor = 0.995;         // first guess
-    static constexpr double kMaxFactor = 1.005;         // first guess
+    static constexpr double kMinFactor = 0.96;          // MODIFIED: was 0.995. In the village the DSP makes only 96-98 % of real time of audio (measured), so +-0.5 % emptied the ring once a second
+    static constexpr double kMaxFactor = 1.04;          // MODIFIED: was 1.005
     static constexpr double kTweakTimeScale = 0.050;    // seconds (Azahar's tweak_time_scale)
     static constexpr double kLowPassTimeScale = 0.712;  // seconds (Azahar's lpf_time_scale)
 

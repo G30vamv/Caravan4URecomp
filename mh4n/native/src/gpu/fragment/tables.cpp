@@ -1,99 +1,104 @@
-// Derived from Azahar src/video_core/renderer_vulkan/vk_rasterizer.cpp (SyncAndUploadLUTsLF and
-// SyncAndUploadLUTs: one Map of the worst case per ring, the "invalidate" rule after a wrap, the commit of
-// the bytes used) at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-3.0-or-later: the file says "Licensed under
-// GPLv3 or any later version").
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (vk_rasterizer.cpp)
-#include "gpu/fragment/tables.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: tables.h, native/bindings.h, the RHI ring contract and gpu_compose_test.
+
+#include "tables.h"
 
 #include <array>
+#include <optional>
 
-#include "gpu/fragment/feature.h"
+#include "feature.h"
 #include "gpu/pica/state.h"
 
 namespace mh4n::gpu::fragment {
 
 struct TableRings::Impl {
-    struct Side {
+    struct RingState {
         std::unique_ptr<rhi::Ring> ring;
-        std::span<u8> mapped;
-        u64 offset = 0;      // of the open session in the buffer
-        u64 used = 0;        // bytes taken in the session
-        bool open = false;
+        std::optional<rhi::RingAllocation> mapping;
+        u64 used = 0;
         u64 wraps = 0;
+        bool reload = false;
     };
-    std::array<Side, 2> sides;
+
+    std::array<RingState, 2> rings;
+
+    RingState& Get(TableRing ring) { return rings[static_cast<size_t>(ring)]; }
+    const RingState& Get(TableRing ring) const { return rings[static_cast<size_t>(ring)]; }
 };
 
 TableRings::TableRings() : impl_(std::make_unique<Impl>()) {}
 TableRings::~TableRings() = default;
 
 rhi::Result<std::unique_ptr<TableRings>> TableRings::Create(rhi::Backend& backend, const TableRingsDesc& desc) {
-    std::unique_ptr<TableRings> rings(new TableRings());
-    const u64 sizes[2] = {desc.lf_bytes, desc.general_bytes};
-    const char* names[2] = {"fragment tables lf", "fragment tables general"};
-    for (int i = 0; i < 2; ++i) {
-        if (sizes[i] < (i == 0 ? kLfRingMaxUpload : kGeneralRingMaxUpload)) {
-            return rhi::Error{"TableRings: a ring is smaller than one worst-case upload"};
-        }
-        rhi::Result<std::unique_ptr<rhi::Ring>> ring = backend.CreateRing(sizes[i], rhi::BufferUsage::Texel | rhi::BufferUsage::Storage, names[i]);
-        if (!ring.ok()) {
-            return rhi::Error{ring.error()};
-        }
-        rings->impl_->sides[i].ring = std::move(*ring);
+    // Bindings 3–5 expose these arrays through storage-buffer descriptors.
+    auto lf = backend.CreateRing(desc.lf_bytes, rhi::BufferUsage::Storage, "lighting and fog tables");
+    if (!lf) {
+        return rhi::Error{lf.error()};
     }
-    return rings;
+    auto general = backend.CreateRing(desc.general_bytes, rhi::BufferUsage::Storage, "procedural texture tables");
+    if (!general) {
+        return rhi::Error{general.error()};
+    }
+    auto result = std::unique_ptr<TableRings>(new TableRings);
+    result->impl_->Get(TableRing::Lf).ring = std::move(*lf);
+    result->impl_->Get(TableRing::General).ring = std::move(*general);
+    return result;
 }
 
 const rhi::Buffer& TableRings::Buffer(TableRing ring) const {
-    return *impl_->sides[static_cast<size_t>(ring)].ring->GetBuffer();
+    return *impl_->Get(ring).ring->GetBuffer();
 }
 
-rhi::Result<bool> TableRings::Begin(TableRing which, u64 max_bytes) {
-    Impl::Side& side = impl_->sides[static_cast<size_t>(which)];
-    if (side.open) {
-        return rhi::Error{"TableRings::Begin: a session is already open on this ring"};
+rhi::Result<bool> TableRings::Begin(TableRing ring, u64 max_bytes) {
+    auto& state = impl_->Get(ring);
+    if (state.mapping) {
+        return rhi::Error{"table upload session already open"};
     }
-    rhi::Result<rhi::RingAllocation> alloc = side.ring->Map(max_bytes, kTableAlignment);
-    if (!alloc.ok()) {
-        return rhi::Error{alloc.error()};
+    if (max_bytes == 0 || max_bytes % kTableAlignment != 0) {
+        return rhi::Error{"table upload reservation must be a nonzero multiple of 16 bytes"};
     }
-    side.mapped = alloc->data;
-    side.offset = alloc->offset;
-    side.used = 0;
-    side.open = true;
-    if (alloc->wrapped) {
-        ++side.wraps;
+    auto mapped = state.ring->Map(max_bytes, kTableAlignment);
+    if (!mapped) {
+        return rhi::Error{mapped.error()};
     }
-    return alloc->wrapped;
+    if (mapped->wrapped) {
+        ++state.wraps;
+        state.reload = true;
+    }
+    state.mapping = *mapped;
+    state.used = 0;
+    return state.reload;
 }
 
-rhi::Result<TableSlice> TableRings::Take(TableRing which, u64 bytes) {
-    Impl::Side& side = impl_->sides[static_cast<size_t>(which)];
-    if (!side.open) {
-        return rhi::Error{"TableRings::Take: no session is open on this ring"};
+rhi::Result<TableSlice> TableRings::Take(TableRing ring, u64 bytes) {
+    auto& state = impl_->Get(ring);
+    if (!state.mapping) {
+        return rhi::Error{"table upload session is closed"};
     }
-    if (bytes % kTableAlignment != 0 || side.used + bytes > side.mapped.size()) {
-        return rhi::Error{"TableRings::Take: the slice is not a multiple of 16 bytes or does not fit the session"};
+    if (bytes % kTableAlignment != 0 || bytes > state.mapping->data.size() - state.used) {
+        return rhi::Error{"table upload slice must be aligned and fit the reservation"};
     }
-    TableSlice slice;
-    slice.data = side.mapped.subspan(side.used, bytes);
-    slice.byte_offset = side.offset + side.used;
-    side.used += bytes;
+    const TableSlice slice{state.mapping->data.subspan(state.used, bytes), state.mapping->offset + state.used};
+    state.used += bytes;
     return slice;
 }
 
-rhi::Result<void> TableRings::End(TableRing which) {
-    Impl::Side& side = impl_->sides[static_cast<size_t>(which)];
-    if (!side.open) {
-        return rhi::Error{"TableRings::End: no session is open on this ring"};
+rhi::Result<void> TableRings::End(TableRing ring) {
+    auto& state = impl_->Get(ring);
+    if (!state.mapping) {
+        return rhi::Error{"table upload session is closed"};
     }
-    side.open = false;
-    side.mapped = {};
-    return side.ring->Commit(side.used);
+    const auto committed = state.ring->Commit(state.used);
+    state.mapping.reset();
+    if (committed && state.used != 0) {
+        state.reload = false;
+    }
+    return committed;
 }
 
 u64 TableRings::Wraps(TableRing ring) const {
-    return impl_->sides[static_cast<size_t>(ring)].wraps;
+    return impl_->Get(ring).wraps;
 }
 
 rhi::Result<UploadSummary> UploadTables(const pica::PicaState& state, TableRings& rings, FragmentBlock& block,
@@ -103,63 +108,57 @@ rhi::Result<UploadSummary> UploadTables(const pica::PicaState& state, TableRings
 
 rhi::Result<UploadSummary> UploadTables(const pica::PicaState& state, TableRings& rings, FragmentBlock& block,
                                         UniformDirty& dirty, const FeatureRegistry& features) {
-    UploadSummary summary;
-    TableDirty need;
-    need.lighting = state.lighting.lut_dirty;
-    need.fog = state.fog.lut_dirty;
-    need.proctex = state.proctex.table_dirty;
-
-    const bool lf = need.lighting != 0 || need.fog;
-    const bool general = need.proctex != 0;
-    if (!lf && !general) {
+    TableDirty need{state.lighting.lut_dirty, state.fog.lut_dirty, state.proctex.table_dirty};
+    const bool upload_lf = need.lighting != 0 || need.fog;
+    const bool upload_general = need.proctex != 0;
+    UploadSummary summary{.uploaded = upload_lf || upload_general};
+    if (!summary.uploaded) {
         return summary;
     }
 
-    if (lf) {
-        rhi::Result<bool> wrapped = rings.Begin(TableRing::Lf, kLfRingMaxUpload);
-        if (!wrapped.ok()) {
-            return rhi::Error{wrapped.error()};
+    if (upload_lf) {
+        const auto started = rings.Begin(TableRing::Lf, kLfRingMaxUpload);
+        if (!started) {
+            return rhi::Error{started.error()};
         }
-        if (*wrapped) {
+        summary.lf_wrapped = *started;
+        if (summary.lf_wrapped) {
             need.lighting = pica::Lighting::kAllDirty;
             need.fog = true;
-            summary.lf_wrapped = true;
         }
     }
-    if (general) {
-        rhi::Result<bool> wrapped = rings.Begin(TableRing::General, kGeneralRingMaxUpload);
-        if (!wrapped.ok()) {
-            if (lf) {
-                (void)rings.End(TableRing::Lf);
+    if (upload_general) {
+        const auto started = rings.Begin(TableRing::General, kGeneralRingMaxUpload);
+        if (!started) {
+            if (upload_lf) {
+                rings.End(TableRing::Lf);
             }
-            return rhi::Error{wrapped.error()};
+            return rhi::Error{started.error()};
         }
-        if (*wrapped) {
+        summary.general_wrapped = *started;
+        if (summary.general_wrapped) {
             need.proctex = pica::ProcTex::kAllDirty;
-            summary.general_wrapped = true;
         }
     }
-    // A ring that was not opened has nothing for the features to take; they only look at what `need` asks for,
-    // and `need` is zero for it.
-    TableUpload upload{state, rings, block, dirty, need};
-    for (const FeatureModule* feature : features.All()) {
+
+    // Publish the new offsets only after the ring reservations have been committed.
+    FragmentBlock updated = block;
+    UniformDirty updated_dirty = dirty;
+    TableUpload upload{state, rings, updated, updated_dirty, need};
+    for (const auto* feature : features.All()) {
         feature->UploadTables(upload);
     }
 
-    rhi::Result<void> result;
-    if (lf) {
-        result = rings.End(TableRing::Lf);
+    const auto lf_commit = upload_lf ? rings.End(TableRing::Lf) : rhi::Result<void>{};
+    const auto general_commit = upload_general ? rings.End(TableRing::General) : rhi::Result<void>{};
+    if (!lf_commit) {
+        return rhi::Error{lf_commit.error()};
     }
-    if (general) {
-        rhi::Result<void> second = rings.End(TableRing::General);
-        if (result.ok()) {
-            result = std::move(second);
-        }
+    if (!general_commit) {
+        return rhi::Error{general_commit.error()};
     }
-    if (!result.ok()) {
-        return rhi::Error{result.error()};
-    }
-    summary.uploaded = true;
+    block = updated;
+    dirty = updated_dirty;
     return summary;
 }
 

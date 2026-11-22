@@ -1,156 +1,113 @@
-// Derived from Azahar src/core/hle/kernel/shared_memory.cpp at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later): the permission checks of Map, the
-// target address of a block created at address 0, the creation of both kinds of block and the
-// clean-up in the destructor. The backing is host memory plus the guest range instead of FCRAM
-// pointers.
-// Copyright 2014-2024 Citra Emulator Project / Azahar Emulator Project
-#include <cstring>
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: mh4n/kernel.h, mh4n/memory.h, kernel_objects_test.cpp,
+// svc_test.cpp, and the HID mapping vector in spec/kernel_test_vectors.tsv.
+#include "mh4n/kernel.h"
 
 #include "mh4n/assert.h"
-#include "mh4n/kernel.h"
 #include "mh4n/log.h"
 
 namespace mh4n {
+
 namespace {
 
-// SharedMemory::ConvertPermissions: the low three bits are the VMA permission.
-MemPerm ToMemPerm(MemoryPermission permission) {
+constexpr auto kLog = "Kernel";
+
+bool Includes(MemoryPermission allowed, MemoryPermission requested) {
+    return (static_cast<u32>(requested) & ~static_cast<u32>(allowed)) == 0;
+}
+
+MemPerm ToGuestPermission(MemoryPermission permission) {
     return static_cast<MemPerm>(static_cast<u32>(permission) & 7u);
 }
 
-constexpr u32 kSharedMemoryVaddrEnd = 0x14000000;  // Azahar's SHARED_MEMORY_VADDR_END
-
-} // namespace
+}  // namespace
 
 SharedMemory::SharedMemory(Kernel& kernel) : Object(kernel) {}
 
 SharedMemory::~SharedMemory() {
-    for (const Piece& piece : pieces_) {
-        if (!kernel_.Regions().Free(region_, piece.offset, piece.size)) {
-            MH4N_LOG(Error, "Kernel", "shared memory: cannot give back FCRAM offset 0x{:08X}",
-                     piece.offset);
-        }
+    if (base_address_ != 0 && pieces_.empty()) {
+        kernel_.Memory().ChangeState(base_address_, size_, MemState::Locked,
+                                     ToGuestPermission(permissions_), MemState::Private,
+                                     MemPerm::ReadWrite);
     }
-    if (auto process = owner_process_.lock()) {
-        if (process->resource_limit) {
-            process->resource_limit->Release(ResourceLimitType::SharedMemory, 1);
+    // Closing the block returns its allocation. Unmap is a separate operation.
+    for (const Piece& piece : pieces_) {
+        MH4N_ASSERT(kernel_.Regions().Free(region_, piece.offset, piece.size));
+    }
+    if (auto owner = owner_process_.lock()) {
+        if (base_address_ == 0 && !pieces_.empty()) {
+            owner->memory_used -= size_;
         }
-        if (base_address_ != 0) {
-            // The owner's memory goes back to ordinary heap.
-            kernel_.Memory().ChangeState(base_address_, size_, MemState::Locked, MemPerm::None,
-                                         MemState::Private, MemPerm::ReadWrite);
-        } else if (!pieces_.empty()) {
-            process->memory_used -= size_;
+        if (owner->resource_limit) {
+            owner->resource_limit->Release(ResourceLimitType::SharedMemory, 1);
         }
     }
 }
 
 Result SharedMemory::Map(Process& target, u32 address, MemoryPermission permissions,
                          MemoryPermission other_permissions) {
-    const auto owner = owner_process_.lock();
-    const MemoryPermission own_other_permissions =
-        &target == owner.get() ? permissions_ : other_permissions_;
-
-    // Automatically allocated blocks can only be mapped with other_permissions = DontCare.
-    if (base_address_ == 0 && other_permissions != MemoryPermission::DontCare) {
+    const bool automatic = base_address_ == 0;
+    const bool dont_care = other_permissions == MemoryPermission::DontCare;
+    if (automatic && !dont_care) {
         return kResultInvalidCombination;
     }
-    // The requested permissions must match what the creator allows.
-    if (static_cast<u32>(permissions) & ~static_cast<u32>(own_other_permissions)) {
-        MH4N_LOG(Error, "Kernel",
-                 "cannot map id={}, address=0x{:08X} name={}, permissions don't match", ObjectId(),
-                 address, Name());
+    const auto allowed = owner_process_.lock().get() == &target ? permissions_ : other_permissions_;
+    if (!Includes(allowed, permissions) || (!automatic && dont_care)) {
         return kResultInvalidCombination;
     }
-    // Heap-backed blocks cannot be mapped with other_permissions = DontCare.
-    if (base_address_ != 0 && other_permissions == MemoryPermission::DontCare) {
-        MH4N_LOG(Error, "Kernel",
-                 "cannot map id={}, address=0x{:08X} name={}, permissions don't match", ObjectId(),
-                 address, Name());
-        return kResultInvalidCombination;
-    }
-    // The permissions must be compatible with what the creator needs.
-    if (other_permissions != MemoryPermission::DontCare &&
-        (static_cast<u32>(permissions_) & ~static_cast<u32>(other_permissions))) {
-        MH4N_LOG(Error, "Kernel",
-                 "cannot map id={}, address=0x{:08X} name={}, permissions don't match", ObjectId(),
-                 address, Name());
+    if (!dont_care && !Includes(other_permissions, permissions_)) {
         return kResultWrongPermission;
     }
-    if (address != 0) {
-        // 64-bit sum: Azahar's 32-bit one would wrap for addresses near the top.
-        if (address < kHeapVaddr ||
-            static_cast<u64>(address) + size_ >= kSharedMemoryVaddrEnd) {
-            MH4N_LOG(Error, "Kernel", "cannot map id={}, address=0x{:08X} name={}, invalid address",
-                     ObjectId(), address, Name());
-            return kResultInvalidAddress;
+
+    if (address == 0) {
+        if (automatic) {
+            address = kLinearHeapVaddr + linear_heap_phys_offset_;
         }
-    }
-
-    u32 target_address = address;
-    if (base_address_ == 0 && target_address == 0) {
-        // Even on new firmware the target is in the old linear heap area, to keep the shared font
-        // compatible (see APT:GetSharedFont).
-        target_address = kLinearHeapVaddr + linear_heap_phys_offset_;
-    }
-
-    GuestMemory& memory = kernel_.Memory();
-    // A guest can pass any address. Azahar answers a misaligned one with the state error only when
-    // its range overlaps mapped memory, and asserts otherwise (N1-07 hardening): flat memory maps
-    // whole pages, so the answer is the same without the overlap.
-    if ((target_address & kPageMask) != 0) {
-        MH4N_LOG(Error, "Kernel", "cannot map id={}, address=0x{:08X} name={}, address not aligned",
-                 ObjectId(), address, Name());
-        return kResultInvalidAddressState;
-    }
-    const auto block = memory.Query(target_address);
-    if (!block) {
+    } else if (address < kHeapVaddr || static_cast<u64>(address) + size_ >= kLinearHeapVaddr) {
         return kResultInvalidAddress;
     }
-    if (block->state != MemState::Free ||
-        static_cast<u64>(block->base) + block->size < static_cast<u64>(target_address) + size_) {
-        MH4N_LOG(Error, "Kernel",
-                 "cannot map id={}, address=0x{:08X} name={}, mapping to already allocated memory",
-                 ObjectId(), address, Name());
-        return kResultInvalidAddressState;
-    }
-
-    // Host aliasing is unsupported (docs/native/wp/N1.md, N1-05): a second address, or any address
-    // for a block that lives in the owner's own memory.
     if (mapped_ || pieces_.empty()) {
-        MH4N_LOG(Error, "Kernel",
-                 "unsupported: shared memory id={} name={} would be mapped at a second address "
-                 "(0x{:08X})",
-                 ObjectId(), Name(), target_address);
+        MH4N_LOG(Warning, kLog, "Shared memory '{}' cannot be aliased at {:#010x}", Name(), address);
         return kResultInvalidAddressState;
     }
 
-    u32 cursor = target_address;
+    auto& memory = kernel_.Memory();
+    const auto area = memory.Query(address);
+    if (!area || area->state != MemState::Free ||
+        static_cast<u64>(address) + size_ > static_cast<u64>(area->base) + area->size) {
+        return kResultInvalidAddressState;
+    }
+
+    u32 cursor = address;
     for (const Piece& piece : pieces_) {
-        const Result result = memory.Map(cursor, piece.size, ToMemPerm(permissions),
+        const Result result = memory.Map(cursor, piece.size, ToGuestPermission(permissions),
                                          MemState::Shared, kFcramPaddr + piece.offset);
-        MH4N_ASSERT(IsSuccess(result), "shared memory: mapping 0x{:08X} failed with 0x{:08X}",
-                    cursor, result);
+        if (result != kResultSuccess) {
+            if (cursor != address) {
+                MH4N_ASSERT(memory.Unmap(address, cursor - address) == kResultSuccess);
+            }
+            return result;
+        }
         cursor += piece.size;
     }
-    // The guest range becomes the home of the contents.
-    memory.WriteBlock(target_address, host_data_.data(), size_);
+    MH4N_ASSERT(memory.WriteBlock(address, host_data_.data(), size_));
+    mapped_at_ = address;
     mapped_ = true;
-    mapped_at_ = target_address;
     return kResultSuccess;
 }
 
 Result SharedMemory::Unmap(Process&, u32 address) {
     if (!mapped_ || address != mapped_at_) {
-        MH4N_LOG(Error, "Kernel", "unmap of shared memory id={} name={} at 0x{:08X}: not mapped there",
-                 ObjectId(), Name(), address);
         return kResultInvalidAddressState;
     }
-    GuestMemory& memory = kernel_.Memory();
-    // The contents go back to the host, so that a later map finds them (FCRAM keeps them in Azahar).
-    memory.ReadBlock(host_data_.data(), mapped_at_, size_);
-    const Result result = memory.Unmap(mapped_at_, size_);
-    if (IsSuccess(result)) {
+
+    auto& memory = kernel_.Memory();
+    if (!memory.ReadBlock(host_data_.data(), address, size_)) {
+        return kResultInvalidAddressState;
+    }
+    const Result result = memory.Unmap(address, size_);
+    if (result == kResultSuccess) {
         mapped_ = false;
         mapped_at_ = 0;
     }
@@ -161,10 +118,10 @@ u8* SharedMemory::GetPointer(u32 offset) {
     if (mapped_) {
         return kernel_.Memory().Base() + mapped_at_ + offset;
     }
-    if (pieces_.empty()) {
-        return kernel_.Memory().Base() + base_address_ + offset;  // the owner's own memory
+    if (base_address_ != 0 && pieces_.empty()) {
+        return kernel_.Memory().Base() + base_address_ + offset;
     }
     return host_data_.data() + offset;
 }
 
-} // namespace mh4n
+}  // namespace mh4n

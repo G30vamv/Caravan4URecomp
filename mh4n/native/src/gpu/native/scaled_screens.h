@@ -81,6 +81,22 @@ public:
     // when the device can.
     virtual void SetSharedScreens(bool on) { (void)on; }
 
+    // Direct screens (2026-11-20, MODIFIED): every sink draws backend images (present::ScreenSink::WantsBackendImages), so a
+    // screen is given as the renderer's own image of it, on the shared device, and nothing is read back or converted.
+    struct BackendScreen {
+        std::shared_ptr<const void> image;  // an rhi::Image
+        present::ImageRegion region;
+        present::Orientation orientation = present::Orientation::Rotated90;
+        u64 timeline_value = 0;  // the submission that drew it
+        u64 sequence = 0;
+        u32 width = 0, height = 0;  // the upright size in image pixels
+    };
+    virtual void SetDirectScreens(bool on) { (void)on; }
+    virtual ScreenRead ReadBackendScreen(u32 paddr, u32 format, u32 stride, u32 rows, BackendScreen& out) {
+        (void)paddr, (void)format, (void)stride, (void)rows, (void)out;
+        return ScreenRead::None;
+    }
+
     // The touch screen's picture is shown (false: nothing shows it, present::ScreenSink::ScreenHidden). Hidden, the
     // renderer leaves out the draws of the touch screen's turn into the target its transfer reads. Any thread.
     virtual void SetTouchScreenShown(bool shown) { (void)shown; }

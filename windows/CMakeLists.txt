@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+﻿# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by
 # khorne-hub (https://github.com/khorne-hub/4u-native); see ADDITIONAL-TERMS and THIRD_PARTY_NOTICES.
 # mh4u-win: the Windows shell of the native port (phase 3 of the project roadmap).
@@ -46,7 +46,24 @@ endif()
 add_executable(mh4u-win WIN32 win_main.cpp menu_gui.cpp imgui_vulkan_backend.cpp "${CINZEL_CPP}" ${APP_ICON_RC})
 set_source_files_properties(app.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/assets/caravan4u.ico")
 set_target_properties(mh4u-win PROPERTIES OUTPUT_NAME Caravan4URecomp)  # Caravan4URecomp.exe
-target_link_libraries(mh4u-win PRIVATE mh4n::app mh4n_warnings SDL3::SDL3 mh4n_imgui iphlpapi ws2_32)
+# What the player's program links: every runtime and app module (as mh4n::app does) except the three that only the test tools use
+# (the IPC and DSP replayers and the Vulkan probe: ~5,600 lines nothing in the shell calls). The runner and the vkprobe program
+# of the game tools keep the full set (they are built from the same tree). Phase 6 of the roadmap.
+set(MH4U_WIN_SKIP_MODULES mh4n_ipc_replay mh4n_dsp_replay mh4n_vkprobe)
+# the older implementations that the independent ones (mh4n/native/own) replaced: not part of the program
+if (NOT MH4U_KEEP_OLD_SERVICES)
+list(APPEND MH4U_WIN_SKIP_MODULES mh4n_services_ndm mh4n_services_nim mh4n_services_frd mh4n_services_cecd mh4n_services_am mh4n_services_cfg mh4n_services_ptm mh4n_services_y2r mh4n_services_ir mh4n_services_dsp mh4n_dsp_hle mh4n_audio)
+endif()
+get_property(MH4U_RUNTIME_MODULES GLOBAL PROPERTY MH4N_MODULES)
+get_property(MH4U_APP_MODULES GLOBAL PROPERTY MH4N_APP_MODULES)
+add_library(mh4u_win_modules INTERFACE)
+foreach (module IN LISTS MH4U_RUNTIME_MODULES MH4U_APP_MODULES)
+    if (NOT module IN_LIST MH4U_WIN_SKIP_MODULES)
+        target_link_libraries(mh4u_win_modules INTERFACE "$<LINK_LIBRARY:WHOLE_ARCHIVE,${module}>")
+    endif()
+endforeach()
+target_link_libraries(mh4u_win_modules INTERFACE SDL3::SDL3 mh4n_imgui mh4n_inih)
+target_link_libraries(mh4u-win PRIVATE mh4u_win_modules mh4n_warnings SDL3::SDL3 mh4n_imgui iphlpapi ws2_32 hid setupapi)
 # the swapchain, present and screen_layout headers are included as "swapchain/..."; screen_layout.h includes the port's platform.h
 target_include_directories(mh4u-win PRIVATE ${MH4N_DIR}/native/src ${MH4N_DIR}/native/app ${MH4N_DIR}/port/src)
 

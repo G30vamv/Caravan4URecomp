@@ -1,16 +1,12 @@
-// The options of the deterministic mode (N1-25), registered here and read by the runtime (runtime.cpp)
-// and by the services that have host threads (services/fs). See deterministic.h.
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: Runtime::Prepare, determinism_test.cpp and the runner's --help output.
+
 #include "mh4n/options.h"
 
 MH4N_OPTION("runner", "--deterministic", "",
-            "make the run repeatable: the game clock counts the cycles the code library charges (it needs "
-            "the library built with --native --deterministic, tools/build_game.py), file replies and the "
-            "rest of the host's work come at fixed ticks of that clock, and the clock starts at the "
-            "reference runner's fixed starting tick. The same options give the same traces; much slower "
-            "than real time. A real-time run is not made repeatable by it");
+            "use guest cycles for the clock and schedule service replies at fixed ticks; "
+            "requires a code library built with --native --deterministic");
 MH4N_OPTION("runner", "--seed", "N",
-            "with --deterministic: draw the length of each scheduling slice from a generator seeded with N, "
-            "from one half to one times the default (4274 us, or --slice-us; the draw goes up to one and a "
-            "half times, but a core with an empty event queue is capped at the default, so the stretches "
-            "usually run one half to one times), which moves the "
-            "points where the two virtual cores take turns; the same seed gives the same run");
+            "with --deterministic, draw reproducible slices from half to one and a half times "
+            "--slice-us (4274 us by default); an empty event queue caps the stretch at the default");

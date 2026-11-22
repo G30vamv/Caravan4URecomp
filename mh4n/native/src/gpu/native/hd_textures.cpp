@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <system_error>
@@ -43,6 +44,99 @@ u64 AnswerKey(u64 content, u32 width, u32 height, texture::Format format) {
 
 }  // namespace
 
+HdTextures::~HdTextures() {
+    {
+        std::lock_guard lock(mutex_);
+        stop_.store(true);
+    }
+    wake_.notify_all();
+    for (auto& w : workers_) if (w.joinable()) w.join();
+    if (loader_.joinable()) loader_.join();
+}
+
+void HdTextures::Worker() {
+    for (;;) {
+        u32 file = 0;
+        {
+            std::unique_lock lock(mutex_);
+            wake_.wait(lock, [this] { return stop_.load() || !queue_.empty(); });
+            if (stop_.load()) return;
+            file = queue_.front();
+            queue_.pop_front();
+        }
+        const File& f = files_[file];
+        std::vector<u8> pixels;
+        bool ok = false;
+        const auto started = std::chrono::steady_clock::now();
+        try {
+            ok = Pixels(Replacement{file, f.width, f.height}, pixels);
+        } catch (const std::exception&) {
+            ok = false;
+            pixels.clear();
+        }
+        const auto took = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+        if (took >= 100) {
+            // (what the game thread used to wait for each time a texture of the pack was first drawn)
+            MH4N_LOG(Info, kLog, "{} ({}x{}) read and decoded in {} ms by a worker (the game did not wait)", f.path, f.width, f.height, took);
+        }
+        std::lock_guard lock(mutex_);
+        auto it = slots_.find(file);
+        if (it == slots_.end()) continue;  // (let go meanwhile: nobody wants it)
+        it->second.state = ok ? State::Ready : State::Failed;
+        it->second.pixels = std::move(pixels);
+    }
+}
+
+HdTextures::State HdTextures::Status(const Replacement& r) {
+    std::lock_guard lock(mutex_);
+    if (files_[r.file].refused) return State::Failed;
+    if (files_[r.file].retry_at > frame_) return State::Pending;
+    auto it = slots_.find(r.file);
+    if (it == slots_.end()) {
+        const u64 bytes = u64{r.width} * r.height * 4;
+        if (reserved_bytes_ + bytes > (128ull << 20)) return State::Pending;  // (too much decoded and waiting: later)
+        Slot slot;
+        slot.bytes = bytes;
+        slot.last_used = frame_;
+        slots_.emplace(r.file, std::move(slot));
+        reserved_bytes_ += bytes;
+        queue_.push_back(r.file);
+        wake_.notify_one();
+        return State::Pending;
+    }
+    it->second.last_used = frame_;
+    return it->second.state;
+}
+
+bool HdTextures::Take(const Replacement& r, std::vector<u8>& rgba) {
+    std::lock_guard lock(mutex_);
+    auto it = slots_.find(r.file);
+    if (it == slots_.end() || it->second.state != State::Ready) return false;
+    rgba = std::move(it->second.pixels);
+    reserved_bytes_ -= std::min(reserved_bytes_, it->second.bytes);
+    slots_.erase(it);
+    return true;
+}
+
+void HdTextures::NextFrame() {
+    std::lock_guard lock(mutex_);
+    ++frame_;
+    std::erase_if(slots_, [this](const auto& item) {
+        const Slot& slot = item.second;
+        if (slot.state == State::Pending || frame_ - slot.last_used <= 120) return false;
+        reserved_bytes_ -= std::min(reserved_bytes_, slot.bytes);
+        return true;
+    });
+}
+
+bool HdTextures::DelayUploadRetry(const Replacement& r) {
+    std::lock_guard lock(mutex_);
+    File& file = files_[r.file];
+    if (file.retry_at != 0) return false;
+    file.retry_at = frame_ + 60;
+    return true;
+}
+
 void HdTextures::Load(const std::string& root) {
     if (const char* d = std::getenv("MH4N_HD_DUMP"); d != nullptr && *d != '\0') {
         dump_dir_ = d;
@@ -54,6 +148,22 @@ void HdTextures::Load(const std::string& root) {
         MH4N_LOG(Info, kLog, "MH4N_HD_TEXTURES=0: no texture pack is read");
         return;
     }
+    if (root.empty()) return;
+    for (int i = 0; i < 2; ++i) workers_.emplace_back([this] { Worker(); });
+    loader_ = std::thread([this, root] {
+        try {
+            Scan(root);
+        } catch (const std::exception& error) {
+            files_.clear();
+            for (auto& hashes : by_hash_) hashes.clear();
+            MH4N_LOG(Warning, kLog, "HD texture scan failed: {}", error.what());
+        }
+        just_ready_.store(true);
+        ready_.store(true, std::memory_order_release);
+    });
+}
+
+void HdTextures::Scan(const std::string& root) {
     std::error_code ec;
     if (root.empty() || !fs::is_directory(utf8::PathFromUtf8(root), ec)) {
         if (!root.empty()) MH4N_LOG(Info, kLog, "no texture packs ({} is not a folder)", root);
@@ -76,6 +186,7 @@ void HdTextures::Load(const std::string& root) {
     u64 total_files = 0;
     const auto t0 = std::chrono::steady_clock::now();
     for (const fs::path& dir : dirs) {
+        if (stop_.load(std::memory_order_relaxed)) return;
         std::string error;
         const std::string dir_text = utf8::PathToUtf8(dir);
         std::optional<hdpack::Pack> pack = hdpack::ScanPack(dir_text, &error);
@@ -86,6 +197,7 @@ void HdTextures::Load(const std::string& root) {
         const int mode = pack->options.use_new_hash ? 1 : 0;
         u32 png = 0, other = 0, normal = 0, taken = 0, size_failed = 0;
         for (const auto& [hash, material] : pack->materials) {
+            if (stop_.load(std::memory_order_relaxed)) return;
             if (material.file[static_cast<int>(hdpack::MapType::Normal)] >= 0) ++normal;
             const int index = material.file[static_cast<int>(hdpack::MapType::Color)];
             if (index < 0) continue;
@@ -139,7 +251,7 @@ void HdTextures::CheckOrientation(const u8* data, std::size_t size, u32 width, u
 
 const HdTextures::Replacement* HdTextures::Find(u64 content, const u8* data, std::size_t size, u32 width, u32 height,
                                                 texture::Format format) {
-    if (by_hash_[0].empty() && by_hash_[1].empty()) return nullptr;
+    if (!ready_.load(std::memory_order_acquire) || (by_hash_[0].empty() && by_hash_[1].empty())) return nullptr;
     const u64 key = AnswerKey(content, width, height, format);
     if (auto it = answers_.find(key); it != answers_.end()) {
         return it->second.found && !files_[it->second.r.file].refused ? &it->second.r : nullptr;
@@ -152,6 +264,7 @@ const HdTextures::Replacement* HdTextures::Find(u64 content, const u8* data, std
     for (int mode = 0; mode < 2 && !a.found; ++mode) {
         if (auto it = by_hash_[mode].find(hashes[mode]); it != by_hash_[mode].end()) {
             const File& f = files_[it->second];
+            if (f.refused) continue;
             a.found = true;
             a.r = Replacement{it->second, f.width, f.height};
             if (++replaced_ <= 30 || replaced_ % 100 == 0) {
@@ -183,6 +296,13 @@ bool HdTextures::Pixels(const Replacement& r, std::vector<u8>& rgba) {
 }
 
 void HdTextures::Refuse(const Replacement& r) {
+    {
+        std::lock_guard lock(mutex_);
+        if (auto it = slots_.find(r.file); it != slots_.end()) {
+            reserved_bytes_ -= std::min(reserved_bytes_, it->second.bytes);
+            slots_.erase(it);
+        }
+    }
     File& f = files_[r.file];
     if (f.refused) return;
     f.refused = true;

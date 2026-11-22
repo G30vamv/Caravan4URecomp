@@ -1,7 +1,7 @@
-// Derived from Azahar src/core/hle/kernel/object.cpp at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6
-// (GPL-2.0-or-later): which handle types a thread can wait on.
-// Copyright 2018-2024 Citra Emulator Project / Azahar Emulator Project
-#include "mh4n/assert.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: the comments of mh4n/kernel.h (Object, IsWaitable), 3dbrew "Kernel objects" and the
+// black-box specification of tests/kernel_objects_test.cpp.
 #include "mh4n/kernel.h"
 
 namespace mh4n {
@@ -9,6 +9,7 @@ namespace mh4n {
 Object::Object(Kernel& kernel) : kernel_(kernel), object_id_(kernel.GenerateObjectId()) {}
 
 bool Object::IsWaitable() const {
+    // Event, Mutex, Thread, Semaphore, Timer, ServerPort and ServerSession; not Process
     switch (GetHandleType()) {
     case HandleType::Event:
     case HandleType::Mutex:
@@ -18,17 +19,9 @@ bool Object::IsWaitable() const {
     case HandleType::ServerPort:
     case HandleType::ServerSession:
         return true;
-    case HandleType::Unknown:
-    case HandleType::SharedMemory:
-    case HandleType::Process:
-    case HandleType::AddressArbiter:
-    case HandleType::ResourceLimit:
-    case HandleType::CodeSet:
-    case HandleType::ClientPort:
-    case HandleType::ClientSession:
+    default:
         return false;
     }
-    MH4N_UNREACHABLE();
 }
 
-} // namespace mh4n
+}  // namespace mh4n

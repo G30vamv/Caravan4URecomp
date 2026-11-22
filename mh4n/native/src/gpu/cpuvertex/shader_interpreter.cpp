@@ -1,953 +1,602 @@
-// Derived from Azahar src/video_core/shader/shader_interpreter.cpp, src/video_core/pica/shader_unit.cpp
-// and src/video_core/pica_types.h at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later;
-// every one of those files says "Licensed under GPLv2 or any later version"): the interpreter, one
-// handler for each instruction, in the order and with the quirks of the original; ShaderUnit::LoadInput
-// and WriteOutput; GeometryEmitter::Emit.
-// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project (shader_interpreter.cpp)
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (shader_unit.cpp)
-// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project (pica_types.h)
-//
-// Each `case` below is the same case of RunInterpreter in shader_interpreter.cpp (Debug = false: the
-// debug records are not kept). Where this file differs it says so in a comment starting with
-// "Deviation".
-#include "gpu/cpuvertex/shader_interpreter.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: WP71-pica-vs-interp, cpuvertex contracts, gpu_cpuvertex tests and 3dbrew GPU/Shader Instruction Set.
+
+#include "shader_interpreter.h"
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <vector>
 
-#include "mh4n/log.h"
-
 namespace mh4n::gpu::cpuvertex {
+namespace {
 
 using isa::CompareOp;
 using isa::FlowOp;
 using isa::Instruction;
 using isa::Opcode;
-using isa::RegisterType;
 using isa::SwizzlePattern;
-using isa::Type;
 
-// ---- ShaderUnit and the emitter (shader_unit.cpp) -------------------------------------------------
+std::atomic<u64> checked_runs{0};
+std::atomic<u64> checked_differences{0};
 
-void ShaderUnit::LoadInput(const ShaderInputConfig& config, const AttributeBuffer& buffer) {
-    const u32 max_attribute = config.max_input_attribute_index;
-    for (u32 attr = 0; attr <= max_attribute; ++attr) {
-        const u32 reg = config.GetRegisterForAttribute(attr);
-        input[reg] = buffer[attr];
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
+
+f24 Bit(bool value) {
+    return value ? f24::One() : f24::Zero();
+}
+
+const Vec4& Read(const ShaderSetup& setup, const ShaderUnit& unit, isa::SourceRegister reg,
+                 u32 address = 0) {
+    const u32 index = static_cast<u32>(reg.GetIndex());
+    switch (reg.GetRegisterType()) {
+    case isa::RegisterType::Input:
+        return unit.input[index];
+    case isa::RegisterType::Temporary:
+        return unit.temporary[index];
+    case isa::RegisterType::FloatUniform:
+        break;
+    }
+
+    const s32 offset = address ? unit.address_registers[address - 1] : 0;
+    const u32 relative = (index + static_cast<u32>(offset >= -128 && offset <= 127 ? offset : 0)) & 127;
+    static const Vec4 ones{{f24::One(), f24::One(), f24::One(), f24::One()}};
+    return relative < setup.uniforms->f.size() ? setup.uniforms->f[relative] : ones;
+}
+
+template <auto Selector, auto Negate>
+Vec4 Swizzle(const Vec4& value, SwizzlePattern pattern) {
+    Vec4 result;
+    const bool negate = (pattern.*Negate)();
+    for (u32 lane = 0; lane < 4; ++lane) {
+        const f24 component = value.c[(pattern.*Selector)(lane)];
+        result.c[lane] = negate ? -component : component;
+    }
+    return result;
+}
+
+s32 ToAddress(float value) {
+    if (value >= -2147483648.0f && value < 2147483648.0f) {
+        return static_cast<s32>(value);
+    }
+    return std::numeric_limits<s32>::min();
+}
+
+bool Test(Instruction instruction, const ShaderUnit& unit) {
+    const bool x = unit.conditional_code[0] == instruction.flow_refx();
+    const bool y = unit.conditional_code[1] == instruction.flow_refy();
+    switch (instruction.flow_op()) {
+    case FlowOp::Or: return x || y;
+    case FlowOp::And: return x && y;
+    case FlowOp::JustX: return x;
+    case FlowOp::JustY: return y;
+    }
+    return false;
+}
+
+bool Compare(CompareOp op, f24 a, f24 b) {
+    switch (op) {
+    case CompareOp::Equal: return a == b;
+    case CompareOp::NotEqual: return a != b;
+    case CompareOp::LessThan: return a < b;
+    case CompareOp::LessEqual: return a <= b;
+    case CompareOp::GreaterThan: return a > b;
+    case CompareOp::GreaterEqual: return a >= b;
+    default: return false;
+    }
+}
+
+void Write(ShaderUnit& unit, isa::DestRegister reg, SwizzlePattern pattern, const Vec4& value) {
+    const u32 index = static_cast<u32>(reg.GetIndex());
+    auto& destination = reg.IsOutput() ? unit.output[unit.output_bank][index] : unit.temporary[index];
+    for (u32 lane = 0; lane < 4; ++lane) {
+        if (pattern.DestComponentEnabled(lane)) {
+            destination.c[lane] = value.c[lane];
+        }
+    }
+}
+
+f24 LaneOperation(Opcode op, f24 a, f24 b) {
+    switch (op) {
+    case Opcode::ADD: return a + b;
+    case Opcode::MUL: return a * b;
+    case Opcode::SGE:
+    case Opcode::SGEI: return Bit(a >= b);
+    case Opcode::SLT:
+    case Opcode::SLTI: return Bit(a < b);
+    case Opcode::FLR: return f24::FromFloat32(std::floor(a.ToFloat32()));
+    case Opcode::MAX: return a > b ? a : b;
+    case Opcode::MIN: return a < b ? a : b;
+    default: return a; // MOV
+    }
+}
+
+float Exp2(float value) { return std::exp2(value); }
+float Log2(float value) { return std::log2(value); }
+
+Unhandled ExecuteAlu(const ShaderSetup& setup, ShaderUnit& unit, Instruction instruction) {
+    const Opcode op = instruction.EffectiveOpCode();
+    const bool inverted = instruction.GetInfo().src_inversed;
+    const bool mad = instruction.GetInfo().type == isa::Type::MultiplyAdd;
+    const SwizzlePattern pattern{
+        setup.swizzle_data[mad ? instruction.mad_operand_desc_id() : instruction.common_operand_desc_id()]};
+    const u32 index = mad ? instruction.mad_address_register_index() : instruction.common_address_register_index();
+    const auto read1 = [&](isa::SourceRegister reg, u32 address) {
+        return Swizzle<&SwizzlePattern::selector_src1, &SwizzlePattern::negate_src1>(
+            Read(setup, unit, reg, address), pattern);
+    };
+    const auto read2 = [&](isa::SourceRegister reg, u32 address) {
+        return Swizzle<&SwizzlePattern::selector_src2, &SwizzlePattern::negate_src2>(
+            Read(setup, unit, reg, address), pattern);
+    };
+
+    Vec4 result;
+    if (mad) {
+        const Vec4 a = read1(instruction.mad_src1(inverted), 0);
+        const Vec4 b = read2(instruction.mad_src2(inverted), inverted ? 0 : index);
+        const Vec4 c = Swizzle<&SwizzlePattern::selector_src3, &SwizzlePattern::negate_src3>(
+            Read(setup, unit, instruction.mad_src3(inverted), inverted ? index : 0), pattern);
+        for (u32 lane = 0; lane < 4; ++lane) {
+            result.c[lane] = a.c[lane] * b.c[lane] + c.c[lane];
+        }
+        Write(unit, instruction.mad_dest(), pattern, result);
+        return Unhandled::None;
+    }
+
+    const Vec4 a = read1(instruction.common_src1(inverted), inverted ? 0 : index);
+    const Vec4 b = read2(instruction.common_src2(inverted), inverted ? index : 0);
+    f24 scalar;
+    switch (op) {
+    case Opcode::DP3:
+    case Opcode::DP4:
+    case Opcode::DPH:
+    case Opcode::DPHI:
+        for (u32 lane = 0; lane < 3; ++lane) {
+            scalar = scalar + a.c[lane] * b.c[lane];
+        }
+        if (op != Opcode::DP3) {
+            scalar = scalar + (op == Opcode::DP4 ? a.c[3] : f24::One()) * b.c[3];
+        }
+        break;
+    case Opcode::EX2: scalar = f24::FromFloat32(Exp2(a.c[0].ToFloat32())); break;
+    case Opcode::LG2: scalar = f24::FromFloat32(Log2(a.c[0].ToFloat32())); break;
+    case Opcode::RCP: scalar = f24::One() / a.c[0]; break;
+    case Opcode::RSQ: scalar = f24::One() / f24::FromFloat32(std::sqrt(a.c[0].ToFloat32())); break;
+    case Opcode::MOVA:
+        for (u32 lane = 0; lane < 2; ++lane) {
+            if (pattern.DestComponentEnabled(lane)) {
+                unit.address_registers[lane] = ToAddress(a.c[lane].ToFloat32());
+            }
+        }
+        return Unhandled::None;
+    case Opcode::CMP: {
+        const CompareOp x = instruction.common_compare_x();
+        const CompareOp y = instruction.common_compare_y();
+        if (x > CompareOp::GreaterEqual || y > CompareOp::GreaterEqual) {
+            return Unhandled::CompareMode;
+        }
+        unit.conditional_code[0] = Compare(x, a.c[0], b.c[0]);
+        unit.conditional_code[1] = Compare(y, a.c[1], b.c[1]);
+        return Unhandled::None;
+    }
+    case Opcode::ADD:
+    case Opcode::MUL:
+    case Opcode::SGE:
+    case Opcode::SGEI:
+    case Opcode::SLT:
+    case Opcode::SLTI:
+    case Opcode::FLR:
+    case Opcode::MAX:
+    case Opcode::MIN:
+    case Opcode::MOV:
+        for (u32 lane = 0; lane < 4; ++lane) {
+            result.c[lane] = LaneOperation(op, a.c[lane], b.c[lane]);
+        }
+        Write(unit, instruction.common_dest(), pattern, result);
+        return Unhandled::None;
+    default:
+        return Unhandled::Instruction;
+    }
+
+    std::fill_n(result.c, 4, scalar);
+    Write(unit, instruction.common_dest(), pattern, result);
+    return Unhandled::None;
+}
+
+template <typename Frame, size_t Capacity>
+struct FlowStack {
+    std::array<Frame, Capacity> frames{};
+    size_t size = 0;
+
+    Frame& Top() { return frames[size - 1]; }
+    void Pop() { --size; }
+    void Push(Frame frame) {
+        if (size == Capacity) {
+            for (size_t i = 1; i < Capacity; ++i) {
+                frames[i - 1] = frames[i];
+            }
+            --size;
+        }
+        frames[size++] = frame;
+    }
+};
+
+struct FlowFrame {
+    u32 end;
+    u32 resume;
+};
+
+struct LoopFrame {
+    u32 end;
+    u32 start;
+    u32 remaining;
+    s32 increment;
+    s32 initial_address;
+};
+
+template <size_t Count>
+struct NativeVectors {
+    float values[Count][4];
+};
+
+struct NativeOutputs {
+    float values[2][16][4];
+};
+
+struct NativeIntegers {
+    unsigned char values[4][4];
+};
+
+struct NativeCall {
+    GeometryEmitter* emitter;
+    NativeOutputs output;
+    unsigned char bank;
+    Unhandled failure = Unhandled::Instruction;
+
+    static int Emit(void* context) {
+        auto& call = *static_cast<NativeCall*>(context);
+        auto* emitter = call.emitter;
+        if (!emitter || emitter->emit_state.vertex_id >= emitter->buffer.size()) {
+            call.failure = emitter ? Unhandled::EmitVertexId : Unhandled::EmitOnVertexShader;
+            return 0;
+        }
+        emitter->Emit(std::bit_cast<AttributeBuffer>(call.output.values[call.bank != 0]));
+        return 1;
+    }
+
+    static int SetEmit(void* context, unsigned id, unsigned primitive, unsigned winding) {
+        auto& call = *static_cast<NativeCall*>(context);
+        if (!call.emitter) {
+            call.failure = Unhandled::EmitOnVertexShader;
+            return 0;
+        }
+        call.emitter->emit_state = {winding != 0, primitive != 0, static_cast<u8>(id)};
+        return 1;
+    }
+};
+
+struct Emission {
+    bool winding = false;
+    AttributeBuffer output{};
+};
+
+class RecordingSink final : public VertexSink {
+public:
+    explicit RecordingSink(VertexSink* sink = nullptr) : sink_(sink) {}
+
+    void SubmitVertex(const AttributeBuffer& output) override {
+        events.push_back({false, output});
+        if (sink_) {
+            sink_->SubmitVertex(output);
+        }
+    }
+
+    void SetWinding() override {
+        events.push_back({true, {}});
+        if (sink_) {
+            sink_->SetWinding();
+        }
+    }
+
+    std::vector<Emission> events;
+
+private:
+    VertexSink* sink_;
+};
+
+template <typename T>
+bool SameVectorBits(const T& a, const T& b) {
+    return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
+
+bool SameUnit(const ShaderUnit& a, const ShaderUnit& b) {
+    if (a.output_bank != b.output_bank ||
+        !std::equal(std::begin(a.address_registers), std::end(a.address_registers), b.address_registers) ||
+        !std::equal(std::begin(a.conditional_code), std::end(a.conditional_code), b.conditional_code) ||
+        !SameVectorBits(a.input, b.input) || !SameVectorBits(a.temporary, b.temporary) ||
+        !SameVectorBits(a.output, b.output)) {
+        return false;
+    }
+    if (!a.emitter_ptr) {
+        return true;
+    }
+
+    const auto& x = *a.emitter_ptr;
+    const auto& y = *b.emitter_ptr;
+    return x.emit_state.winding == y.emit_state.winding &&
+           x.emit_state.prim_emit == y.emit_state.prim_emit &&
+           x.emit_state.vertex_id == y.emit_state.vertex_id &&
+           SameVectorBits(x.buffer, y.buffer);
+}
+
+} // namespace
+
+void ShaderUnit::LoadInput(const ShaderInputConfig& config, const AttributeBuffer& attributes) {
+    for (u32 i = 0; i <= config.max_input_attribute_index && i < input.size(); ++i) {
+        input[config.GetRegisterForAttribute(i)] = attributes[i];
     }
 }
 
 void ShaderUnit::WriteOutput(u32 output_mask, AttributeBuffer& buffer) const {
-    u32 output_index{};
-    // Common::BitSet<u32>: the set bits, lowest first.
-    for (u32 mask = output_mask; mask != 0; mask &= mask - 1) {
-        const u32 reg = static_cast<u32>(__builtin_ctz(mask));
-        buffer[output_index++] = output[output_bank][reg];
+    u32 next = 0;
+    for (u32 i = 0; i < output[0].size(); ++i) {
+        if (output_mask & (1u << i)) {
+            buffer[next++] = output[output_bank][i];
+        }
     }
 }
 
 void GeometryEmitter::Emit(std::span<const Vec4, 16> output_regs) {
-    // The interpreter has checked emit_state.vertex_id < 3 (Azahar: ASSERT).
-    u32 output_index{};
-    for (u32 mask = output_mask; mask != 0; mask &= mask - 1) {
-        const u32 reg = static_cast<u32>(__builtin_ctz(mask));
-        buffer[emit_state.vertex_id][output_index++] = output_regs[reg];
+    if (emit_state.vertex_id >= buffer.size()) {
+        return;
+    }
+    auto& vertex = buffer[emit_state.vertex_id];
+    u32 next = 0;
+    for (u32 i = 0; i < output_regs.size(); ++i) {
+        if (output_mask & (1u << i)) {
+            vertex[next++] = output_regs[i];
+        }
     }
 
-    if (emit_state.prim_emit) {
+    if (emit_state.prim_emit && sink) {
         if (emit_state.winding) {
             sink->SetWinding();
         }
-        for (std::size_t i = 0; i < buffer.size(); ++i) {
-            sink->SubmitVertex(buffer[i]);
+        for (const auto& buffered : buffer) {
+            sink->SubmitVertex(buffered);
         }
     }
 }
 
 void GeometryShaderUnit::Reset() {
-    VertexSink* keep = emitter.sink;
-    const u32 mask = emitter.output_mask;
-    address_registers[0] = address_registers[1] = address_registers[2] = 0;
-    conditional_code[0] = conditional_code[1] = false;
-    input = {};
-    temporary = {};
-    output = {};
-    output_bank = false;
-    emitter = GeometryEmitter{};
-    emitter.sink = keep;
-    emitter.output_mask = mask;
+    VertexSink* sink = emitter.sink;
+    emitter = {};
+    emitter.sink = sink;
+    static_cast<ShaderUnit&>(*this) = ShaderUnit(&emitter);
 }
-
-// ---- the interpreter (shader_interpreter.cpp) ------------------------------------------------------
-
-namespace {
-
-struct IfStackElement {
-    u32 else_address;
-    u32 end_address;
-};
-
-struct CallStackElement {
-    u32 end_address;
-    u32 return_address;
-};
-
-struct LoopStackElement {
-    u32 entry_address;
-    u32 end_address;
-    u8 loop_downcounter;
-    u8 address_increment;
-    u8 previous_aL;
-};
-
-// boost::circular_buffer<T>(N) as the interpreter uses it: pushing onto a full buffer overwrites
-// the oldest element.
-template <typename T, std::size_t N>
-class CircularStack {
-public:
-    bool empty() const {
-        return size_ == 0;
-    }
-    std::size_t size() const {
-        return size_;
-    }
-    T& back() {
-        return data_[(first_ + size_ - 1) % N];
-    }
-    void push_back(const T& value) {
-        if (size_ == N) {
-            first_ = (first_ + 1) % N;
-            --size_;
-        }
-        data_[(first_ + size_) % N] = value;
-        ++size_;
-    }
-    void pop_back() {
-        --size_;
-    }
-
-private:
-    std::array<T, N> data_{};
-    std::size_t first_ = 0;
-    std::size_t size_ = 0;
-};
-
-// static_cast<s32>(float) as it is on x86-64 (Azahar's only configuration that matters here): a
-// value that does not fit, and NaN, give the most negative integer. The C++ cast is undefined
-// there. (Every such value is outside the 8-bit range LookupSourceRegister allows an address
-// register, so the result only has to be deterministic.)
-s32 FloatToS32(float value) {
-    if (!(value > -2147483648.0f && value < 2147483648.0f)) {
-        return std::numeric_limits<s32>::min();
-    }
-    return static_cast<s32>(value);
-}
-
-} // namespace
-
-// ---- compiled programs (pica_native.h) ------------------------------------------------------------
-
-static_assert(sizeof(Vec4) == 16 && sizeof(f24) == 4, "a register is float[4] to a compiled program");
-static_assert(sizeof(bool) == 1, "the bool uniforms and the conditional code are bytes to a compiled program");
-static_assert(sizeof(std::array<std::array<Vec4, 16>, 2>) == 2 * 16 * 16, "the output banks are float[2][16][4]");
-
-namespace {
-
-std::atomic<u64> g_check_runs{0};
-std::atomic<u64> g_check_differences{0};
-
-// EMIT and SETEMIT of a compiled program: the interpreter's checks, then the emitter.
-struct NativeContext {
-    ShaderUnit* unit = nullptr;
-    Unhandled failure = Unhandled::None;
-};
-
-int NativeEmit(void* ctx) {
-    NativeContext& c = *static_cast<NativeContext*>(ctx);
-    GeometryEmitter* emitter = c.unit->emitter_ptr;
-    if (emitter == nullptr) {
-        c.failure = Unhandled::EmitOnVertexShader;
-        return 0;
-    }
-    if (emitter->emit_state.vertex_id >= 3) {
-        c.failure = Unhandled::EmitVertexId;
-        return 0;
-    }
-    emitter->Emit(c.unit->output[c.unit->output_bank]);
-    return 1;
-}
-
-int NativeSetEmit(void* ctx, unsigned vertex_id, unsigned prim_emit, unsigned winding) {
-    NativeContext& c = *static_cast<NativeContext*>(ctx);
-    GeometryEmitter* emitter = c.unit->emitter_ptr;
-    if (emitter == nullptr) {
-        c.failure = Unhandled::EmitOnVertexShader;
-        return 0;
-    }
-    emitter->emit_state.vertex_id = static_cast<u8>(vertex_id);
-    emitter->emit_state.prim_emit = prim_emit != 0;
-    emitter->emit_state.winding = winding != 0;
-    return 1;
-}
-
-float NativeExp2(float x) {
-    return std::exp2(x);
-}
-float NativeLog2(float x) {
-    return std::log2(x);
-}
-
-// A sink that keeps what it is given (and passes it on, when it has where to).
-class RecordingSink final : public VertexSink {
-public:
-    explicit RecordingSink(VertexSink* next) : next_(next) {}
-    void SubmitVertex(const AttributeBuffer& output) override {
-        vertices.push_back(output);
-        if (next_ != nullptr) {
-            next_->SubmitVertex(output);
-        }
-    }
-    void SetWinding() override {
-        windings.push_back(vertices.size());
-        if (next_ != nullptr) {
-            next_->SetWinding();
-        }
-    }
-    std::vector<AttributeBuffer> vertices;
-    std::vector<size_t> windings;
-
-private:
-    VertexSink* next_;
-};
-
-// The same floats, bit for bit, except that any NaN equals any NaN: which NaN an operation on NaNs gives (the sign, the
-// payload) is up to the compiler's order of commutative operands and to the CPU, and nothing that reads a register sees it.
-bool SameBits(const void* a, const void* b, size_t size) {
-    const auto* x = static_cast<const f24*>(a);
-    const auto* y = static_cast<const f24*>(b);
-    for (size_t i = 0; i < size / sizeof(f24); ++i) {
-        const float p = x[i].value, q = y[i].value;
-        if (!(std::isnan(p) && std::isnan(q)) && std::memcmp(&p, &q, sizeof(float)) != 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-}  // namespace
 
 NativeCheckCounts GetNativeCheckCounts() {
-    return {g_check_runs.load(std::memory_order_relaxed), g_check_differences.load(std::memory_order_relaxed)};
+    return {checked_runs.load(std::memory_order_relaxed), checked_differences.load(std::memory_order_relaxed)};
 }
 
-bool InterpreterEngine::Run(const ShaderSetup& setup, ShaderUnit& state, RunError& error) const {
-    if (setup.native == nullptr) {
-        return Interpret(setup, state, error);
-    }
-    return setup.check_native ? RunChecked(setup, state, error) : RunNative(setup, state, error);
-}
-
-bool InterpreterEngine::RunNative(const ShaderSetup& setup, ShaderUnit& state, RunError& error) const {
+bool InterpreterEngine::Run(const ShaderSetup& setup, ShaderUnit& unit, RunError& error) const {
     error = {};
-    NativeContext context{&state, Unhandled::None};
-    PicaNativeState s;
-    s.input = reinterpret_cast<float(*)[4]>(state.input.data());
-    s.temporary = reinterpret_cast<float(*)[4]>(state.temporary.data());
-    s.output = reinterpret_cast<float(*)[16][4]>(state.output.data());
-    s.output_bank = reinterpret_cast<unsigned char*>(&state.output_bank);
-    s.address = reinterpret_cast<int*>(state.address_registers);
-    s.conditional = reinterpret_cast<unsigned char*>(state.conditional_code);
-    s.uniform_f = reinterpret_cast<const float(*)[4]>(setup.uniforms->f.data());
-    s.uniform_b = reinterpret_cast<const unsigned char*>(setup.uniforms->b.data());
-    s.uniform_i = reinterpret_cast<const unsigned char(*)[4]>(setup.uniforms->i.data());
-    s.emit = NativeEmit;
-    s.setemit = NativeSetEmit;
-    s.exp2 = NativeExp2;
-    s.log2 = NativeLog2;
-    s.ctx = &context;
-    const int result = setup.native(&s);
-    if (result == 1) {
-        return true;
-    }
-    const u32 pc = static_cast<u32>(-result - 1);
-    error = {context.failure != Unhandled::None ? context.failure : Unhandled::Instruction, pc,
-             pc < kMaxProgramCodeLength ? setup.program_code[pc] : 0};
-    return false;
-}
-
-bool InterpreterEngine::RunChecked(const ShaderSetup& setup, ShaderUnit& state, RunError& error) const {
-    // the unit and its emitter as they are before the run
-    ShaderUnit before = state;
-    GeometryEmitter emitter_before;
-    GeometryEmitter* const emitter = state.emitter_ptr;
-    if (emitter != nullptr) {
-        emitter_before = *emitter;
-    }
-    // the interpreter, for real (its vertices go on to the sink), kept
-    RecordingSink interpreted(emitter != nullptr ? emitter->sink : nullptr);
-    if (emitter != nullptr) {
-        emitter->sink = &interpreted;
-    }
-    const bool ok = Interpret(setup, state, error);
-    if (emitter != nullptr) {
-        emitter->sink = emitter_before.sink;
-    }
-    // the compiled program on the copy
-    RecordingSink compiled(nullptr);
-    GeometryEmitter emitter_copy = emitter_before;
-    emitter_copy.sink = &compiled;
-    ShaderUnit copy = before;
-    copy.emitter_ptr = emitter != nullptr ? &emitter_copy : nullptr;
-    RunError native_error;
-    const bool native_ok = RunNative(setup, copy, native_error);
-
-    bool same = ok == native_ok &&
-                std::memcmp(state.address_registers, copy.address_registers, sizeof(copy.address_registers)) == 0 &&
-                state.conditional_code[0] == copy.conditional_code[0] &&
-                state.conditional_code[1] == copy.conditional_code[1] &&
-                SameBits(state.temporary.data(), copy.temporary.data(), sizeof(copy.temporary)) &&
-                SameBits(state.output.data(), copy.output.data(), sizeof(copy.output)) &&
-                state.output_bank == copy.output_bank && interpreted.vertices.size() == compiled.vertices.size() &&
-                interpreted.windings == compiled.windings;
-    for (size_t i = 0; same && i < compiled.vertices.size(); ++i) {
-        same = SameBits(interpreted.vertices[i].data(), compiled.vertices[i].data(), sizeof(AttributeBuffer));
-    }
-    if (same && emitter != nullptr) {
-        same = emitter->emit_state.vertex_id == emitter_copy.emit_state.vertex_id &&
-               emitter->emit_state.prim_emit == emitter_copy.emit_state.prim_emit &&
-               emitter->emit_state.winding == emitter_copy.emit_state.winding &&
-               SameBits(emitter->buffer.data(), emitter_copy.buffer.data(), sizeof(emitter_copy.buffer));
-    }
-    g_check_runs.fetch_add(1, std::memory_order_relaxed);
-    if (!same) {
-        const u64 n = g_check_differences.fetch_add(1, std::memory_order_relaxed);
-        if (n < 8) {
-            MH4N_LOG(Warning, "CpuVertex", "a compiled shader program (entry {}) differs from the interpreter: ok {}/{}, {}/{} "
-                     "vertices", setup.entry_point, ok, native_ok, interpreted.vertices.size(), compiled.vertices.size());
-        }
-    }
-    return ok;
-}
-
-bool InterpreterEngine::Interpret(const ShaderSetup& setup, ShaderUnit& state, RunError& error) const {
-    error = {};
-    // SetupBatch: ASSERT(entry_point < MAX_PROGRAM_CODE_LENGTH).
     if (setup.entry_point >= kMaxProgramCodeLength) {
         error = {Unhandled::EntryPoint, setup.entry_point, 0};
         return false;
     }
+    if (!setup.native) {
+        return Interpret(setup, unit, error);
+    }
+    return setup.check_native ? RunChecked(setup, unit, error) : RunNative(setup, unit, error);
+}
 
-    CircularStack<IfStackElement, 8> if_stack;
-    CircularStack<CallStackElement, 4> call_stack;
-    CircularStack<LoopStackElement, 4> loop_stack;
-    u32 program_counter = setup.entry_point;
+bool InterpreterEngine::Interpret(const ShaderSetup& setup, ShaderUnit& unit, RunError& error) const {
+    FlowStack<FlowFrame, 4> calls;
+    FlowStack<FlowFrame, 8> branches;
+    FlowStack<LoopFrame, 4> loops;
+    u32 pc = setup.entry_point;
 
-    const auto do_if = [&](Instruction instr, bool condition) {
-        if (condition) {
-            if_stack.push_back({
-                instr.flow_dest_offset(),
-                instr.flow_dest_offset() + instr.flow_num_instructions(),
-            });
+    for (u32 step = 0; step < kMaxInstructions; ++step) {
+        if (pc >= kMaxProgramCodeLength) {
+            error = {Unhandled::EntryPoint, pc, 0};
+            return false;
+        }
+        if (pc == kMaxProgramCodeLength - 1) {
+            return true;
+        }
+
+        const Instruction instruction{setup.program_code[pc]};
+        const Opcode op = instruction.EffectiveOpCode();
+        const u32 next = pc + 1;
+        u32 target = next;
+        bool break_loop = false;
+        Unhandled failure = Unhandled::None;
+        const auto& info = instruction.GetInfo();
+        if (info.type == isa::Type::Arithmetic || info.type == isa::Type::MultiplyAdd) {
+            failure = ExecuteAlu(setup, unit, instruction);
         } else {
-            program_counter = instr.flow_dest_offset() - 1;
+            const u32 dest = instruction.flow_dest_offset();
+            const u32 length = instruction.flow_num_instructions();
+            const u32 uniform = instruction.flow_bool_uniform_id();
+            switch (op) {
+            case Opcode::END: return true;
+            case Opcode::NOP: break;
+            case Opcode::BREAK:
+            case Opcode::BREAKC:
+                break_loop = op == Opcode::BREAK || Test(instruction, unit);
+                break;
+            case Opcode::CALL:
+            case Opcode::CALLC:
+            case Opcode::CALLU:
+                if (length && (op == Opcode::CALL ||
+                               (op == Opcode::CALLC ? Test(instruction, unit) : setup.uniforms->b[uniform]))) {
+                    calls.Push({dest + length, next});
+                    target = dest;
+                }
+                break;
+            case Opcode::IFC:
+            case Opcode::IFU:
+                if (op == Opcode::IFC ? Test(instruction, unit) : setup.uniforms->b[uniform]) {
+                    branches.Push({dest, dest + length});
+                } else {
+                    target = dest;
+                }
+                break;
+            case Opcode::LOOP: {
+                const auto& parameters = setup.uniforms->i[instruction.flow_int_uniform_id()];
+                unit.address_registers[2] = parameters[1];
+                // The renderer restores the inner loop's start value on return to an outer loop.
+                loops.Push({dest + 1, next, 1u + parameters[0], parameters[2], parameters[1]});
+                break;
+            }
+            case Opcode::JMPC:
+                if (Test(instruction, unit)) {
+                    target = dest;
+                }
+                break;
+            case Opcode::JMPU:
+                if (setup.uniforms->b[uniform] != ((length & 1) != 0)) {
+                    target = dest;
+                }
+                break;
+            case Opcode::EMIT:
+                if (!unit.emitter_ptr) {
+                    failure = Unhandled::EmitOnVertexShader;
+                } else if (unit.emitter_ptr->emit_state.vertex_id >= unit.emitter_ptr->buffer.size()) {
+                    failure = Unhandled::EmitVertexId;
+                } else {
+                    unit.emitter_ptr->Emit(unit.output[unit.output_bank]);
+                    unit.output_bank = !unit.output_bank;
+                }
+                break;
+            case Opcode::SETEMIT:
+                if (!unit.emitter_ptr) {
+                    failure = Unhandled::EmitOnVertexShader;
+                } else {
+                    unit.emitter_ptr->emit_state = {instruction.setemit_winding(), instruction.setemit_prim_emit(),
+                                                    static_cast<u8>(instruction.setemit_vertex_id())};
+                }
+                break;
+            default:
+                failure = Unhandled::Instruction;
+                break;
+            }
         }
-    };
-
-    const auto do_call = [&](Instruction instr) {
-        call_stack.push_back({
-            instr.flow_dest_offset() + instr.flow_num_instructions(),
-            program_counter + 1,
-        });
-        program_counter = instr.flow_dest_offset() - 1;
-    };
-
-    const auto do_loop = [&](Instruction instr, const std::array<u8, 4>& loop_param) {
-        const u8 previous_aL = static_cast<u8>(state.address_registers[2]);
-        loop_stack.push_back({
-            program_counter + 1,
-            instr.flow_dest_offset() + 1,
-            loop_param[0],
-            loop_param[2],
-            previous_aL,
-        });
-        state.address_registers[2] = loop_param[1];
-    };
-
-    auto evaluate_condition = [&state](Instruction instr) {
-        bool result_x = instr.flow_refx() == state.conditional_code[0];
-        bool result_y = instr.flow_refy() == state.conditional_code[1];
-
-        switch (instr.flow_op()) {
-        case FlowOp::Or:
-            return result_x || result_y;
-        case FlowOp::And:
-            return result_x && result_y;
-        case FlowOp::JustX:
-            return result_x;
-        case FlowOp::JustY:
-            return result_y;
-        }
-        return false; // unreachable: the field has two bits
-    };
-
-    const Uniforms& uniforms = *setup.uniforms;
-    const u32* swizzle_data = setup.swizzle_data;
-    const u32* program_code = setup.program_code;
-
-    // Constants for handling invalid inputs. In Azahar these are static arrays that a write to an
-    // invalid destination would modify; the destination field has five bits, so none exists, and
-    // these are constant here.
-    static const f24 dummy_vec4_float24_zeros[4] = {f24::Zero(), f24::Zero(), f24::Zero(), f24::Zero()};
-    static const f24 dummy_vec4_float24_ones[4] = {f24::One(), f24::One(), f24::One(), f24::One()};
-
-    u32 iteration = 0;
-    bool should_stop = false;
-    while (!should_stop) {
-        bool is_break = false;
-        const u32 old_program_counter = program_counter;
-
-        if (iteration >= kMaxInstructions) {
-            error = {Unhandled::InstructionBudget, old_program_counter, 0};
+        if (failure != Unhandled::None || (break_loop && !loops.size)) {
+            error = {failure == Unhandled::None ? Unhandled::Instruction : failure, pc, instruction.hex};
             return false;
         }
 
-        // Always treat the last instruction of the program code as an end instruction. This fixes
-        // some games such as Thunder Blade or After Burner II which have malformed geo shaders
-        // without an end instruction crashing the emulator due to the program counter growing
-        // uncontrollably. (Azahar's comment; its TODO: find how real hardware reacts.)
-        Instruction instr{};
-        if (program_counter < kMaxProgramCodeLength - 1) {
-            instr.hex = program_code[program_counter];
-        } else {
-            instr.hex = static_cast<u32>(Opcode::END) << 26;
+        // All scopes inspect the sequential PC. A matching loop overrides a branch or call.
+        u32 returned = next;
+        for (u32 popped = 0; calls.size && calls.Top().end == returned; ++popped) {
+            if (popped < 3) {
+                returned = calls.Top().resume;
+            }
+            calls.Pop();
+            target = returned;
         }
-
-        const SwizzlePattern swizzle = {swizzle_data[instr.common_operand_desc_id()]};
-
-        auto LookupSourceRegister = [&](const isa::SourceRegister& source_reg,
-                                        int address_register_index) -> const f24* {
-            int index = source_reg.GetIndex();
-            switch (source_reg.GetRegisterType()) {
-            case RegisterType::Input:
-                return &state.input[static_cast<size_t>(index)].c[0];
-
-            case RegisterType::Temporary:
-                return &state.temporary[static_cast<size_t>(index)].c[0];
-
-            case RegisterType::FloatUniform:
-                if (address_register_index != 0) {
-                    int offset = state.address_registers[address_register_index - 1];
-                    if (offset < std::numeric_limits<s8>::min() ||
-                        offset > std::numeric_limits<s8>::max()) [[unlikely]] {
-                        offset = 0;
-                    }
-                    index = (index + offset) & 0x7F;
-                    // If the index is above 96, the result is all one.
-                    if (index >= 96) [[unlikely]] {
-                        return dummy_vec4_float24_ones;
-                    }
-                }
-                return &uniforms.f[static_cast<size_t>(index)].c[0];
-
-            default:
-                return dummy_vec4_float24_zeros;
-            }
-        };
-
-        switch (instr.GetInfo().type) {
-        case Type::Arithmetic: {
-            const bool is_inverted = instr.GetInfo().src_inversed;
-
-            const f24* src1_ = LookupSourceRegister(
-                instr.common_src1(is_inverted),
-                !is_inverted * static_cast<int>(instr.common_address_register_index()));
-            const f24* src2_ = LookupSourceRegister(
-                instr.common_src2(is_inverted),
-                is_inverted * static_cast<int>(instr.common_address_register_index()));
-
-            const bool negate_src1 = swizzle.negate_src1();
-            const bool negate_src2 = swizzle.negate_src2();
-
-            f24 src1[4] = {
-                src1_[swizzle.selector_src1(0)],
-                src1_[swizzle.selector_src1(1)],
-                src1_[swizzle.selector_src1(2)],
-                src1_[swizzle.selector_src1(3)],
-            };
-            if (negate_src1) {
-                src1[0] = -src1[0];
-                src1[1] = -src1[1];
-                src1[2] = -src1[2];
-                src1[3] = -src1[3];
-            }
-            f24 src2[4] = {
-                src2_[swizzle.selector_src2(0)],
-                src2_[swizzle.selector_src2(1)],
-                src2_[swizzle.selector_src2(2)],
-                src2_[swizzle.selector_src2(3)],
-            };
-            if (negate_src2) {
-                src2[0] = -src2[0];
-                src2[1] = -src2[1];
-                src2[2] = -src2[2];
-                src2[3] = -src2[3];
-            }
-
-            // Deviation: Azahar's `dest` can also point at a dummy array for a register value of
-            // 0x20 and above; the field is five bits wide, so that arm cannot be taken.
-            f24* dest = instr.common_dest().IsOutput()
-                            ? &state.output[state.output_bank][static_cast<size_t>(instr.common_dest().GetIndex())].c[0]
-                            : &state.temporary[static_cast<size_t>(instr.common_dest().GetIndex())].c[0];
-
-            switch (instr.EffectiveOpCode()) {
-            case Opcode::ADD: {
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = src1[i] + src2[i];
-                }
-                break;
-            }
-
-            case Opcode::MUL: {
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = src1[i] * src2[i];
-                }
-                break;
-            }
-
-            case Opcode::FLR:
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = f24::FromFloat32(std::floor(src1[i].ToFloat32()));
-                }
-                break;
-
-            case Opcode::MAX:
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    // NOTE: Exact form required to match NaN semantics to hardware:
-                    //   max(0, NaN) -> NaN
-                    //   max(NaN, 0) -> 0
-                    dest[i] = (src1[i] > src2[i]) ? src1[i] : src2[i];
-                }
-                break;
-
-            case Opcode::MIN:
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    // NOTE: Exact form required to match NaN semantics to hardware:
-                    //   min(0, NaN) -> NaN
-                    //   min(NaN, 0) -> 0
-                    dest[i] = (src1[i] < src2[i]) ? src1[i] : src2[i];
-                }
-                break;
-
-            case Opcode::DP3:
-            case Opcode::DP4:
-            case Opcode::DPH:
-            case Opcode::DPHI: {
-                const Opcode opcode = instr.EffectiveOpCode();
-                if (opcode == Opcode::DPH || opcode == Opcode::DPHI)
-                    src1[3] = f24::One();
-
-                const int num_components = (opcode == Opcode::DP3) ? 3 : 4;
-                // std::inner_product(src1, src1 + n, src2, f24::Zero()): init = init + a * b
-                f24 dot = f24::Zero();
-                for (int i = 0; i < num_components; ++i) {
-                    dot = dot + src1[i] * src2[i];
-                }
-
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = dot;
-                }
-                break;
-            }
-
-            // Reciprocal
-            case Opcode::RCP: {
-                f24 rcp_res = f24::FromFloat32(1.0f / src1[0].ToFloat32());
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = rcp_res;
-                }
-                break;
-            }
-
-            // Reciprocal Square Root
-            case Opcode::RSQ: {
-                f24 rsq_res = f24::FromFloat32(1.0f / std::sqrt(src1[0].ToFloat32()));
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = rsq_res;
-                }
-                break;
-            }
-
-            case Opcode::MOVA: {
-                for (int i = 0; i < 2; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    // TODO (Azahar): Figure out how the rounding is done on hardware
-                    state.address_registers[i] = FloatToS32(src1[i].ToFloat32());
-                }
-                break;
-            }
-
-            case Opcode::MOV: {
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = src1[i];
-                }
-                break;
-            }
-
-            case Opcode::SGE:
-            case Opcode::SGEI:
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = (src1[i] >= src2[i]) ? f24::One() : f24::Zero();
-                }
-                break;
-
-            case Opcode::SLT:
-            case Opcode::SLTI:
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = (src1[i] < src2[i]) ? f24::One() : f24::Zero();
-                }
-                break;
-
-            case Opcode::CMP:
-                for (int i = 0; i < 2; ++i) {
-                    // TODO (Azahar): Can you restrict to one compare via dest masking?
-
-                    const CompareOp op = (i == 0) ? instr.common_compare_x() : instr.common_compare_y();
-
-                    switch (op) {
-                    case CompareOp::Equal:
-                        state.conditional_code[i] = (src1[i] == src2[i]);
-                        break;
-
-                    case CompareOp::NotEqual:
-                        state.conditional_code[i] = (src1[i] != src2[i]);
-                        break;
-
-                    case CompareOp::LessThan:
-                        state.conditional_code[i] = (src1[i] < src2[i]);
-                        break;
-
-                    case CompareOp::LessEqual:
-                        state.conditional_code[i] = (src1[i] <= src2[i]);
-                        break;
-
-                    case CompareOp::GreaterThan:
-                        state.conditional_code[i] = (src1[i] > src2[i]);
-                        break;
-
-                    case CompareOp::GreaterEqual:
-                        state.conditional_code[i] = (src1[i] >= src2[i]);
-                        break;
-
-                    default:
-                        // Deviation: Azahar logs "Unknown compare mode" and leaves the code as it
-                        // is; the draw is dropped here.
-                        error = {Unhandled::CompareMode, old_program_counter, instr.hex};
-                        return false;
-                    }
-                }
-                break;
-
-            case Opcode::EX2: {
-                // EX2 only takes first component exp2 and writes it to all dest components
-                f24 ex2_res = f24::FromFloat32(std::exp2(src1[0].ToFloat32()));
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = ex2_res;
-                }
-                break;
-            }
-
-            case Opcode::LG2: {
-                // LG2 only takes the first component log2 and writes it to all dest components
-                f24 lg2_res = f24::FromFloat32(std::log2(src1[0].ToFloat32()));
-                for (int i = 0; i < 4; ++i) {
-                    if (!swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = lg2_res;
-                }
-                break;
-            }
-
-            default:
-                // Azahar: LOG_ERROR "Unhandled arithmetic instruction" (DST, DSTI and LIT have no
-                // handler in its interpreter) and goes on. Deviation: the draw is dropped.
-                error = {Unhandled::Instruction, old_program_counter, instr.hex};
-                return false;
-            }
-
-            break;
+        if (branches.size && branches.Top().end == next) {
+            target = branches.Top().resume;
+            branches.Pop();
         }
-
-        case Type::MultiplyAdd: {
-            if ((instr.EffectiveOpCode() == Opcode::MAD) || (instr.EffectiveOpCode() == Opcode::MADI)) {
-                const SwizzlePattern mad_swizzle = {swizzle_data[instr.mad_operand_desc_id()]};
-
-                bool is_inverted = (instr.EffectiveOpCode() == Opcode::MADI);
-
-                const f24* src1_ = LookupSourceRegister(instr.mad_src1(is_inverted), 0);
-                const f24* src2_ = LookupSourceRegister(
-                    instr.mad_src2(is_inverted),
-                    !is_inverted * static_cast<int>(instr.mad_address_register_index()));
-                const f24* src3_ = LookupSourceRegister(
-                    instr.mad_src3(is_inverted),
-                    is_inverted * static_cast<int>(instr.mad_address_register_index()));
-
-                const bool negate_src1 = mad_swizzle.negate_src1();
-                const bool negate_src2 = mad_swizzle.negate_src2();
-                const bool negate_src3 = mad_swizzle.negate_src3();
-
-                f24 src1[4] = {
-                    src1_[mad_swizzle.selector_src1(0)],
-                    src1_[mad_swizzle.selector_src1(1)],
-                    src1_[mad_swizzle.selector_src1(2)],
-                    src1_[mad_swizzle.selector_src1(3)],
-                };
-                if (negate_src1) {
-                    src1[0] = -src1[0];
-                    src1[1] = -src1[1];
-                    src1[2] = -src1[2];
-                    src1[3] = -src1[3];
+        if (loops.size && (break_loop || loops.Top().end == next)) {
+            auto& loop = loops.Top();
+            unit.address_registers[2] += loop.increment;
+            if (break_loop || --loop.remaining == 0) {
+                target = loop.end;
+                if (loops.size > 1) {
+                    unit.address_registers[2] = loop.initial_address;
                 }
-                f24 src2[4] = {
-                    src2_[mad_swizzle.selector_src2(0)],
-                    src2_[mad_swizzle.selector_src2(1)],
-                    src2_[mad_swizzle.selector_src2(2)],
-                    src2_[mad_swizzle.selector_src2(3)],
-                };
-                if (negate_src2) {
-                    src2[0] = -src2[0];
-                    src2[1] = -src2[1];
-                    src2[2] = -src2[2];
-                    src2[3] = -src2[3];
-                }
-                f24 src3[4] = {
-                    src3_[mad_swizzle.selector_src3(0)],
-                    src3_[mad_swizzle.selector_src3(1)],
-                    src3_[mad_swizzle.selector_src3(2)],
-                    src3_[mad_swizzle.selector_src3(3)],
-                };
-                if (negate_src3) {
-                    src3[0] = -src3[0];
-                    src3[1] = -src3[1];
-                    src3[2] = -src3[2];
-                    src3[3] = -src3[3];
-                }
-
-                f24* dest = instr.mad_dest().IsOutput()
-                                ? &state.output[state.output_bank][static_cast<size_t>(instr.mad_dest().GetIndex())].c[0]
-                                : &state.temporary[static_cast<size_t>(instr.mad_dest().GetIndex())].c[0];
-
-                for (int i = 0; i < 4; ++i) {
-                    if (!mad_swizzle.DestComponentEnabled(i))
-                        continue;
-
-                    dest[i] = src1[i] * src2[i] + src3[i];
-                }
+                loops.Pop();
             } else {
-                error = {Unhandled::Instruction, old_program_counter, instr.hex};
-                return false;
-            }
-            break;
-        }
-
-        default: {
-            // Handle each instruction on its own
-            switch (static_cast<Opcode>(instr.opcode())) {
-            case Opcode::END:
-                should_stop = true;
-                break;
-
-            case Opcode::JMPC:
-                if (evaluate_condition(instr)) {
-                    program_counter = instr.flow_dest_offset() - 1;
-                }
-                break;
-
-            case Opcode::JMPU:
-                if (uniforms.b[instr.flow_bool_uniform_id()] == !(instr.flow_num_instructions() & 1)) {
-                    program_counter = instr.flow_dest_offset() - 1;
-                }
-                break;
-
-            case Opcode::CALL:
-                do_call(instr);
-                break;
-
-            case Opcode::CALLU:
-                if (uniforms.b[instr.flow_bool_uniform_id()]) {
-                    do_call(instr);
-                }
-                break;
-
-            case Opcode::CALLC:
-                if (evaluate_condition(instr)) {
-                    do_call(instr);
-                }
-                break;
-
-            case Opcode::NOP:
-                break;
-
-            case Opcode::IFU: {
-                const bool cond = uniforms.b[instr.flow_bool_uniform_id()];
-                do_if(instr, cond);
-                break;
-            }
-
-            case Opcode::IFC: {
-                // TODO (Azahar): Do we need to consider swizzlers here?
-                const bool cond = evaluate_condition(instr);
-                do_if(instr, cond);
-                break;
-            }
-
-            case Opcode::LOOP: {
-                const std::array<u8, 4>& loop_param = uniforms.i[instr.flow_int_uniform_id()];
-                state.address_registers[2] = loop_param[1];
-
-                // Quirk kept from Azahar: aL has just been assigned, so do_loop's `previous_aL`
-                // is this loop's own start value, not the value of a surrounding loop.
-                do_loop(instr, loop_param);
-                break;
-            }
-
-            case Opcode::BREAK: {
-                is_break = true;
-                break;
-            }
-
-            case Opcode::BREAKC: {
-                if (evaluate_condition(instr)) {
-                    is_break = true;
-                }
-                break;
-            }
-
-            case Opcode::EMIT: {
-                auto* emitter = state.emitter_ptr;
-                if (emitter == nullptr) {
-                    // Azahar: ASSERT_MSG(emitter, "execute EMIT on VS")
-                    error = {Unhandled::EmitOnVertexShader, old_program_counter, instr.hex};
-                    return false;
-                }
-                if (emitter->emit_state.vertex_id >= 3) {
-                    // Azahar: ASSERT(emit_state.vertex_id < 3) in GeometryEmitter::Emit
-                    error = {Unhandled::EmitVertexId, old_program_counter, instr.hex};
-                    return false;
-                }
-                emitter->Emit(state.output[state.output_bank]);
-                state.output_bank = !state.output_bank;
-                break;
-            }
-
-            case Opcode::SETEMIT: {
-                auto* emitter = state.emitter_ptr;
-                if (emitter == nullptr) {
-                    // Azahar: ASSERT_MSG(emitter, "execute SETEMIT on VS")
-                    error = {Unhandled::EmitOnVertexShader, old_program_counter, instr.hex};
-                    return false;
-                }
-                emitter->emit_state.vertex_id = static_cast<u8>(instr.setemit_vertex_id());
-                emitter->emit_state.prim_emit = instr.setemit_prim_emit();
-                emitter->emit_state.winding = instr.setemit_winding();
-                break;
-            }
-
-            default:
-                // Azahar: LOG_ERROR "Unhandled instruction" and goes on. Deviation: the draw is dropped.
-                error = {Unhandled::Instruction, old_program_counter, instr.hex};
-                return false;
-            }
-
-            break;
-        }
-        }
-
-        ++program_counter;
-        ++iteration;
-
-        // Stacks are checked in the order CALL -> IF -> LOOP. The CALL stack can be popped multiple
-        // times per instruction. A JMP at the end of a scope is never taken, this is why we compare
-        // against old_program_counter + 1 here.
-        u32 next_program_counter = old_program_counter + 1;
-        for (u32 i = 0; i < 4; i++) {
-            if (call_stack.empty() || call_stack.back().end_address != next_program_counter)
-                break;
-            // Hardware bug: when popping four CALL scopes at once, the last one doesn't update the
-            // program counter
-            if (i < 3) {
-                program_counter = call_stack.back().return_address;
-                next_program_counter = program_counter;
-            }
-            call_stack.pop_back();
-        }
-
-        // The other two stacks can only pop one entry per instruction. They are checked against the
-        // original program counter before any CALL scopes were closed and they overwrite any
-        // previous program counter updates.
-        if (!if_stack.empty() && if_stack.back().else_address == old_program_counter + 1) {
-            program_counter = if_stack.back().end_address;
-            if_stack.pop_back();
-        }
-
-        if (!loop_stack.empty() &&
-            (loop_stack.back().end_address == old_program_counter + 1 || is_break)) {
-            auto& loop = loop_stack.back();
-            state.address_registers[2] += loop.address_increment;
-            if (!is_break && loop.loop_downcounter--) {
-                program_counter = loop.entry_address;
-            } else {
-                program_counter = loop.end_address;
-                // Only restore previous value if there is a surrounding LOOP scope.
-                if (loop_stack.size() > 1)
-                    state.address_registers[2] = loop.previous_aL;
-                loop_stack.pop_back();
+                target = loop.start;
             }
         }
+        pc = target;
     }
-    return true;
+
+    error = {Unhandled::InstructionBudget, pc, pc < kMaxProgramCodeLength ? setup.program_code[pc] : 0};
+    return false;
+}
+
+bool InterpreterEngine::RunNative(const ShaderSetup& setup, ShaderUnit& unit, RunError& error) const {
+    static_assert(sizeof(bool) == sizeof(unsigned char));
+    auto input = std::bit_cast<NativeVectors<16>>(unit.input);
+    auto temporary = std::bit_cast<NativeVectors<16>>(unit.temporary);
+    const auto uniform_f = std::bit_cast<NativeVectors<96>>(setup.uniforms->f);
+    const auto uniform_i = std::bit_cast<NativeIntegers>(setup.uniforms->i);
+    NativeCall call{unit.emitter_ptr, std::bit_cast<NativeOutputs>(unit.output),
+                    static_cast<unsigned char>(unit.output_bank)};
+    PicaNativeState state{
+        input.values,
+        temporary.values,
+        call.output.values,
+        &call.bank,
+        unit.address_registers,
+        reinterpret_cast<unsigned char*>(unit.conditional_code),
+        uniform_f.values,
+        reinterpret_cast<const unsigned char*>(setup.uniforms->b.data()),
+        uniform_i.values,
+        NativeCall::Emit,
+        NativeCall::SetEmit,
+        Exp2,
+        Log2,
+        &call,
+    };
+    const int result = setup.native(&state);
+    unit.input = std::bit_cast<AttributeBuffer>(input);
+    unit.temporary = std::bit_cast<AttributeBuffer>(temporary);
+    unit.output = std::bit_cast<decltype(unit.output)>(call.output);
+    unit.output_bank = call.bank != 0;
+    if (result == 1) {
+        return true;
+    }
+    const u32 pc = result < 0 ? static_cast<u32>(-(result + 1)) : setup.entry_point;
+    error = {call.failure, pc, pc < kMaxProgramCodeLength ? setup.program_code[pc] : 0};
+    return false;
+}
+
+bool InterpreterEngine::RunChecked(const ShaderSetup& setup, ShaderUnit& unit, RunError& error) const {
+    ShaderUnit native_unit = unit;
+    GeometryEmitter native_emitter;
+    GeometryEmitter* emitter = unit.emitter_ptr;
+    VertexSink* sink = emitter ? emitter->sink : nullptr;
+    RecordingSink interpreted_events(sink);
+    RecordingSink native_events;
+    if (emitter) {
+        native_emitter = *emitter;
+        native_emitter.sink = &native_events;
+        native_unit.emitter_ptr = &native_emitter;
+        emitter->sink = &interpreted_events;
+    }
+    const bool interpreted_ok = Interpret(setup, unit, error);
+    if (emitter) {
+        emitter->sink = sink;
+    }
+    RunError native_error;
+    const bool native_ok = RunNative(setup, native_unit, native_error);
+    const bool same_events = std::equal(
+        interpreted_events.events.begin(), interpreted_events.events.end(),
+        native_events.events.begin(), native_events.events.end(),
+        [](const Emission& a, const Emission& b) {
+            return a.winding == b.winding && SameVectorBits(a.output, b.output);
+        });
+    checked_runs.fetch_add(1, std::memory_order_relaxed);
+    if (interpreted_ok != native_ok || error.kind != native_error.kind ||
+        error.program_counter != native_error.program_counter || error.instruction != native_error.instruction ||
+        !SameUnit(unit, native_unit) || !same_events) {
+        checked_differences.fetch_add(1, std::memory_order_relaxed);
+    }
+    return interpreted_ok;
 }
 
 } // namespace mh4n::gpu::cpuvertex

@@ -1,603 +1,425 @@
-// Derived from Azahar src/video_core/pica/vertex_loader.cpp, vertex_loader.h, regs_pipeline.h,
-// regs_shader.h, shader_unit.cpp, pica_core.cpp, src/video_core/rasterizer_accelerated.cpp,
-// src/video_core/renderer_vulkan/vk_instance.cpp, vk_rasterizer.cpp and vk_graphics_pipeline.cpp at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-3.0-or-later: vk_rasterizer.cpp and
-// vk_graphics_pipeline.cpp say "GPLv3 or any later version"; every other source named here says
-// "GPLv2 or any later version"): the attribute loaders' layout rules (alignment, padding
-// components, which register an attribute feeds), the vertex range of a draw
-// (AnalyzeVertexArray), the repacking of a loader's data to an aligned stride, the fixed and
-// default attribute buffer, the index buffer set-up and the base-vertex rule of the draw.
-// Copyright 2023 Citra Emulator Project (vertex_loader.cpp, vertex_loader.h)
-// Copyright 2017-2025 Citra Emulator Project / Azahar Emulator Project (regs_pipeline.h,
-//   regs_shader.h)
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (shader_unit.cpp, pica_core.cpp,
-//   rasterizer_accelerated.cpp, vk_instance.cpp, vk_rasterizer.cpp, vk_graphics_pipeline.cpp)
-//
-// Where the interpreter's VertexLoader and the hardware renderers differ, this follows the
-// VertexLoader (what the interpreter feeds the vertex shader is the reference): a default
-// attribute wins over a loader that also provides it, a later attribute that maps to the same
-// register wins, and only the attributes up to the vertex shader's last input (and below the
-// number of attributes) are described.
-#include "gpu/vertex/vertex_loader.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: vertex_loader.h, gpu/pica contracts, gpu_vertex_test.cpp cases, 3dbrew GPU/Internal Registers and GPU/Pitfalls.
+
+#include "vertex_loader.h"
 
 #include <algorithm>
-#include <bit>
 #include <cstring>
-
-#include "gpu/pica/regs.h"
-#include "gpu/pica/state.h"
-#include "mh4n/log.h"
+#include <limits>
+#include <utility>
 
 namespace mh4n::gpu::vertex {
 namespace {
 
-using pica::BitsOf;
-
-constexpr const char* kLog = "Vertex";
-constexpr u32 kTailPadding = kVertexTailPadding;
-constexpr u32 kNumLocations = 16;
-constexpr u32 kNumLoaders = 12;
-constexpr u32 kNumAttributes = 12;
-// A draw of more vertices than this is not a draw (the largest an index can name is 65536).
+constexpr u32 kArrayCount = 12;
+constexpr u32 kInputCount = 16;
+constexpr u32 kFloat4Bytes = 4 * sizeof(float);
 constexpr u32 kMaxArraysVertices = 1u << 24;
 
-// PipelineRegs::VertexAttributeFormat.
-constexpr u32 kFmtByte = 0;
-constexpr u32 kFmtUByte = 1;
-constexpr u32 kFmtShort = 2;
-constexpr u32 kFmtFloat = 3;
+// The rows follow the PICA's two-bit type field and the columns its size field.
+struct AttributeType {
+    ComponentKind kind;
+    u32 element_bytes;
+    Conversion conversion;
+    std::array<VertexFormat, 4> formats;
+};
 
-constexpr u32 kRegAttributeFormats = 0x201; // formats and sizes of attributes 0-7, 4 bits each
-constexpr u32 kRegAttributeConfig = 0x202;  // 8-11, mask bits 16-27, max_attribute_index 28-31
-constexpr u32 kRegLoaders = 0x203;          // 12 loaders, 3 words each
-constexpr u32 kShaderInputMapLow = 0x0B;
-constexpr u32 kShaderInputMapHigh = 0x0C;
+constexpr std::array<AttributeType, 4> kTypes{{
+    {ComponentKind::S8, 1, Conversion::FromSint,
+     {VertexFormat::R8_SINT, VertexFormat::R8G8_SINT, VertexFormat::R8G8B8A8_SINT,
+      VertexFormat::R8G8B8A8_SINT}},
+    {ComponentKind::U8, 1, Conversion::FromUint,
+     {VertexFormat::R8_UINT, VertexFormat::R8G8_UINT, VertexFormat::R8G8B8A8_UINT,
+      VertexFormat::R8G8B8A8_UINT}},
+    {ComponentKind::S16, 2, Conversion::FromSint,
+     {VertexFormat::R16_SINT, VertexFormat::R16G16_SINT, VertexFormat::R16G16B16A16_SINT,
+      VertexFormat::R16G16B16A16_SINT}},
+    {ComponentKind::F32, 4, Conversion::None,
+     {VertexFormat::R32_FLOAT, VertexFormat::R32G32_FLOAT, VertexFormat::R32G32B32_FLOAT,
+      VertexFormat::R32G32B32A32_FLOAT}},
+}};
 
-constexpr u32 AlignUp(u32 value, u32 alignment) {
-    return alignment <= 1 ? value : (value + alignment - 1) / alignment * alignment;
-}
-
-constexpr u32 ElementSize(u32 format) {
-    return format == kFmtFloat ? 4 : (format == kFmtShort ? 2 : 1);
-}
-
-// MakeAttributeFormat's integer table (attrib_formats_int), with the 3-component integer cases
-// aliased to the 4-component format (needs_emulation in Azahar), returned with the alias flag.
-VertexFormat MakeFormat(u32 pica_format, u32 count, bool& alias_w) {
-    alias_w = false;
-    if (pica_format == kFmtFloat) {
-        switch (count) {
-        case 1: return VertexFormat::R32_FLOAT;
-        case 2: return VertexFormat::R32G32_FLOAT;
-        case 3: return VertexFormat::R32G32B32_FLOAT;
-        default: return VertexFormat::R32G32B32A32_FLOAT;
+constexpr auto kFormats = [] {
+    std::array<FormatInfo, static_cast<size_t>(VertexFormat::R32G32B32A32_FLOAT) + 1> formats{};
+    for (const auto& type : kTypes) {
+        for (u32 i = 0; i < type.formats.size(); ++i) {
+            const u32 lanes = i + 1;
+            formats[static_cast<size_t>(type.formats[i])] =
+                {type.kind, lanes, lanes * type.element_bytes};
         }
     }
-    if (count == 3) {
-        alias_w = true;
-        count = 4;
-    }
-    const u32 count_index = count == 4 ? 2 : count - 1; // 1, 2, 4 -> 0, 1, 2
-    switch (pica_format) {
-    case kFmtByte:
-        return static_cast<VertexFormat>(static_cast<u32>(VertexFormat::R8_SINT) + count_index);
-    case kFmtUByte:
-        return static_cast<VertexFormat>(static_cast<u32>(VertexFormat::R8_UINT) + count_index);
-    default:
-        return static_cast<VertexFormat>(static_cast<u32>(VertexFormat::R16_SINT) + count_index);
-    }
+    return formats;
+}();
+
+constexpr u32 AlignUp(u32 size, u32 alignment) {
+    const u32 remainder = size % alignment;
+    return remainder == 0 ? size : size + alignment - remainder;
 }
 
-Conversion ConversionFor(u32 pica_format) {
-    // MakeAttribLoadFlag
-    switch (pica_format) {
-    case kFmtByte:
-    case kFmtShort:
-        return Conversion::FromSint;
-    case kFmtUByte:
-        return Conversion::FromUint;
-    default:
-        return Conversion::None;
+constexpr u32 Nibble(u32 word, u32 slot) {
+    return (word >> (4 * slot)) & 0xf;
+}
+
+const u8* MapRange(Host& host, u64 address, u64 bytes) {
+    constexpr u64 address_space = u64{1} << 32;
+    if (address >= address_space || bytes >= address_space || bytes > address_space - address) {
+        return nullptr;
     }
+    return host.PhysicalPointer(static_cast<u32>(address), static_cast<u32>(bytes));
 }
 
-struct Attr {
-    u32 format = 0;
-    u32 elements = 0; // GetNumElements
-    bool is_default = false;
-    bool has_source = false;
-    u32 loader = 0;
-    u32 offset = 0; // inside the loader's vertex
+struct ArrayLayout {
+    u32 offset = 0;
+    u32 stride = 0;
+    const u8* data = nullptr;
 };
 
-struct Loader {
-    u32 data_offset = 0;
-    u32 byte_count = 0;
-    u32 component_count = 0;
-    std::array<u32, 12> components{};
+struct AttributeLayout {
+    u32 array = kArrayCount;
+    u32 offset = 0;
+    const AttributeType* type = nullptr;
+    u32 components = 0;
 };
 
-enum class LocKind : u8 { Unset, Loader, Fixed };
-struct Location {
-    LocKind kind = LocKind::Unset;
-    u32 attr = 0;
-    const pica::Vec4f* value = nullptr;
-    u32 fixed_offset = 0;
-};
+bool LoadAttributes(Host& host, const pica::DrawCall& draw, LoadedDraw& out, u32 vertex_count,
+                    u32 alignment, bool copy_vertices) {
+    const auto& state = *draw.state;
+    const auto& regs = state.regs;
+    const bool immediate = draw.kind == pica::DrawKind::Immediate;
+    const u32 format_reg = pica::reg::kVertexAttributesBase + 1;
+    const u32 format_high = regs[format_reg + 1];
+    const u32 fixed_mask = (format_high >> 16) & 0xfff;
+    const u32 shader_inputs = (regs[pica::reg::kVs + pica::reg::kShaderInputBufferConfig] & 0xf) + 1;
+    const u32 input_map_reg = pica::reg::kVs + 0xb;
+    const u32 attribute_count = immediate ? shader_inputs : std::min(shader_inputs, (format_high >> 28) + 1);
 
-u32 RegisterFor(const pica::PicaState& s, u32 attr) {
-    const u64 map = (static_cast<u64>(s.regs[pica::reg::kVs + kShaderInputMapHigh]) << 32) |
-                    s.regs[pica::reg::kVs + kShaderInputMapLow];
-    return static_cast<u32>((map >> (attr * 4)) & 0xF);
-}
+    std::array<ArrayLayout, kArrayCount> arrays{};
+    std::array<AttributeLayout, kArrayCount> layout{};
+    if (!immediate) {
+        for (u32 array = 0; array < kArrayCount; ++array) {
+            const u32 first_reg = format_reg + 2 + 3 * array;
+            const u32 config = regs[first_reg + 2];
+            const u32 stride = (config >> 16) & 0xff;
+            if (stride == 0) {
+                continue;
+            }
+            arrays[array] = {regs[first_reg] & 0x0fffffff, stride};
+            const u32 slots = std::min(config >> 28, kArrayCount);
+            u32 offset = 0;
+            for (u32 slot = 0; slot < slots; ++slot) {
+                const u32 attribute = Nibble(regs[first_reg + 1 + slot / 8], slot % 8);
+                if (attribute >= kArrayCount) {
+                    offset = AlignUp(offset, 4) + 4 * (attribute - kArrayCount + 1);
+                    continue;
+                }
+                const u32 format = Nibble(regs[format_reg + attribute / 8], attribute % 8);
+                const AttributeType& type = kTypes[format & 3];
+                const u32 components = (format >> 2) + 1;
+                offset = AlignUp(offset, type.element_bytes);
+                layout[attribute] = {array, offset, &type, components};
+                offset += components * type.element_bytes;
+            }
+        }
+    }
 
-u32 ReadU16(const u8* p) {
-    return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8);
+    // Resolve register collisions before touching guest memory. An overwritten array may be unmapped.
+    std::array<u32, kInputCount> register_attributes;
+    register_attributes.fill(kInputCount);
+    for (u32 attribute = 0; attribute < attribute_count; ++attribute) {
+        const u32 location = Nibble(regs[input_map_reg + attribute / 8], attribute % 8);
+        register_attributes[location] = attribute;
+    }
+
+    std::array<bool, kArrayCount> used{};
+    std::array<const pica::Vec4f*, kInputCount> constants{};
+    for (u32 location = 0; location < kInputCount; ++location) {
+        const u32 attribute = register_attributes[location];
+        auto& input = out.attributes[location];
+        input.location = location;
+        input.binding = kArrayCount;
+        if (attribute == kInputCount) {
+            continue;
+        }
+        if (immediate) {
+            constants[location] = &state.immediate.input_vertex[attribute];
+        } else if (attribute >= kArrayCount || ((fixed_mask >> attribute) & 1) != 0) {
+            constants[location] = &state.default_attributes[attribute];
+        } else if (const auto& entry = layout[attribute]; entry.type != nullptr) {
+            used[entry.array] = true;
+            input.binding = entry.array;
+            input.offset = entry.offset;
+            input.format = entry.type->formats[entry.components - 1];
+            input.components = entry.components;
+            input.conversion = entry.type->conversion;
+            input.alias_w = GetFormatInfo(input.format).lanes > entry.components;
+        }
+    }
+
+    std::array<u32, kArrayCount + 1> bindings{};
+    u32 buffer_count = 0;
+    for (u32 array = 0; array < kArrayCount; ++array) {
+        if (!used[array]) {
+            continue;
+        }
+        auto& src = arrays[array];
+        const u64 address = u64{draw.vertex_base_address} + src.offset + u64{out.first_vertex} * src.stride;
+        src.data = MapRange(host, address, u64{vertex_count} * src.stride);
+        if (src.data == nullptr) {
+            return false;
+        }
+        bindings[array] = buffer_count++;
+    }
+
+    bindings[kArrayCount] = buffer_count;
+    out.buffers.resize(buffer_count + 1);
+    for (u32 array = 0; array < kArrayCount; ++array) {
+        if (!used[array]) {
+            continue;
+        }
+        const auto& src = arrays[array];
+        auto& buffer = out.buffers[bindings[array]];
+        buffer.stride = AlignUp(src.stride, alignment);
+        buffer.vertex_count = vertex_count;
+        buffer.per_instance = false;
+        buffer.source = src.data;
+        buffer.source_stride = src.stride;
+        if (copy_vertices) {
+            buffer.data.resize(buffer.Bytes());
+            buffer.CopyTo(buffer.data.data());
+            buffer.source = nullptr;
+            buffer.source_stride = 0;
+        } else {
+            buffer.data.clear();
+        }
+    }
+
+    u32 constant_bytes = kFloat4Bytes;
+    for (auto& input : out.attributes) {
+        input.binding = bindings[input.binding];
+        if (constants[input.location] != nullptr) {
+            input.offset = constant_bytes;
+            constant_bytes += kFloat4Bytes;
+        }
+    }
+    auto& constant_buffer = out.buffers.back();
+    constant_buffer.stride = AlignUp(constant_bytes, alignment);
+    constant_buffer.vertex_count = 1;
+    constant_buffer.per_instance = true;
+    constant_buffer.source = nullptr;
+    constant_buffer.source_stride = 0;
+    constant_buffer.data.assign(static_cast<size_t>(constant_buffer.stride) + kVertexTailPadding, 0);
+    constexpr pica::Vec4f missing{{0.0f, 0.0f, 0.0f, 1.0f}};
+    std::memcpy(constant_buffer.data.data(), missing.c, kFloat4Bytes);
+    for (const auto& input : out.attributes) {
+        if (const auto* value = constants[input.location]) {
+            std::memcpy(constant_buffer.data.data() + input.offset, value->c, kFloat4Bytes);
+        }
+    }
+    return true;
 }
 
 } // namespace
 
 FormatInfo GetFormatInfo(VertexFormat format) {
-    switch (format) {
-    case VertexFormat::R8_SINT: return {ComponentKind::S8, 1, 1};
-    case VertexFormat::R8G8_SINT: return {ComponentKind::S8, 2, 2};
-    case VertexFormat::R8G8B8A8_SINT: return {ComponentKind::S8, 4, 4};
-    case VertexFormat::R8_UINT: return {ComponentKind::U8, 1, 1};
-    case VertexFormat::R8G8_UINT: return {ComponentKind::U8, 2, 2};
-    case VertexFormat::R8G8B8A8_UINT: return {ComponentKind::U8, 4, 4};
-    case VertexFormat::R16_SINT: return {ComponentKind::S16, 1, 2};
-    case VertexFormat::R16G16_SINT: return {ComponentKind::S16, 2, 4};
-    case VertexFormat::R16G16B16A16_SINT: return {ComponentKind::S16, 4, 8};
-    case VertexFormat::R32_FLOAT: return {ComponentKind::F32, 1, 4};
-    case VertexFormat::R32G32_FLOAT: return {ComponentKind::F32, 2, 8};
-    case VertexFormat::R32G32B32_FLOAT: return {ComponentKind::F32, 3, 12};
-    case VertexFormat::R32G32B32A32_FLOAT: return {ComponentKind::F32, 4, 16};
-    }
-    return {ComponentKind::F32, 4, 16};
+    const size_t slot = static_cast<size_t>(format);
+    return slot < kFormats.size() ? kFormats[slot] : FormatInfo{};
 }
 
 const char* ToString(LoadStatus status) {
     switch (status) {
     case LoadStatus::Ok: return "ok";
     case LoadStatus::NoVertices: return "no vertices";
-    case LoadStatus::Unmapped: return "vertex or index data outside guest memory";
+    case LoadStatus::Unmapped: return "unmapped";
     case LoadStatus::TooLarge: return "more vertices than any draw has";
     }
-    return "?";
+    return "unknown";
 }
 
-LoadedDraw VertexLoader::Load(gpu::Host& host, const pica::DrawCall& draw) {
+void VertexBuffer::CopyTo(u8* out) const {
+    if (source == nullptr) {
+        if (!data.empty()) {
+            std::memcpy(out, data.data(), data.size());
+        }
+        return;
+    }
+
+    if (stride == source_stride) {
+        const size_t bytes = static_cast<size_t>(stride) * vertex_count;
+        std::memcpy(out, source, bytes);
+        out += bytes;
+    } else {
+        const u8* vertex = source;
+        for (u32 i = 0; i < vertex_count; ++i) {
+            std::memcpy(out, vertex, source_stride);
+            std::memset(out + source_stride, 0, stride - source_stride);
+            vertex += source_stride;
+            out += stride;
+        }
+    }
+    std::memset(out, 0, kVertexTailPadding);
+}
+
+LoadedDraw VertexLoader::Load(Host& host, const pica::DrawCall& draw) {
     LoadedDraw out;
     LoadInto(host, draw, out);
     return out;
 }
 
-void VertexBuffer::CopyTo(u8* out) const {
-    if (source == nullptr) {
-        std::memcpy(out, data.data(), data.size());
-        return;
-    }
-    const size_t packed = static_cast<size_t>(source_stride) * vertex_count;
-    if (stride == source_stride) {
-        std::memcpy(out, source, packed);
-    } else {
-        // each vertex, then the padding of the aligned stride
-        for (u32 v = 0; v < vertex_count; ++v) {
-            u8* at = out + static_cast<size_t>(v) * stride;
-            std::memcpy(at, source + static_cast<size_t>(v) * source_stride, source_stride);
-            std::memset(at + source_stride, 0, stride - source_stride);
-        }
-    }
-    std::memset(out + static_cast<size_t>(stride) * vertex_count, 0, kTailPadding);
-}
-
-void VertexLoader::LoadInto(gpu::Host& host, const pica::DrawCall& draw, LoadedDraw& out, bool copy_vertices,
-                            bool defer_indices) {
-    // `out` starts again as a LoadedDraw{}, its buffers' and index list's storage kept for this draw
-    size_t buffers_used = 0;
-    out.status = LoadStatus::Ok;
-    out.topology = Topology::TriangleList;
-    out.attributes = {};
-    out.index_type = IndexType::None;
+void VertexLoader::LoadInto(Host& host, const pica::DrawCall& draw, LoadedDraw& out,
+                            bool copy_vertices, bool defer_indices) {
+    // Keep the caller's buffer and index storage when resetting the draw description.
+    LoadedDraw next;
+    next.buffers.swap(out.buffers);
+    next.index_data.swap(out.index_data);
+    out = std::move(next);
     out.index_data.clear();
-    out.count = 0;
-    out.base_vertex = 0;
-    out.first_vertex = 0;
-    out.fan_converted = out.indices_widened_u8 = out.restart_widened = false;
-    out.indices_deferred = false;
-    out.list = {};
-    out.list_low = out.list_high = 0;
-    out.index_source = nullptr;
-    out.index_source_u16 = false;
-    const u8* index_source = nullptr;
-    const auto next_buffer = [&]() -> VertexBuffer& {
-        if (buffers_used == out.buffers.size()) {
-            out.buffers.emplace_back();
-        }
-        VertexBuffer& b = out.buffers[buffers_used++];
-        b.stride = 0;  // (its data is resized by the caller: a resize to the same size touches nothing)
-        b.per_instance = false;
-        b.vertex_count = 0;
-        b.source = nullptr;
-        b.source_stride = 0;
-        return b;
-    };
-    const auto finish = [&]() { out.buffers.resize(buffers_used); };
-    const pica::PicaState& s = *draw.state;
-    const auto& regs = s.regs;
-    const u32 align = std::max<u32>(caps_.stride_alignment, 1);
-    const bool native_u8 = caps_.index_uint8 && !caps_.apple;
-    const bool native_fans = caps_.triangle_fans && !caps_.apple;
 
-    switch (BitsOf(regs[pica::reg::kTriangleTopology], 8, 2)) {
-    case pica::kTopologyList: out.topology = Topology::TriangleList; break;
-    case pica::kTopologyStrip: out.topology = Topology::TriangleStrip; break;
-    case pica::kTopologyFan: out.topology = Topology::TriangleFan; break;
-    default: out.topology = Topology::Shader; break;
-    }
-    const bool convert_fan = out.topology == Topology::TriangleFan && !native_fans;
-
-    const bool immediate = draw.kind == pica::DrawKind::Immediate;
-    const u32 vs_max = BitsOf(regs[pica::reg::kVs + pica::reg::kShaderInputBufferConfig], 0, 4);
-
-    // ---- the attributes and the loaders (VertexLoader's constructor) -------------------------------
-    std::array<Attr, kNumLocations> attrs{};
-    std::array<Loader, kNumLoaders> loaders{};
-    const u32 num_total = BitsOf(regs[kRegAttributeConfig], 28, 4) + 1;
-    const u32 default_mask = BitsOf(regs[kRegAttributeConfig], 16, 12);
-    if (!immediate) {
-        for (u32 i = 0; i < kNumAttributes; ++i) {
-            const u32 word = regs[i < 8 ? kRegAttributeFormats : kRegAttributeConfig];
-            const u32 shift = (i % 8) * 4;
-            attrs[i].format = BitsOf(word, shift, 2);
-            attrs[i].elements = BitsOf(word, shift + 2, 2) + 1;
-        }
-        for (u32 i = 0; i < kNumLocations; ++i) {
-            attrs[i].is_default = i >= kNumAttributes || ((default_mask >> i) & 1u) != 0;
-        }
-        for (u32 l = 0; l < kNumLoaders; ++l) {
-            const u32 base = kRegLoaders + 3 * l;
-            Loader& loader = loaders[l];
-            loader.data_offset = BitsOf(regs[base], 0, 28);
-            loader.byte_count = BitsOf(regs[base + 2], 16, 8);
-            loader.component_count = BitsOf(regs[base + 2], 28, 4);
-            for (u32 c = 0; c < 8; ++c) {
-                loader.components[c] = BitsOf(regs[base + 1], 4 * c, 4);
-            }
-            for (u32 c = 0; c < 4; ++c) {
-                loader.components[8 + c] = BitsOf(regs[base + 2], 4 * c, 4);
-            }
-            // A loader without data or without a stride provides nothing (the accelerated
-            // renderers skip it).
-            if (loader.component_count == 0 || loader.byte_count == 0) {
-                continue;
-            }
-            u32 offset = 0;
-            for (u32 c = 0; c < loader.component_count; ++c) {
-                if (c >= 12) {
-                    MH4N_LOG(Error, kLog, "loader {} has more than 12 components", l);
-                    break;
-                }
-                const u32 a = loader.components[c];
-                if (a < kNumAttributes) {
-                    offset = AlignUp(offset, ElementSize(attrs[a].format));
-                    attrs[a].has_source = true; // a later loader overwrites an earlier one
-                    attrs[a].loader = l;
-                    attrs[a].offset = offset;
-                    offset += attrs[a].elements * ElementSize(attrs[a].format);
-                } else {
-                    // Attribute ids 12-15 are paddings of 4, 8, 12 and 16 bytes.
-                    offset = AlignUp(offset, 4) + (a - 11) * 4;
-                }
-            }
-        }
-    }
-
-    // ---- which attribute feeds which input register (ShaderUnit::LoadInput) --------------------------
-    std::array<Location, kNumLocations> locs{};
-    for (u32 a = 0; a <= vs_max; ++a) {
-        const u32 reg = RegisterFor(s, a);
-        Location loc;
-        if (immediate) {
-            loc.kind = LocKind::Fixed;
-            loc.value = &s.immediate.input_vertex[a];
-        } else if (a >= num_total) {
-            // not loaded: stays the constant (0, 0, 0, 1)
-        } else if (attrs[a].is_default) {
-            loc.kind = LocKind::Fixed;
-            loc.value = &s.default_attributes[a];
-        } else if (attrs[a].has_source) {
-            loc.kind = LocKind::Loader;
-        }
-        loc.attr = a;
-        locs[reg] = loc; // a later attribute overwrites an earlier one
-    }
-
-    // ---- the range of vertices ---------------------------------------------------------------------------
-    u32 vertex_min = 0;
-    u32 vertex_num = 0;
-    std::vector<u32>& indices = indices_; // Indexed draws: the index values
-    indices.clear();
-    bool source_u16 = false;
-    if (draw.kind == pica::DrawKind::Arrays) {
-        vertex_min = draw.vertex_offset;
-        vertex_num = draw.num_vertices;
-        if (vertex_num == 0) {
-            out.status = LoadStatus::NoVertices;
-        } else if (vertex_num > kMaxArraysVertices) {
-            MH4N_LOG(Warning, kLog, "an Arrays draw of {} vertices is dropped", vertex_num);
-            out.status = LoadStatus::TooLarge;
-        }
-    } else if (draw.kind == pica::DrawKind::Indexed) {
-        source_u16 = draw.index_u16;
-        const u32 index_size = source_u16 ? 2 : 1;
-        const u64 bytes = static_cast<u64>(draw.num_vertices) * index_size;
-        if (draw.num_vertices == 0) {
-            out.status = LoadStatus::NoVertices;
-        } else if (bytes > 0xFFFFFFFFull ||
-                   static_cast<u64>(draw.vertex_base_address) + draw.index_offset + bytes >
-                       0xFFFFFFFFull) {
-            out.status = LoadStatus::Unmapped;
-        } else {
-            const u8* p = host.PhysicalPointer(draw.vertex_base_address + draw.index_offset,
-                                               static_cast<u32>(bytes));
-            if (p == nullptr) {
-                out.status = LoadStatus::Unmapped;
-            } else {
-                index_source = p;
-                indices.resize(draw.num_vertices);
-                u32 lo = 0xFFFFFFFFu;
-                u32 hi = 0;
-                // (one loop for each index size, without a test inside: the compiler vectorizes them)
-                u32* out_index = indices.data();
-                const u32 n = draw.num_vertices;
-                if (source_u16) {
-                    for (u32 i = 0; i < n; ++i) {
-                        const u32 v = ReadU16(p + 2 * i);
-                        out_index[i] = v;
-                        lo = std::min(lo, v);
-                        hi = std::max(hi, v);
-                    }
-                } else {
-                    for (u32 i = 0; i < n; ++i) {
-                        const u32 v = p[i];
-                        out_index[i] = v;
-                        lo = std::min(lo, v);
-                        hi = std::max(hi, v);
-                    }
-                }
-                vertex_min = lo;
-                vertex_num = hi - lo + 1;
-            }
-        }
-    } else {
-        vertex_num = 1;
-    }
-    if (out.status != LoadStatus::Ok) {
+    const auto drop = [&](LoadStatus status) {
+        out.status = status;
+        out.buffers.clear();
+        out.attributes = {};
+        out.first_vertex = 0;
+        out.list_low = 0;
+        out.list_high = 0;
         ++counters_.draws_dropped;
-        finish();
-        return;
-    }
-    out.first_vertex = vertex_min;
-
-    // ---- the buffers --------------------------------------------------------------------------------------
-    std::array<bool, kNumLoaders> loader_used{};
-    for (const Location& loc : locs) {
-        if (loc.kind == LocKind::Loader) {
-            loader_used[attrs[loc.attr].loader] = true;
-        }
-    }
-    std::array<u32, kNumLoaders> loader_binding{};
-    for (u32 l = 0; l < kNumLoaders; ++l) {
-        if (!loader_used[l]) {
-            continue;
-        }
-        const Loader& loader = loaders[l];
-        const u64 size = static_cast<u64>(loader.byte_count) * vertex_num;
-        const u64 start = static_cast<u64>(draw.vertex_base_address) + loader.data_offset +
-                          static_cast<u64>(vertex_min) * loader.byte_count;
-        const u8* src = nullptr;
-        if (start + size <= 0xFFFFFFFFull) {
-            src = host.PhysicalPointer(static_cast<u32>(start), static_cast<u32>(size));
-        }
-        if (src == nullptr) {
-            MH4N_LOG(Warning, kLog, "loader {} reads {} bytes at {:#x}: outside guest memory", l, size,
-                     start);
-            out.buffers.clear();
-            out.index_data.clear();
-            out.attributes = {};
-            out.count = 0;
-            out.base_vertex = 0;
-            out.first_vertex = 0;
-            out.status = LoadStatus::Unmapped;
-            ++counters_.draws_dropped;
-            return;
-        }
-        loader_binding[l] = static_cast<u32>(buffers_used);
-        VertexBuffer& buffer = next_buffer();
-        buffer.stride = AlignUp(loader.byte_count, align);
-        buffer.vertex_count = vertex_num;
-        if (!copy_vertices) {
-            buffer.data.clear();
-            buffer.source = src;
-            buffer.source_stride = loader.byte_count;
-            continue;
-        }
-        // (resize, not assign: storage kept from the last draw is not cleared first; what the copy does not cover
-        // is zeroed below)
-        buffer.data.resize(static_cast<size_t>(buffer.stride) * vertex_num + kTailPadding);
-        std::memset(buffer.data.data() + static_cast<size_t>(buffer.stride) * vertex_num, 0, kTailPadding);
-        if (buffer.stride != loader.byte_count) {
-            // the padding between packed vertices in the aligned stride
-            for (u32 v = 0; v < vertex_num; ++v) {
-                std::memset(buffer.data.data() + static_cast<size_t>(v) * buffer.stride + loader.byte_count, 0,
-                            buffer.stride - loader.byte_count);
-            }
-        }
-        if (buffer.stride == loader.byte_count) {
-            std::memcpy(buffer.data.data(), src, static_cast<size_t>(loader.byte_count) * vertex_num);
-        } else {
-            for (u32 v = 0; v < vertex_num; ++v) {
-                std::memcpy(buffer.data.data() + static_cast<size_t>(v) * buffer.stride,
-                            src + static_cast<size_t>(v) * loader.byte_count, loader.byte_count);
-            }
-        }
-    }
-
-    // The constant buffer: (0, 0, 0, 1) at offset 0, then each fixed value (SetupFixedAttribs).
-    const u32 fixed_binding = static_cast<u32>(buffers_used);
-    VertexBuffer& fixed = next_buffer();
-    fixed.data.clear();
-    fixed.per_instance = true;
-    fixed.vertex_count = 1;
-    auto push_float4 = [&fixed](const float* v) {
-        const size_t at = fixed.data.size();
-        fixed.data.resize(at + 16);
-        std::memcpy(fixed.data.data() + at, v, 16);
     };
-    const float one_w[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    push_float4(one_w);
-    for (Location& loc : locs) {
-        if (loc.kind == LocKind::Fixed) {
-            loc.fixed_offset = static_cast<u32>(fixed.data.size());
-            push_float4(loc.value->c);
-        }
-    }
-    fixed.stride = AlignUp(static_cast<u32>(fixed.data.size()), align);
-    fixed.data.resize(fixed.stride, 0);
-    finish();
-
-    for (u32 reg = 0; reg < kNumLocations; ++reg) {
-        VertexAttribute& va = out.attributes[reg];
-        const Location& loc = locs[reg];
-        va.location = reg;
-        if (loc.kind == LocKind::Loader) {
-            const Attr& a = attrs[loc.attr];
-            va.binding = loader_binding[a.loader];
-            va.offset = a.offset;
-            va.format = MakeFormat(a.format, a.elements, va.alias_w);
-            va.components = a.elements;
-            va.conversion = ConversionFor(a.format);
-        } else {
-            va.binding = fixed_binding;
-            va.offset = loc.kind == LocKind::Fixed ? loc.fixed_offset : 0;
-            va.format = VertexFormat::R32G32B32A32_FLOAT;
-            va.components = 4;
-            va.conversion = Conversion::None;
-        }
-    }
-
-    // ---- indices and topology ---------------------------------------------------------------------------------
-    if (immediate) {
-        out.count = 1;
-        ++counters_.draws_loaded;
-        return;
-    }
 
     const bool indexed = draw.kind == pica::DrawKind::Indexed;
-    if (!indexed && !convert_fan) {
-        out.count = draw.num_vertices;
-        ++counters_.draws_loaded;
+    const bool immediate = draw.kind == pica::DrawKind::Immediate;
+    const u32 count = immediate ? 1 : draw.num_vertices;
+    if (count == 0) {
+        drop(LoadStatus::NoVertices);
+        return;
+    }
+    if (draw.kind == pica::DrawKind::Arrays &&
+        (count > kMaxArraysVertices || u64{draw.vertex_offset} + count > (u64{1} << 32))) {
+        drop(LoadStatus::TooLarge);
         return;
     }
 
-    std::vector<u32>& list = list_;
-    list.clear();
-    if (indexed) {
-        out.base_vertex = -static_cast<s32>(vertex_min);
-        list.swap(indices);
-    } else {
-        list.resize(draw.num_vertices);
-        for (u32 i = 0; i < draw.num_vertices; ++i) {
-            list[i] = i;
-        }
+    constexpr std::array topologies{Topology::TriangleList, Topology::TriangleStrip,
+                                    Topology::TriangleFan, Topology::Shader};
+    const u32 topology_reg = draw.state->regs[pica::reg::kTriangleTopology];
+    out.topology = topologies[(topology_reg >> 8) & 3];
+    const bool convert_fan = !immediate && out.topology == Topology::TriangleFan &&
+                             (!caps_.triangle_fans || caps_.apple);
+    if (convert_fan && count >= 3 && u64{count - 2} * 3 > std::numeric_limits<u32>::max()) {
+        drop(LoadStatus::TooLarge);
+        return;
     }
-    if (convert_fan) {
-        // A fan (v0, v1, v2, v3, ...) is the triangles (v0, vi, vi+1).
-        std::vector<u32>& triangles = triangles_;
-        triangles.clear();
-        if (list.size() >= 3) {
-            triangles.reserve((list.size() - 2) * 3);
-            for (size_t i = 1; i + 1 < list.size(); ++i) {
-                triangles.push_back(list[0]);
-                triangles.push_back(list[i]);
-                triangles.push_back(list[i + 1]);
-            }
+
+    const u8* index_source = nullptr;
+    u32 vertex_count = count;
+    if (indexed) {
+        const u32 width = draw.index_u16 ? 2 : 1;
+        index_source = MapRange(host, u64{draw.vertex_base_address} + draw.index_offset, u64{count} * width);
+        if (index_source == nullptr) {
+            drop(LoadStatus::Unmapped);
+            return;
         }
-        list.swap(triangles);
+        indices_.resize(count);
+        u32 low = std::numeric_limits<u32>::max();
+        u32 high = 0;
+        const u8* read = index_source;
+        for (u32& value : indices_) {
+            value = *read++;
+            if (draw.index_u16) {
+                value |= static_cast<u32>(*read++) << 8;
+            }
+            low = std::min(low, value);
+            high = std::max(high, value);
+        }
+        out.first_vertex = low;
+        out.list_low = low;
+        out.list_high = high;
+        vertex_count = high - low + 1;
+    } else if (!immediate) {
+        out.first_vertex = draw.vertex_offset;
+    }
+
+    if (!LoadAttributes(host, draw, out, vertex_count, std::max(caps_.stride_alignment, 1u), copy_vertices)) {
+        drop(LoadStatus::Unmapped);
+        return;
+    }
+
+    out.count = count;
+    const bool native_u8 = caps_.index_uint8 && !caps_.apple;
+    if (indexed) {
+        out.base_vertex = -static_cast<s32>(out.first_vertex);
+        out.list = indices_;
+        out.index_source = index_source;
+        out.index_source_u16 = draw.index_u16;
+    }
+
+    if (convert_fan) {
         out.topology = Topology::TriangleList;
         out.fan_converted = true;
         ++counters_.fans_converted;
+        triangles_.clear();
+        if (count >= 3) {
+            triangles_.reserve(static_cast<size_t>(count - 2) * 3);
+            const u32 first = indexed ? indices_.front() : 0;
+            for (u32 i = 1; i < count - 1; ++i) {
+                triangles_.push_back(first);
+                triangles_.push_back(indexed ? indices_[i] : i);
+                triangles_.push_back(indexed ? indices_[i + 1] : i + 1);
+            }
+        }
+        out.list = triangles_;
+        if (!indexed) {
+            out.list_high = count - 1;
+        }
+        PackList(out, indexed, draw.index_u16, native_u8);
+    } else if (indexed && defer_indices) {
+        out.indices_deferred = true;
+        deferred_source_u16_ = draw.index_u16;
+        deferred_native_u8_ = native_u8;
+    } else if (indexed) {
+        PackList(out, true, draw.index_u16, native_u8);
     }
     ++counters_.draws_loaded;
-    if (defer_indices && indexed && !convert_fan) {
-        out.indices_deferred = true;
-        out.list = list;
-        out.list_low = vertex_min;
-        out.list_high = vertex_min + vertex_num - 1;
-        out.count = static_cast<u32>(list.size());
-        out.index_source = index_source;
-        out.index_source_u16 = source_u16;
-        deferred_source_u16_ = source_u16;
-        deferred_native_u8_ = native_u8;
-        return;
-    }
-    PackList(out, indexed, source_u16, native_u8);
 }
 
 void VertexLoader::PackIndices(LoadedDraw& out) {
-    if (!out.indices_deferred) {
-        return;
+    if (out.indices_deferred) {
+        PackList(out, true, deferred_source_u16_, deferred_native_u8_);
     }
-    out.indices_deferred = false;
-    out.list = {};
-    out.index_source = nullptr;
-    PackList(out, true, deferred_source_u16_, deferred_native_u8_);
 }
 
-// The index list (list_) as index data: the narrowest type the device takes, widened past the restart value.
 void VertexLoader::PackList(LoadedDraw& out, bool indexed, bool source_u16, bool native_u8) {
-    const std::vector<u32>& list = list_;
-    u32 max_value = 0;
-    for (u32 v : list) {
-        max_value = std::max(max_value, v);
+    const auto values = out.list;
+    out.list = {};
+    out.indices_deferred = false;
+    out.count = static_cast<u32>(values.size());
+    if (values.empty()) {
+        return;
     }
-    IndexType type = IndexType::U16;
-    if (indexed && !source_u16 && native_u8) {
-        type = IndexType::U8;
-    } else if (max_value > 0xFFFF) {
-        type = IndexType::U32;
+
+    const bool source_u8 = indexed && !source_u16;
+    u32 width = 2;
+    if (source_u8 && native_u8) {
+        width = 1;
+    } else if (out.list_high > 0xffff) {
+        width = 4;
     }
-    out.indices_widened_u8 = indexed && !source_u16 && type != IndexType::U8;
-    if (caps_.primitive_restart_always_on && type != IndexType::U32) {
-        const u32 restart = type == IndexType::U8 ? 0xFFu : 0xFFFFu;
-        if (std::find(list.begin(), list.end(), restart) != list.end()) {
-            type = type == IndexType::U8 ? IndexType::U16 : IndexType::U32;
-            out.restart_widened = true;
-            ++counters_.restart_widened;
-        }
+    if (caps_.primitive_restart_always_on &&
+        ((width == 1 && out.list_high == 0xff) || (width == 2 && out.list_high == 0xffff))) {
+        width *= 2;
+        out.restart_widened = true;
+        ++counters_.restart_widened;
     }
-    out.index_type = type;
-    out.count = static_cast<u32>(list.size());
-    const size_t index_size = type == IndexType::U8 ? 1 : (type == IndexType::U16 ? 2 : 4);
-    out.index_data.resize(list.size() * index_size);
-    u8* put = out.index_data.data();
-    static_assert(std::endian::native == std::endian::little, "the index list is little-endian");
-    switch (type) {
-    case IndexType::U8:
-        for (size_t i = 0; i < list.size(); ++i) {
-            put[i] = static_cast<u8>(list[i]);
+
+    out.indices_widened_u8 = source_u8 && width > 1;
+    constexpr std::array types{IndexType::None, IndexType::U8, IndexType::U16, IndexType::None, IndexType::U32};
+    out.index_type = types[width];
+    out.index_data.resize(values.size() * width);
+    u8* write = out.index_data.data();
+    for (u32 value : values) {
+        for (u32 byte = 0; byte < width; ++byte) {
+            *write++ = static_cast<u8>(value);
+            value >>= 8;
         }
-        break;
-    case IndexType::U16:
-        for (size_t i = 0; i < list.size(); ++i) {
-            const u16 v = static_cast<u16>(list[i]);
-            std::memcpy(put + 2 * i, &v, 2);
-        }
-        break;
-    default:
-        std::memcpy(put, list.data(), 4 * list.size());
-        break;
     }
 }
 

@@ -1,43 +1,34 @@
-// Written for N2-16: nothing is copied from Azahar here.
-#include "gpu/pipeline/files.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: files.h, provider_host.h, gpu_pipeline_test and record files emitted by the shipped cache.
 
+#include "files.h"
+
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
-#include <cstring>
 #include <fstream>
-#include <system_error>
+#include <limits>
 
-#include <fmt/format.h>
-
+#include "cache_bytes.h"
 #include "gpu/native/provider_host.h"
 
 namespace mh4n::gpu::pipeline {
 namespace {
 
-constexpr char kMagic[8] = {'M', 'H', '4', 'N', 'P', 'I', 'P', 'E'};
-constexpr u64 kHashSeed = 0x46494C45ull;  // "FILE"
-constexpr size_t kHeaderSize = 8 + 4 + 8 + 8 + 4;
+constexpr std::array<u8, 8> kMagic{'M', 'H', '4', 'N', 'P', 'I', 'P', 'E'};
+constexpr size_t kHeaderSize = kMagic.size() + sizeof(u32) * 2 + sizeof(u64) * 2;
 
-void Put32(std::vector<u8>& out, u32 v) {
-    for (u32 i = 0; i < 4; ++i) out.push_back(static_cast<u8>(v >> (8 * i)));
+u64 Checksum(std::span<const u8> bytes) {
+    return native::detail::HashBytes(bytes.data(), bytes.size(), 0x46494c45ull);
 }
-void Put64(std::vector<u8>& out, u64 v) {
-    Put32(out, static_cast<u32>(v));
-    Put32(out, static_cast<u32>(v >> 32));
-}
-u32 Get32(const u8* p) {
-    u32 v = 0;
-    for (u32 i = 0; i < 4; ++i) v |= static_cast<u32>(p[i]) << (8 * i);
-    return v;
-}
-u64 Get64(const u8* p) { return Get32(p) | (static_cast<u64>(Get32(p + 4)) << 32); }
 
-std::filesystem::path TemporaryBeside(const std::filesystem::path& path) {
-    static std::atomic<u64> serial{0};
-    const u64 tick = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
-    std::filesystem::path tmp = path;
-    tmp += fmt::format(".{:x}.{}.tmp", tick & 0xFFFFFFFFFFull, serial.fetch_add(1));
-    return tmp;
+bool Fail(std::string* error, std::string message) {
+    if (error) {
+        *error = std::move(message);
+    }
+    return false;
 }
 
 }  // namespace
@@ -45,127 +36,137 @@ std::filesystem::path TemporaryBeside(const std::filesystem::path& path) {
 const char* ToString(ReadStatus status) {
     switch (status) {
     case ReadStatus::Ok: return "ok";
-    case ReadStatus::Missing: return "none";
-    case ReadStatus::Stale: return "another version";
+    case ReadStatus::Missing: return "missing";
+    case ReadStatus::Stale: return "stale";
     case ReadStatus::Damaged: return "damaged";
     }
-    return "?";
+    return "unknown";
 }
 
 bool WriteBytes(const std::filesystem::path& path, std::span<const u8> bytes, std::string* error) {
+    if (error) {
+        error->clear();
+    }
+    if (bytes.size() > static_cast<u64>(std::numeric_limits<std::streamsize>::max())) {
+        return Fail(error, "file too large");
+    }
+
     std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    const std::filesystem::path tmp = TemporaryBeside(path);
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            if (error) *error = fmt::format("cannot write {}", tmp.string());
-            return false;
-        }
-        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-        out.flush();
-        if (!out) {
-            if (error) *error = fmt::format("cannot write {}", tmp.string());
-            out.close();
-            std::filesystem::remove(tmp, ec);
-            return false;
+    if (!path.parent_path().empty()) {
+        std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec) {
+            return Fail(error, ec.message());
         }
     }
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
-        // A rename that does not replace (some file systems): remove the old file first.
-        std::error_code ignored;
-        std::filesystem::remove(path, ignored);
-        ec.clear();
-        std::filesystem::rename(tmp, path, ec);
+
+    static std::atomic<u64> sequence{0};
+    auto temporary = path;
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    temporary += ".tmp-" + std::to_string(ticks) + "-" + std::to_string(sequence.fetch_add(1));
+    std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return Fail(error, "could not open temporary file");
     }
-    if (ec) {
-        if (error) *error = fmt::format("cannot rename {} to {}: {}", tmp.string(), path.string(), ec.message());
-        std::error_code ignored;
-        std::filesystem::remove(tmp, ignored);
-        return false;
+    if (!bytes.empty()) {
+        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     }
-    return true;
+    file.close();
+    if (file) {
+        std::filesystem::rename(temporary, path, ec);
+        if (!ec) {
+            return true;
+        }
+    }
+    const auto message = ec ? ec.message() : "could not write temporary file";
+    std::filesystem::remove(temporary, ec);
+    return Fail(error, message);
 }
 
 std::optional<std::vector<u8>> ReadBytes(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
         return std::nullopt;
     }
-    in.seekg(0, std::ios::end);
-    const std::streamoff size = in.tellg();
-    if (size < 0) {
+    const std::streamoff size = file.tellg();
+    if (size < 0 || static_cast<u64>(size) > std::vector<u8>().max_size() ||
+        size > std::numeric_limits<std::streamsize>::max()) {
         return std::nullopt;
     }
-    in.seekg(0, std::ios::beg);
     std::vector<u8> bytes(static_cast<size_t>(size));
-    if (size > 0) {
-        in.read(reinterpret_cast<char*>(bytes.data()), size);
-        if (!in) {
-            return std::nullopt;
-        }
+    file.seekg(0);
+    if (size != 0 && !file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size))) {
+        return std::nullopt;
     }
     return bytes;
 }
 
-bool WriteRecords(const std::filesystem::path& path, u32 kind, u64 version_a, u64 version_b, const Records& records,
-                  std::string* error) {
-    size_t total = kHeaderSize + 8;
-    for (const auto& r : records) total += 4 + r.size();
-    std::vector<u8> out;
-    out.reserve(total);
-    out.insert(out.end(), kMagic, kMagic + 8);
-    Put32(out, kind);
-    Put64(out, version_a);
-    Put64(out, version_b);
-    Put32(out, static_cast<u32>(records.size()));
-    for (const auto& r : records) {
-        Put32(out, static_cast<u32>(r.size()));
-        out.insert(out.end(), r.begin(), r.end());
+bool WriteRecords(const std::filesystem::path& path, u32 kind, u64 version_a, u64 version_b,
+                  const Records& records, std::string* error) {
+    constexpr auto kMaxWord = std::numeric_limits<u32>::max();
+    if (records.size() > kMaxWord) {
+        return Fail(error, "too many records");
     }
-    Put64(out, native::detail::HashBytes(out.data(), out.size(), kHashSeed));
-    return WriteBytes(path, out, error);
+    std::vector<u8> bytes(kMagic.begin(), kMagic.end());
+    disk::Append(bytes, kind);
+    disk::Append(bytes, version_a);
+    disk::Append(bytes, version_b);
+    disk::Append(bytes, static_cast<u32>(records.size()));
+    for (const auto& record : records) {
+        if (record.size() > kMaxWord) {
+            return Fail(error, "record too large");
+        }
+        disk::Append(bytes, static_cast<u32>(record.size()));
+        bytes.insert(bytes.end(), record.begin(), record.end());
+    }
+    disk::Append(bytes, Checksum(bytes));
+    return WriteBytes(path, bytes, error);
 }
 
 ReadStatus ReadRecords(const std::filesystem::path& path, u32 kind, u64 version_a, u64 version_b, Records& records) {
     records.clear();
-    std::optional<std::vector<u8>> file = ReadBytes(path);
-    if (!file) {
-        return ReadStatus::Missing;
+    const auto bytes = ReadBytes(path);
+    if (!bytes) {
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(path, ec);
+        return !exists && !ec ? ReadStatus::Missing : ReadStatus::Damaged;
     }
-    const std::vector<u8>& b = *file;
-    if (b.size() < kHeaderSize + 8 || std::memcmp(b.data(), kMagic, 8) != 0) {
+    if (bytes->size() < kHeaderSize + sizeof(u64)) {
         return ReadStatus::Damaged;
     }
-    const size_t body = b.size() - 8;
-    if (native::detail::HashBytes(b.data(), body, kHashSeed) != Get64(b.data() + body)) {
+    const auto contents = std::span(*bytes).first(bytes->size() - sizeof(u64));
+    disk::Reader footer(std::span(*bytes).last(sizeof(u64)));
+    disk::Reader reader(contents);
+    if (!std::ranges::equal(reader.Take(kMagic.size()), kMagic) || footer.Read<u64>() != Checksum(contents)) {
         return ReadStatus::Damaged;
     }
-    if (Get32(b.data() + 8) != kind || Get64(b.data() + 12) != version_a || Get64(b.data() + 20) != version_b) {
+    const u32 file_kind = reader.Read<u32>();
+    const u64 file_version_a = reader.Read<u64>();
+    const u64 file_version_b = reader.Read<u64>();
+    if (file_kind != kind || file_version_a != version_a || file_version_b != version_b) {
         return ReadStatus::Stale;
     }
-    const u32 count = Get32(b.data() + 28);
-    size_t at = kHeaderSize;
-    records.reserve(count);
-    for (u32 i = 0; i < count; ++i) {
-        if (at + 4 > body) {
-            records.clear();
-            return ReadStatus::Damaged;
-        }
-        const u32 size = Get32(b.data() + at);
-        at += 4;
-        if (size > body - at) {
-            records.clear();
-            return ReadStatus::Damaged;
-        }
-        records.emplace_back(b.begin() + static_cast<std::ptrdiff_t>(at), b.begin() + static_cast<std::ptrdiff_t>(at + size));
-        at += size;
-    }
-    if (at != body) {
-        records.clear();
+
+    const u32 count = reader.Read<u32>();
+    if (count > reader.Remaining() / sizeof(u32)) {
         return ReadStatus::Damaged;
     }
+    Records decoded;
+    decoded.reserve(count);
+    for (u32 i = 0; i < count; ++i) {
+        if (reader.Remaining() < sizeof(u32)) {
+            return ReadStatus::Damaged;
+        }
+        const u32 size = reader.Read<u32>();
+        const auto record = reader.Take(size);
+        if (record.size() != size) {
+            return ReadStatus::Damaged;
+        }
+        decoded.emplace_back(record.begin(), record.end());
+    }
+    if (!reader.Done()) {
+        return ReadStatus::Damaged;
+    }
+    records = std::move(decoded);
     return ReadStatus::Ok;
 }
 

@@ -209,7 +209,8 @@ public:
     // The runtime's interrupt sink. `delay_ns` is what the GPU passed with the interrupt (the time
     // the work would take on a console): it is not waited for, it goes to the performance log.
     // The VBlanks ignore it.
-    void SignalInterrupt(gpu::Interrupt id, u64 delay_ns = 0);
+    // `apply_swap` false: the VBlank's buffer swap was already applied (OnVBlank, in order with the queued GX), only deliver.
+    void SignalInterrupt(gpu::Interrupt id, u64 delay_ns = 0, bool apply_swap = true);
 
     // ---- VBlank ----
     // Schedules the first VBlank, one period from now. Once.
@@ -234,8 +235,9 @@ public:
 
 private:
     void Init(ServiceContext& context);
-    void SignalInterruptForThread(gpu::Interrupt id, u32 thread, u64 delay_ns);
-    void ProcessInterrupt(gpu::Interrupt id, u32 thread);
+    void SignalInterruptForThread(gpu::Interrupt id, u32 thread, u64 delay_ns, bool apply_swap);
+    void ProcessInterrupt(gpu::Interrupt id, u32 thread, bool apply_swap);
+    void ApplyVBlankSwap(gpu::Interrupt id, u32 thread);
     void OnVBlank();
     void ScheduleVBlank();
     void FollowDisplay();

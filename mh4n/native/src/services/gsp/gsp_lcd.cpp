@@ -1,41 +1,41 @@
-// Derived from Azahar src/core/hle/service/gsp/gsp_lcd.cpp, src/core/hle/service/gsp/gsp_lcd.h and
-// src/core/hle/service/gsp/gsp.cpp at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later:
-// each of them says "GPLv2 or any later version"): the gsp::Lcd service and its table of command
-// names, none of which Azahar implements.
-// Copyright 2015 Citra Emulator Project (gsp_lcd.cpp, gsp_lcd.h)
-// Copyright 2017 Citra Emulator Project (gsp.cpp)
-//
-// The gsp::Lcd service (N1-17): every command is known by name and implemented by none, as in
-// Azahar, so each is logged once as unimplemented and answered the way Azahar answers it. The game
-// does not open this service; it exists so that one that does gets a session.
-#include <memory>
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: 3dbrew GSP Services and gsp_test.
 
 #include "mh4n/registry.h"
 #include "mh4n/service.h"
 
 namespace mh4n::gsp {
-
 namespace {
 
-class GspLcd final : public Service {
+class LcdSession final : public Service {
 public:
-    explicit GspLcd(ServiceContext& context) : Service(context, "gsp::Lcd") {
-        Register(0x000A, "SetBrightnessRaw");
-        Register(0x000B, "SetBrightness");
-        Register(0x000F, "PowerOnAllBacklights");
-        Register(0x0010, "PowerOffAllBacklights");
-        Register(0x0011, "PowerOnBacklight");
-        Register(0x0012, "PowerOffBacklight");
-        Register(0x0013, "SetLedForceOff");
-        Register(0x0014, "GetVendor");
-        Register(0x0015, "GetBrightness");
+    explicit LcdSession(ServiceContext& context) : Service(context, "gsp::Lcd") {
+        Register(0x01, "EnableABL");
+        Register(0x02, "DisableABL");
+        Register(0x03, "SetRSLut");
+        Register(0x04, "SetRSParams");
+        Register(0x05, "SetABLArea");
+        Register(0x07, "SetInertia");
+        Register(0x08, "SetDitherMode");
+        Register(0x09, "SetDitherParams");
+        Register(0x0A, "SetBrightnessRaw");
+        Register(0x0B, "SetBrightness");
+        Register(0x0C, "ReloadConfig");
+        Register(0x0D, "RestoreConfig");
+        Register(0x0E, "GetPowerState");
+        Register(0x0F, "PowerOnAllBacklights");
+        Register(0x10, "PowerOffAllBacklights");
+        Register(0x11, "PowerOnBacklight");
+        Register(0x12, "PowerOffBacklight");
+        Register(0x13, "SetLedForceOff");
+        Register(0x14, "GetVendor");
+        Register(0x15, "GetBrightness");
     }
 };
 
-// ServiceFramework("gsp::Lcd") takes the default number of sessions.
 MH4N_REGISTER(ServiceFactory, "gsp::Lcd",
-              ServiceFactory([](ServiceContext& context) { return std::make_unique<GspLcd>(context); }));
+              [](ServiceContext& context) { return std::make_unique<LcdSession>(context); });
 
 }  // namespace
-
 }  // namespace mh4n::gsp

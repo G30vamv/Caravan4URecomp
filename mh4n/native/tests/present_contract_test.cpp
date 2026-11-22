@@ -299,16 +299,21 @@ TEST_CASE("a ScreenImage keeps its backend image alive and checks its sizes") {
 
 TEST_CASE("a rotated image stores each displayed column as a row, bottom to top") {
     const present::PixelPos top_left =
-        present::ToImagePixel(present::Orientation::Rotated90, 240, 0, 0);
+        present::ToImagePixel(present::Orientation::Rotated90, 400, 240, 0, 0);
     CHECK(top_left == present::PixelPos{239, 0});
     const present::PixelPos bottom_right =
-        present::ToImagePixel(present::Orientation::Rotated90, 240, 399, 239);
+        present::ToImagePixel(present::Orientation::Rotated90, 400, 240, 399, 239);
     CHECK(bottom_right == present::PixelPos{0, 399});
-    CHECK(present::ToImagePixel(present::Orientation::Upright, 240, 5, 6) ==
+    CHECK(present::ToImagePixel(present::Orientation::Upright, 400, 240, 5, 6) ==
           present::PixelPos{5, 6});
     // At 2x the displayed height is 480 image pixels.
-    CHECK(present::ToImagePixel(present::Orientation::Rotated90, 480, 10, 3) ==
+    CHECK(present::ToImagePixel(present::Orientation::Rotated90, 800, 480, 10, 3) ==
           present::PixelPos{476, 10});
+    // Mirrored: the displayed columns run the other way too.
+    CHECK(present::ToImagePixel(present::Orientation::Rotated90Mirrored, 400, 240, 0, 0) ==
+          present::PixelPos{239, 399});
+    CHECK(present::ToImagePixel(present::Orientation::Rotated90Mirrored, 400, 240, 399, 239) ==
+          present::PixelPos{0, 0});
 }
 
 TEST_CASE("the shared backend slot is empty by default and is set and read from two threads") {

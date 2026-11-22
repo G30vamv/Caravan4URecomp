@@ -3,12 +3,30 @@
 # (threads) add their .cpp files to this directory; the glob picks them up
 # without editing this file (add `DEPENDS` for the modules they use when they need to).
 file(GLOB kernel_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
+# MODIFIED for the Windows port (Phase 6, independent kernel; empty by default: nothing changes): MH4N_KERNEL_DIR names a directory
+# whose *.cpp replace this directory's, to build the kernel module from the independent implementation (the headers stay these).
+set(MH4N_KERNEL_DIR "" CACHE PATH "Directory of an independent kernel implementation (*.cpp) built instead of this one; empty: this one")
+if (MH4N_KERNEL_DIR)
+    # file by file: a *.cpp of the replacement directory takes the place of the one of the same name here; the others stay,
+    # and a name that is not here is added (so a work package can replace part of the kernel at a time)
+    file(GLOB replacement_sources CONFIGURE_DEPENDS "${MH4N_KERNEL_DIR}/*.cpp")
+    foreach (replacement IN LISTS replacement_sources)
+        get_filename_component(replacement_name "${replacement}" NAME)
+        list(FILTER kernel_sources EXCLUDE REGEX "/${replacement_name}$")
+        list(APPEND kernel_sources "${replacement}")
+        message(STATUS "mh4n_kernel: ${replacement_name} from ${MH4N_KERNEL_DIR}")
+    endforeach()
+endif()
 list(SORT kernel_sources)
 
 mh4n_module(
     SOURCES ${kernel_sources}
     DEPENDS mh4n_memory mh4n_cpu
 )
+if (TRUE)
+    # the replacement files include this directory's internal headers as "internal.h", "cpu_limiter.h"...
+    target_include_directories(mh4n_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+endif()
 
 # ---- test data for native/tests/determinism_test.cpp (N1-25) ----------------------------------------
 # port/tests/svc_test.c (threads, mutexes, events, timers, an address arbiter) is built into a 3DS ELF

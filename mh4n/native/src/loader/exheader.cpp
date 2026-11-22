@@ -1,127 +1,92 @@
-// Derived from Azahar src/core/file_sys/ncch_container.h and src/core/hle/kernel/process.cpp at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-3.0-or-later: ncch_container.h says so, process.cpp
-// says GPL-2.0-or-later): the layout of the ARM11 local
-// capabilities and Process::ParseKernelCaps.
-// Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project (ncch_container.h)
-// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project (process.cpp)
-#include <cstring>
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: 3dbrew NCCH/Extended Header, mh4n/loader.h and loader_test.cpp.
 
-#include <fmt/format.h>
-
+#include "image_fields.h"
 #include "mh4n/loader.h"
+
+#include <algorithm>
 
 namespace mh4n {
 namespace {
 
-u16 Le16(const u8* p) {
-    return static_cast<u16>(p[0] | (p[1] << 8));
-}
-u32 Le32(const u8* p) {
-    return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) | (static_cast<u32>(p[2]) << 16) |
-           (static_cast<u32>(p[3]) << 24);
-}
-u64 Le64(const u8* p) {
-    return Le32(p) | (static_cast<u64>(Le32(p + 4)) << 32);
-}
+void ReadCapabilities(const u8* data, KernelCaps& caps) {
+    constexpr unsigned count = 28;
+    constexpr u32 page_mask = 0xFFFFF;
+    const auto descriptor = [data](unsigned index) {
+        return static_cast<u32>(loader_detail::ReadLe(data + index * 4, 4));
+    };
+    const auto is_range = [](u32 word) { return (word & 0xFFE00000) == 0xFF800000; };
 
-ExHeaderSegment ReadSegment(const u8* p) {
-    return ExHeaderSegment{Le32(p), Le32(p + 4), Le32(p + 8)};
-}
-
-constexpr std::size_t kLocalCapsOffset = 0x200;
-constexpr std::size_t kKernelCapsOffset = kLocalCapsOffset + 0x170;
-constexpr std::size_t kKernelCapsCount = 28;
-
-KernelCaps ParseKernelCaps(const u32* caps, std::size_t len) {
-    KernelCaps out;
-    for (std::size_t i = 0; i < len; ++i) {
-        const u32 descriptor = caps[i];
-        const u32 type = descriptor >> 20;
-
-        if (descriptor == 0xFFFFFFFF) {
-            // Unused descriptor entry
-        } else if ((type & 0xF00) == 0xE00) {
-            // Allowed interrupts list: ignored
-        } else if ((type & 0xF80) == 0xF00) {
-            // Allowed syscalls mask
-            std::size_t index = ((descriptor >> 24) & 7) * 24;
-            u32 bits = descriptor & 0xFFFFFF;
-            while (bits && index < out.svc_mask.size()) {
-                out.svc_mask.set(index, bits & 1);
-                ++index;
-                bits >>= 1;
+    for (unsigned i = 0; i < count; ++i) {
+        const u32 word = descriptor(i);
+        if ((word & 0xF8000000) == 0xF0000000) {
+            const unsigned first = ((word >> 24) & 7) * 24;
+            for (unsigned bit = 0; bit < 24 && first + bit < caps.svc_mask.size(); ++bit) {
+                if (word & (1u << bit)) {
+                    caps.svc_mask.set(first + bit);
+                }
             }
-        } else if ((type & 0xFF0) == 0xFE0) {
-            out.handle_table_size = descriptor & 0x3FF;
-        } else if ((type & 0xFF8) == 0xFF0) {
-            out.flags = static_cast<u16>(descriptor & 0xFFFF);
-        } else if ((type & 0xFFE) == 0xFF8) {
-            // Mapped memory range: two descriptors
-            if (i + 1 >= len || ((caps[i + 1] >> 20) & 0xFFE) != 0xFF8) {
-                continue;  // incomplete: ignored
+        } else if ((word & 0xFE000000) == 0xFC000000) {
+            caps.kernel_version = word & 0xFFFF;
+        } else if ((word & 0xFF000000) == 0xFE000000) {
+            caps.handle_table_size = word & 0x7FFFF;
+        } else if ((word & 0xFF800000) == 0xFF000000) {
+            caps.flags = static_cast<u16>(word);
+        } else if (is_range(word) && i + 1 < count && is_range(descriptor(i + 1))) {
+            const u32 end = descriptor(++i);
+            const u32 first_page = word & page_mask;
+            const u32 end_page = end & page_mask;
+            if (first_page < end_page) {
+                caps.address_mappings.push_back({first_page << 12, (end_page - first_page) << 12,
+                                                 (word & 0x100000) != 0, (end & 0x100000) != 0});
             }
-            const u32 end_desc = caps[i + 1];
-            ++i;
-            AddressMapping mapping{};
-            mapping.address = descriptor << 12;
-            const u32 end_address = end_desc << 12;
-            mapping.size = mapping.address < end_address ? end_address - mapping.address : 0;
-            mapping.read_only = (descriptor & (1u << 20)) != 0;
-            mapping.unk_flag = (end_desc & (1u << 20)) != 0;
-            out.address_mappings.push_back(mapping);
-        } else if ((type & 0xFFF) == 0xFFE) {
-            // Mapped memory page
-            out.address_mappings.push_back(AddressMapping{descriptor << 12, kPageSize, false, false});
-        } else if ((type & 0xFE0) == 0xFC0) {
-            out.kernel_version = descriptor & 0xFFFF;
+        } else if ((word & 0xFFF00000) == 0xFFE00000) {
+            caps.address_mappings.push_back({(word & page_mask) << 12, 0x1000, false, false});
         }
-        // Anything else: Azahar logs it as unhandled and goes on.
     }
-    return out;
 }
 
 }  // namespace
 
 bool ParseExHeader(const u8* data, std::size_t size, ExHeader* out, std::string* error) {
-    if (size < kExHeaderMinSize) {
-        if (error) {
-            *error = fmt::format("exheader too small (0x{:X} bytes, need at least 0x{:X})", size,
-                                 kExHeaderMinSize);
-        }
-        return false;
+    if (!data || size < kExHeaderMinSize) {
+        return loader_detail::Fail(error, "exheader.bin is too small");
     }
-    ExHeader h;
-    const char* title = reinterpret_cast<const char*>(data);
-    h.title.assign(title, strnlen(title, 8));
-    h.flags = data[0x0D];
-    h.remaster_version = Le16(data + 0x0E);
-    h.text = ReadSegment(data + 0x10);
-    h.stack_size = Le32(data + 0x1C);
-    h.ro = ReadSegment(data + 0x20);
-    h.data = ReadSegment(data + 0x30);
-    h.bss_size = Le32(data + 0x3C);
-
-    const u8* lc = data + kLocalCapsOffset;
-    h.program_id = Le64(lc);
-    h.core_version = Le32(lc + 8);
-    h.enable_l2_cache = (lc[0x0C] & 1) != 0;
-    h.enable_804mhz_cpu = (lc[0x0C] & 2) != 0;
-    h.n3ds_mode = lc[0x0D];
-    h.ideal_processor = lc[0x0E] & 3;
-    h.affinity_mask = (lc[0x0E] >> 2) & 3;
-    h.system_mode = lc[0x0E] >> 4;
-    h.priority = lc[0x0F];
-    const u16 core1 = Le16(lc + 0x10);
-    h.max_cpu = core1 & 0x7F;
-    h.schedule_mode = (core1 >> 7) & 1;
-    h.resource_limit_category = lc[0x16F];
-
-    u32 caps[kKernelCapsCount];
-    for (std::size_t i = 0; i < kKernelCapsCount; ++i) {
-        caps[i] = Le32(data + kKernelCapsOffset + 4 * i);
+    if (!out) {
+        return loader_detail::Fail(error, "no exheader output");
     }
-    h.kernel_caps = ParseKernelCaps(caps, kKernelCapsCount);
-    *out = std::move(h);
+
+    const auto le32 = [data](std::size_t offset) {
+        return static_cast<u32>(loader_detail::ReadLe(data + offset, 4));
+    };
+    const auto segment = [&](std::size_t offset) {
+        return ExHeaderSegment{le32(offset), le32(offset + 4), le32(offset + 8)};
+    };
+
+    ExHeader header;
+    header.title.assign(data, std::find(data, data + 8, u8{0}));
+    header.flags = data[0xD];
+    header.remaster_version = static_cast<u16>(loader_detail::ReadLe(data + 0xE, 2));
+    header.text = segment(0x10);
+    header.ro = segment(0x20);
+    header.data = segment(0x30);
+    header.stack_size = le32(0x1C);
+    header.bss_size = le32(0x3C);
+    header.program_id = loader_detail::ReadLe(data + 0x200, 8);
+    header.core_version = le32(0x208);
+    header.enable_l2_cache = (data[0x20C] & 1) != 0;
+    header.enable_804mhz_cpu = (data[0x20C] & 2) != 0;
+    header.n3ds_mode = data[0x20D] & 0xF;
+    header.ideal_processor = data[0x20E] & 3;
+    header.affinity_mask = (data[0x20E] >> 2) & 3;
+    header.system_mode = data[0x20E] >> 4;
+    header.priority = data[0x20F];
+    header.max_cpu = data[0x210] & 0x7F;
+    header.schedule_mode = data[0x210] >> 7;
+    header.resource_limit_category = data[0x36F];
+    ReadCapabilities(data + 0x370, header.kernel_caps);
+    *out = std::move(header);
     return true;
 }
 

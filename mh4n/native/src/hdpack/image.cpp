@@ -1,21 +1,80 @@
-// Derived from Azahar src/video_core/custom_textures/material.cpp (CustomTexture::LoadPNG,
-// LoadDDS, ToCustomPixelFormat), custom_format.h, src/common/texture.cpp (FlipRGBA8Texture) and
-// src/core/frontend/image_interface.cpp (DecodePNG, DecodeDDS) at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later; every one of those files says
-// "Licensed under GPLv2 or any later version").
-// Copyright 2023 Citra Emulator Project (material.cpp, custom_format.h, image_interface.cpp)
-// Copyright 2019 Citra Emulator Project (texture.cpp)
-#include "hdpack/image.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: image.h, hdpack_test.cpp, LodePNG's public API and Microsoft's DDS Programming Guide.
+
+#include "image.h"
 
 #include <algorithm>
-#include <cstdlib>
+#include <bit>
 #include <cstring>
+#include <optional>
+#include <utility>
 
 #include <lodepng.h>
 
-#include <fmt/format.h>
+#include "bytes.h"
 
 namespace mh4n::hdpack {
+namespace {
+
+bool ValidSize(u32 width, u32 height) {
+    return width != 0 && height != 0 && width <= kMaxDimension && height <= kMaxDimension;
+}
+
+struct DdsFormat {
+    PixelFormat format;
+    bool swap_rb = false;
+    bool opaque = false;
+};
+
+constexpr u32 FourCC(char a, char b, char c, char d) {
+    return static_cast<u32>(a) | (static_cast<u32>(b) << 8) |
+           (static_cast<u32>(c) << 16) | (static_cast<u32>(d) << 24);
+}
+
+std::optional<DdsFormat> DxgiFormat(u32 value) {
+    switch (value) {
+    case 28: case 29: return DdsFormat{PixelFormat::RGBA8};
+    case 87: case 91: return DdsFormat{PixelFormat::RGBA8, true};
+    case 88: case 93: return DdsFormat{PixelFormat::RGBA8, true, true};
+    case 71: case 72: return DdsFormat{PixelFormat::BC1};
+    case 77: case 78: return DdsFormat{PixelFormat::BC3};
+    case 83: return DdsFormat{PixelFormat::BC5};
+    case 98: case 99: return DdsFormat{PixelFormat::BC7};
+    default: return std::nullopt;
+    }
+}
+
+std::optional<DdsFormat> LegacyFormat(const u8* data) {
+    const u32 flags = Get32(data + 80);
+    if (flags & 0x4) {
+        switch (Get32(data + 84)) {
+        case FourCC('D', 'X', 'T', '1'): return DdsFormat{PixelFormat::BC1};
+        case FourCC('D', 'X', 'T', '5'): return DdsFormat{PixelFormat::BC3};
+        case FourCC('A', 'T', 'I', '2'):
+        case FourCC('B', 'C', '5', 'U'): return DdsFormat{PixelFormat::BC5};
+        default: return std::nullopt;
+        }
+    }
+
+    const u32 red = Get32(data + 92);
+    const u32 green = Get32(data + 96);
+    const u32 blue = Get32(data + 100);
+    const u32 alpha = Get32(data + 104);
+    if (!(flags & 0x40) || Get32(data + 88) != 32 || green != 0xFF00 ||
+        (alpha != 0 && alpha != 0xFF000000)) {
+        return std::nullopt;
+    }
+    if (red == 0xFF && blue == 0xFF0000) {
+        return DdsFormat{PixelFormat::RGBA8, false, alpha == 0};
+    }
+    if (red == 0xFF0000 && blue == 0xFF) {
+        return DdsFormat{PixelFormat::RGBA8, true, alpha == 0};
+    }
+    return std::nullopt;
+}
+
+}  // namespace
 
 const char* PixelFormatName(PixelFormat format) {
     switch (format) {
@@ -25,224 +84,158 @@ const char* PixelFormatName(PixelFormat format) {
     case PixelFormat::BC5: return "BC5";
     case PixelFormat::BC7: return "BC7";
     }
-    return "?";
+    return "unknown";
 }
 
 u32 BlockBytes(PixelFormat format) {
     switch (format) {
     case PixelFormat::BC1: return 8;
-    case PixelFormat::BC3:
-    case PixelFormat::BC5:
-    case PixelFormat::BC7: return 16;
-    case PixelFormat::RGBA8: break;
+    case PixelFormat::BC3: case PixelFormat::BC5: case PixelFormat::BC7: return 16;
+    default: return 0;
     }
-    return 0;
 }
 
 u64 LevelBytes(PixelFormat format, u32 width, u32 height) {
-    const u32 block = BlockBytes(format);
-    if (block == 0) {
-        return static_cast<u64>(width) * height * 4;
+    const auto block_bytes = BlockBytes(format);
+    if (block_bytes == 0) {
+        return u64{4} * width * height;
     }
-    return static_cast<u64>((width + 3) / 4) * ((height + 3) / 4) * block;
+    return ((u64{width} + 3) / 4) * ((u64{height} + 3) / 4) * block_bytes;
 }
 
 u32 FullMipCount(u32 width, u32 height) {
-    u32 count = 1;
-    for (u32 side = std::max(width, height); side > 1; side >>= 1) {
-        ++count;
-    }
-    return count;
+    return static_cast<u32>(std::bit_width(std::max(width, height)));
 }
 
 void FlipRows(u8* rgba, u32 width, u32 height) {
-    const std::size_t line = static_cast<std::size_t>(width) * 4;
+    if (!width || height < 2) {
+        return;
+    }
+    const auto stride = std::size_t{4} * width;
     for (u32 row = 0; row < height / 2; ++row) {
-        std::swap_ranges(rgba + row * line, rgba + (row + 1) * line,
-                         rgba + static_cast<std::size_t>(height - row - 1) * line);
+        u8* top = rgba + row * stride;
+        u8* bottom = rgba + (height - 1 - row) * stride;
+        std::swap_ranges(top, top + stride, bottom);
     }
 }
 
 bool DecodePng(const u8* data, std::size_t size, bool flip, Image& out, std::string& error) {
-    // Read the size first, so that an absurd image is refused before it is allocated.
-    unsigned width = 0;
-    unsigned height = 0;
-    LodePNGState state;
-    lodepng_state_init(&state);
-    unsigned code = lodepng_inspect(&width, &height, &state, data, size);
-    lodepng_state_cleanup(&state);
-    if (code != 0) {
-        error = fmt::format("not a PNG: {}", lodepng_error_text(code));
+    if (!data || size < 33) {
+        error = "truncated PNG header";
         return false;
     }
-    if (width == 0 || height == 0 || width > kMaxDimension || height > kMaxDimension) {
-        error = fmt::format("PNG of {}x{} is out of range", width, height);
+
+    lodepng::State state;
+    unsigned width = 0, height = 0;
+    const auto header_result = lodepng_inspect(&width, &height, &state, data, size);
+    if (header_result != 0) {
+        error = lodepng_error_text(header_result);
         return false;
     }
-    unsigned char* pixels = nullptr;
-    code = lodepng_decode_memory(&pixels, &width, &height, data, size, LCT_RGBA, 8);
-    if (code != 0) {
-        std::free(pixels);
-        error = fmt::format("cannot decode the PNG: {}", lodepng_error_text(code));
+    if (!ValidSize(width, height)) {
+        error = "PNG dimensions out of range";
         return false;
     }
-    out.format = PixelFormat::RGBA8;
-    out.width = width;
-    out.height = height;
-    out.levels.assign(1, std::vector<u8>(pixels, pixels + static_cast<std::size_t>(width) * height * 4));
-    std::free(pixels);
+
+    Image decoded{PixelFormat::RGBA8, width, height, {{}}};
+    auto& pixels = decoded.levels.front();
+    const auto result = lodepng::decode(pixels, width, height, data, size);
+    if (result != 0) {
+        error = lodepng_error_text(result);
+        return false;
+    }
     if (flip) {
-        FlipRows(out.levels[0].data(), width, height);
+        FlipRows(pixels.data(), width, height);
     }
+    out = std::move(decoded);
     return true;
 }
-
-namespace {
-
-u32 Le32(const u8* p) {
-    return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) | (static_cast<u32>(p[2]) << 16) |
-           (static_cast<u32>(p[3]) << 24);
-}
-
-constexpr u32 FourCC(char a, char b, char c, char d) {
-    return static_cast<u32>(static_cast<u8>(a)) | (static_cast<u32>(static_cast<u8>(b)) << 8) |
-           (static_cast<u32>(static_cast<u8>(c)) << 16) | (static_cast<u32>(static_cast<u8>(d)) << 24);
-}
-
-struct DdsFormat {
-    bool known = false;
-    PixelFormat format = PixelFormat::RGBA8;
-    bool swap_rb = false;  // BGRA in the file
-    bool opaque = false;   // the fourth channel is padding
-};
-
-DdsFormat FromDxgi(u32 dxgi) {
-    DdsFormat f;
-    f.known = true;
-    switch (dxgi) {
-    case 28: case 29: break; // R8G8B8A8_UNORM, _SRGB
-    case 87: case 91: f.swap_rb = true; break; // B8G8R8A8_UNORM, _SRGB
-    case 88: case 93: f.swap_rb = true; f.opaque = true; break; // B8G8R8X8_UNORM, _SRGB
-    case 71: case 72: f.format = PixelFormat::BC1; break;
-    case 77: case 78: f.format = PixelFormat::BC3; break;
-    case 83: f.format = PixelFormat::BC5; break;
-    case 98: case 99: f.format = PixelFormat::BC7; break;
-    default: f.known = false; break;
-    }
-    return f;
-}
-
-} // namespace
 
 bool DecodeDds(const u8* data, std::size_t size, Image& out, std::string& error) {
-    constexpr std::size_t kHeader = 4 + 124;
-    if (size < kHeader || std::memcmp(data, "DDS ", 4) != 0 || Le32(data + 4) != 124) {
-        error = "not a DDS file";
+    constexpr std::size_t header_size = 128;
+    constexpr std::size_t dx10_size = 20;
+    if (!data || size < header_size || std::memcmp(data, "DDS ", 4) != 0 ||
+        Get32(data + 4) != 124 || Get32(data + 76) != 32) {
+        error = "invalid DDS header";
         return false;
     }
-    const u8* h = data + 4;
-    const u32 flags = Le32(h + 4);
-    const u32 height = Le32(h + 8);
-    const u32 width = Le32(h + 12);
-    const u32 depth = Le32(h + 20);
-    u32 mip_count = (flags & 0x20000) ? Le32(h + 24) : 1; // DDSD_MIPMAPCOUNT
-    // DDS_PIXELFORMAT starts at offset 72 of the header: size, flags, four-CC, bit count, masks.
-    const u32 pf_flags = Le32(h + 76);
-    const u32 four_cc = Le32(h + 80);
-    const u32 bit_count = Le32(h + 84);
-    const u32 mask_r = Le32(h + 88);
-    const u32 mask_g = Le32(h + 92);
-    const u32 mask_b = Le32(h + 96);
-    const u32 mask_a = Le32(h + 100);
-    const u32 caps2 = Le32(h + 108);
-    std::size_t offset = kHeader;
 
-    if (width == 0 || height == 0 || width > kMaxDimension || height > kMaxDimension) {
-        error = fmt::format("DDS of {}x{} is out of range", width, height);
+    const u32 width = Get32(data + 16);
+    const u32 height = Get32(data + 12);
+    if (!ValidSize(width, height)) {
+        error = "DDS dimensions out of range";
         return false;
     }
-    if ((caps2 & 0x200) || (caps2 & 0x200000) || ((flags & 0x800000) && depth > 1)) {
-        error = "cube maps and volume textures are not supported";
+    if ((Get32(data + 112) & 0x20FE00) || Get32(data + 24) > 1) {
+        error = "DDS cube maps and volumes are unsupported";
         return false;
     }
-    mip_count = std::clamp<u32>(mip_count, 1, FullMipCount(width, height));
 
-    DdsFormat format;
-    if ((pf_flags & 0x4) && four_cc == FourCC('D', 'X', '1', '0')) { // DDPF_FOURCC
-        if (size < kHeader + 20) {
-            error = "truncated DX10 header";
+    std::size_t offset = header_size;
+    std::optional<DdsFormat> format;
+    if ((Get32(data + 80) & 0x4) && Get32(data + 84) == FourCC('D', 'X', '1', '0')) {
+        offset += dx10_size;
+        if (size < offset) {
+            error = "truncated DDS DX10 header";
             return false;
         }
-        const u32 dxgi = Le32(data + kHeader);
-        const u32 array_size = Le32(data + kHeader + 12);
-        if (array_size > 1) {
-            error = "texture arrays are not supported";
+        if (Get32(data + 132) != 3 || (Get32(data + 136) & 0x4) || Get32(data + 140) != 1) {
+            error = "DDS resource must be a single 2D texture";
             return false;
         }
-        format = FromDxgi(dxgi);
-        if (!format.known) {
-            error = fmt::format("DXGI format {} is not supported", dxgi);
-            return false;
-        }
-        offset += 20;
-    } else if (pf_flags & 0x4) {
-        format.known = true;
-        if (four_cc == FourCC('D', 'X', 'T', '1')) {
-            format.format = PixelFormat::BC1;
-        } else if (four_cc == FourCC('D', 'X', 'T', '5')) {
-            format.format = PixelFormat::BC3;
-        } else if (four_cc == FourCC('A', 'T', 'I', '2') || four_cc == FourCC('B', 'C', '5', 'U')) {
-            format.format = PixelFormat::BC5;
-        } else {
-            error = "this four-CC format is not supported";
-            return false;
-        }
-    } else if ((pf_flags & 0x40) && bit_count == 32 && mask_g == 0xFF00) { // DDPF_RGB
-        format.known = true;
-        if (mask_r == 0xFF && mask_b == 0xFF0000) {
-            format.swap_rb = false;
-        } else if (mask_r == 0xFF0000 && mask_b == 0xFF) {
-            format.swap_rb = true;
-        } else {
-            error = "this 32-bit channel order is not supported";
-            return false;
-        }
-        format.opaque = (mask_a == 0);
+        format = DxgiFormat(Get32(data + 128));
     } else {
-        error = "this DDS pixel format is not supported";
+        format = LegacyFormat(data);
+    }
+    if (!format) {
+        error = "unsupported DDS pixel format";
         return false;
     }
 
-    out.format = format.format;
-    out.width = width;
-    out.height = height;
-    out.levels.clear();
-    const u32 levels = format.format == PixelFormat::RGBA8 ? 1 : mip_count;
-    u32 w = width;
-    u32 h2 = height;
-    for (u32 level = 0; level < levels; ++level) {
-        const u64 bytes = LevelBytes(format.format, w, h2);
-        if (offset + bytes > size) {
-            error = "the DDS file is truncated";
+    Image decoded{format->format, width, height, {}};
+    const u32 mips = std::max(1u, Get32(data + 28));
+    if (mips > FullMipCount(width, height)) {
+        error = "invalid DDS mip count";
+        return false;
+    }
+    if (format->format == PixelFormat::RGBA8) {
+        const auto row_bytes = std::size_t{4} * width;
+        std::size_t stride = row_bytes;
+        if (Get32(data + 8) & 0x8) {
+            stride = std::max(row_bytes, static_cast<std::size_t>(Get32(data + 20)));
+        }
+        if (stride > (size - offset) / height) {
+            error = "truncated DDS pixels";
             return false;
         }
-        out.levels.emplace_back(data + offset, data + offset + bytes);
-        offset += static_cast<std::size_t>(bytes);
-        w = std::max(1u, w >> 1);
-        h2 = std::max(1u, h2 >> 1);
-    }
-    if (format.format == PixelFormat::RGBA8) {
-        std::vector<u8>& pixels = out.levels[0];
-        for (std::size_t i = 0; i < pixels.size(); i += 4) {
-            if (format.swap_rb) {
-                std::swap(pixels[i], pixels[i + 2]);
-            }
-            if (format.opaque) {
-                pixels[i + 3] = 255;
+        auto& pixels = decoded.levels.emplace_back(row_bytes * height);
+        for (u32 y = 0; y < height; ++y) {
+            std::memcpy(pixels.data() + y * row_bytes, data + offset + y * stride, row_bytes);
+        }
+        if (format->swap_rb || format->opaque) {
+            for (std::size_t pos = 0; pos < pixels.size(); pos += 4) {
+                if (format->swap_rb) {
+                    std::swap(pixels[pos], pixels[pos + 2]);
+                }
+                if (format->opaque) {
+                    pixels[pos + 3] = 255;
+                }
             }
         }
+    } else {
+        for (u32 level = 0; level < mips; ++level) {
+            const auto bytes = LevelBytes(format->format, std::max(1u, width >> level),
+                                          std::max(1u, height >> level));
+            if (bytes > size - offset) {
+                error = "truncated DDS mip chain";
+                return false;
+            }
+            decoded.levels.emplace_back(data + offset, data + offset + bytes);
+            offset += bytes;
+        }
     }
+    out = std::move(decoded);
     return true;
 }
 
-} // namespace mh4n::hdpack
+}  // namespace mh4n::hdpack

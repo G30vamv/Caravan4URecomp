@@ -391,7 +391,7 @@ pr::ScreenImage MakeScreen(rhi::Backend& backend, const Screen& s) {
     }
     for (u32 y = 0; y < s.ScaledH(); ++y) {
         for (u32 x = 0; x < s.ScaledW(); ++x) {
-            const pr::PixelPos at = pr::ToImagePixel(s.orientation, s.ScaledH(), x, y);
+            const pr::PixelPos at = pr::ToImagePixel(s.orientation, s.ScaledW(), s.ScaledH(), x, y);
             const Rgb p = Pix(s.id, x, y);
             u8* dst = &bytes[((static_cast<std::size_t>(kRegionY + at.y)) * image_w + kRegionX + at.x) * 4];
             dst[0] = p.r;

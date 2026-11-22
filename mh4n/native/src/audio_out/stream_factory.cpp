@@ -76,7 +76,7 @@ std::unique_ptr<AudioSink> MakeStream(Runtime& rt) {
 }
 
 MH4N_OPTION("runner", "--audio-latency", "MS",
-            "with --audio stream: the audio stream's target fill, 10 to 200 ms (default 40)");
+            "with --audio stream: the audio stream's target fill, 10 to 200 ms (default 60)");
 MH4N_REGISTER(AudioSinkFactory, "stream", [](Runtime& rt) { return MakeStream(rt); });
 
 }  // namespace

@@ -1,306 +1,294 @@
-#include "gpu/texture/cache.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: cache.h, gpu_texture_test.cpp and the bundled xxHash API.
+
+#include "cache.h"
+#include "decode.h"
+#include "mh4n/log.h"
 
 #include <algorithm>
-#include <string>
+#include <cstring>
+#include <utility>
 
-// XXH3 is vendored (native/third_party/xxhash, BSD-2-Clause) and used only here, as the cache's
-// own content hash; the custom-texture hashes are CityHash64 (hash.h).
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
-#include "gpu/texture/decode.h"
-#include "mh4n/log.h"
-
 namespace mh4n::gpu::texture {
-
 namespace {
 
-constexpr std::size_t kPieces = 16, kPiece = 32;
-// A texture of up to this many bytes is hashed whole by the spot check (and has no slices).
-constexpr std::size_t kWhole = kPieces * kPiece * 2;
+constexpr auto kLog = "GPU.Texture";
+constexpr std::size_t kSpotPieces = 16;
+constexpr std::size_t kSpotPieceBytes = 32;
+constexpr std::size_t kSpotBytes = kSpotPieces * kSpotPieceBytes;
 
-// The spot check's hash: the whole of a small texture, else 16 pieces of 32 bytes spread over it.
+u32 KeyBytes(const CacheKey& key) {
+    if (!IsValidSize(key.width, key.height) || !IsValidFormat(static_cast<u32>(key.format))) {
+        return 0;
+    }
+    return static_cast<u32>(EncodedBytes(key.format, key.width, key.height));
+}
+
+u64 SliceHash(const u8* memory, std::size_t bytes, std::size_t slice) {
+    const auto begin = bytes / kSlices * slice;
+    const auto end = slice + 1 == kSlices ? bytes : begin + bytes / kSlices;
+    return XXH3_64bits(memory + begin, end - begin);
+}
+
 u64 SpotHash(const u8* memory, std::size_t bytes) {
-    if (bytes <= kWhole) {
+    if (bytes <= kSpotBytes) {
         return XXH3_64bits(memory, bytes);
     }
-    u64 h = 0;
-    for (std::size_t i = 0; i < kPieces; ++i) {
-        h = XXH3_64bits_withSeed(memory + i * (bytes - kPiece) / (kPieces - 1), kPiece, h);
+    std::array<u8, kSpotBytes> sample;
+    for (std::size_t piece = 0; piece < kSpotPieces; ++piece) {
+        const auto offset = piece * (bytes - kSpotPieceBytes) / (kSpotPieces - 1);
+        std::memcpy(sample.data() + piece * kSpotPieceBytes, memory + offset, kSpotPieceBytes);
     }
-    return h;
+    return XXH3_64bits(sample.data(), sample.size());
 }
 
-// Slice i of a texture of `bytes` bytes is [SliceBegin(bytes, i), SliceBegin(bytes, i + 1)).
-std::size_t SliceBegin(std::size_t bytes, std::size_t i) {
-    return bytes * i / kSlices;
+void RecordContent(CachedTexture& texture, u64 hash, const std::array<u64, kSlices>& slices,
+                   const u8* memory, std::size_t bytes, u64 frame) {
+    texture.content_hash = hash;
+    texture.slices = slices;
+    texture.used_frame = frame;
+    texture.spot_frame = frame;
+    texture.spot_hash = SpotHash(memory, bytes);
+    texture.maybe_changed = false;
+    texture.roll = 0;
 }
 
-}  // namespace
+} // namespace
 
 u64 ContentHash(const u8* memory, std::size_t bytes, std::array<u64, kSlices>* slices) {
-    if (bytes <= kWhole) {
-        if (slices != nullptr) {
+    if (bytes <= kSpotBytes) {
+        if (slices) {
             slices->fill(0);
         }
         return XXH3_64bits(memory, bytes);
     }
-    std::array<u64, kSlices> h;
-    for (std::size_t i = 0; i < kSlices; ++i) {
-        const std::size_t begin = SliceBegin(bytes, i), end = SliceBegin(bytes, i + 1);
-        h[i] = XXH3_64bits(memory + begin, end - begin);
+    std::array<u64, kSlices> local;
+    auto& hashes = slices ? *slices : local;
+    for (std::size_t slice = 0; slice < kSlices; ++slice) {
+        hashes[slice] = SliceHash(memory, bytes, slice);
     }
-    if (slices != nullptr) {
-        *slices = h;
-    }
-    return XXH3_64bits(h.data(), sizeof h);
-}
-
-bool TextureCache::Decode(CachedTexture& texture, const u8* memory, std::size_t bytes) {
-    pixel_bytes_ -= texture.rgba8.size();
-    const bool ok = DecodeToRgba8(memory, bytes, texture.key.width, texture.key.height, texture.key.format, texture.rgba8);
-    if (!ok) {
-        std::vector<u8>().swap(texture.rgba8);
-    }
-    pixel_bytes_ += texture.rgba8.size();
-    texture.decoded_frame = frame_;
-    return ok;
-}
-
-void TextureCache::SetPixels(CachedTexture& texture, std::vector<u8>&& rgba8) {
-    pixel_bytes_ -= texture.rgba8.size();
-    texture.rgba8 = std::move(rgba8);
-    pixel_bytes_ += texture.rgba8.size();
-    texture.decoded_frame = frame_;
-}
-
-void TextureCache::Forget(std::map<CacheKey, CachedTexture>::iterator it) {
-    pixel_bytes_ -= it->second.rgba8.size();
-    entries_.erase(it);
+    return XXH3_64bits(hashes.data(), sizeof(hashes));
 }
 
 const CachedTexture* TextureCache::Get(const CacheKey& key) {
-    if (!IsValidSize(key.width, key.height) || !IsValidFormat(static_cast<u32>(key.format))) {
-        ++stats_.failures;
-        return nullptr;
-    }
-    const std::size_t bytes = EncodedBytes(key.format, key.width, key.height);
-
-    auto it = entries_.find(key);
-    bool checked_now = false;  // (verify mode: whether a stale hit is one the spot check missed just now)
-    if (it != entries_.end() && !it->second.maybe_changed && config_.spot_check && it->second.spot_frame != frame_) {
-        CachedTexture& texture = it->second;
-        texture.spot_frame = frame_;
-        checked_now = true;
-        const u8* memory = host_.PhysicalPointer(key.paddr, static_cast<u32>(bytes));
-        if (memory != nullptr) {
-            bool changed = SpotHash(memory, bytes) != texture.spot_hash;
-            stats_.spot_bytes += bytes <= kWhole ? bytes : kPieces * kPiece;
-            std::size_t slice = kSlices;  // (none)
-            if (!changed && config_.rolling_check && bytes > kWhole) {
-                slice = texture.roll;
-                texture.roll = static_cast<u32>((slice + 1) % kSlices);
-                const std::size_t begin = SliceBegin(bytes, slice), end = SliceBegin(bytes, slice + 1);
-                stats_.spot_bytes += end - begin;
-                changed = XXH3_64bits(memory + begin, end - begin) != texture.slices[slice];
-            }
-            if (changed) {
-                const bool rolled = slice < kSlices;
-                stats_.rolled += rolled ? 1 : 0;
-                if (++stats_.spotted <= 10) {  // (in a shared log: the first few)
-                    MH4N_LOG(Info, "GPU.Texture", "texture {:08x} {}x{} format {} written with no flush: decoded again ({})",
-                             key.paddr, key.width, key.height, static_cast<u32>(key.format),
-                             rolled ? fmt::format("the rolling check, slice {} of {}", slice + 1, kSlices)
-                                    : std::string("the spot check"));
-                }
-                texture.maybe_changed = true;  // (hashed whole and decoded again below if it differs)
-            }
-        }
-    }
-    if (it != entries_.end() && !it->second.maybe_changed) {
-        if (config_.verify) {
-            const u8* memory = host_.PhysicalPointer(key.paddr, static_cast<u32>(bytes));
-            if (memory != nullptr && ContentHash(memory, bytes) != it->second.content_hash) {
-                if (++stats_.stale <= 40) {
-                    MH4N_LOG(Warning, "GPU.Texture", "stale texture {:08x} {}x{} format {}: its memory changed with no notification ({})",
-                             key.paddr, key.width, key.height, static_cast<u32>(key.format),
-                             !config_.spot_check ? "no spot check"
-                             : checked_now       ? "the spot check missed it at its first use in this frame"
-                                                 : "written after its first use in this frame");
-                }
-                it->second.maybe_changed = true;  // (decoded again below)
-            }
-        }
-    }
-    if (it != entries_.end() && !it->second.maybe_changed) {
-        ++stats_.hits;
-        it->second.used_frame = frame_;
-        return &it->second;
-    }
-
-    const u8* memory = host_.PhysicalPointer(key.paddr, static_cast<u32>(bytes));
-    if (memory == nullptr) {
-        ++stats_.failures;
-        if (it != entries_.end()) {
-            Forget(it); // its memory is gone; do not keep a copy nobody can validate
-        }
-        return nullptr;
-    }
-    std::array<u64, kSlices> slices;
-    const u64 hash = ContentHash(memory, bytes, &slices);
-
+    const auto it = entries_.find(key);
+    const u32 bytes = KeyBytes(key);
     if (it == entries_.end()) {
-        CachedTexture texture;
-        texture.key = key;
-        texture.content_hash = hash;
-        texture.slices = slices;
-        texture.spot_hash = SpotHash(memory, bytes);
-        texture.spot_frame = frame_;
-        texture.used_frame = frame_;
-        if (!Decode(texture, memory, bytes)) {
+        const auto* memory = bytes ? host_.PhysicalPointer(key.paddr, bytes) : nullptr;
+        if (!memory) {
             ++stats_.failures;
             return nullptr;
         }
-        texture.generation = ++next_generation_;
+        std::vector<u8> pixels;
+        if (!DecodeToRgba8(memory, bytes, key.width, key.height, key.format, pixels)) {
+            ++stats_.failures;
+            return nullptr;
+        }
+        std::array<u64, kSlices> slices;
+        const auto hash = ContentHash(memory, bytes, &slices);
+        auto& entry = entries_.try_emplace(key).first->second;
+        entry.key = key;
+        entry.generation = ++next_generation_;
+        entry.decoded_frame = frame_;
+        RecordContent(entry, hash, slices, memory, bytes, frame_);
+        SetPixels(entry, std::move(pixels));
         ++stats_.misses;
-        max_bytes_ = std::max(max_bytes_, static_cast<u32>(bytes));
-        return &entries_.emplace(key, std::move(texture)).first->second;
+        max_bytes_ = std::max(max_bytes_, bytes);
+        return &entry;
     }
 
-    CachedTexture& texture = it->second;
-    ++stats_.rehashes;
-    texture.maybe_changed = false;
-    texture.spot_hash = SpotHash(memory, bytes);
-    texture.spot_frame = frame_;
-    texture.used_frame = frame_;
-    texture.slices = slices;
-    if (hash == texture.content_hash) {
-        ++stats_.unchanged;
-        return &texture;
+    auto& entry = it->second;
+    entry.used_frame = frame_;
+    const bool spot_due = config_.spot_check && entry.spot_frame != frame_;
+    const bool notified = entry.maybe_changed;
+    if (!notified && !spot_due && !config_.verify) {
+        ++stats_.hits;
+        return &entry;
     }
-    if (!Decode(texture, memory, bytes)) {
+
+    const auto* memory = host_.PhysicalPointer(key.paddr, bytes);
+    if (!memory) {
         ++stats_.failures;
         Forget(it);
         return nullptr;
     }
-    texture.content_hash = hash;
-    texture.generation = ++next_generation_;
-    texture.changed_once = true;
-    ++stats_.redecodes;
-    return &texture;
-}
 
-const CachedTexture* TextureCache::Pixels(const CacheKey& key) {
-    auto it = entries_.find(key);
-    if (it == entries_.end()) {
-        return Get(key);
-    }
-    CachedTexture& texture = it->second;
-    if (!texture.rgba8.empty()) {
-        return &texture;
-    }
-    const std::size_t bytes = EncodedBytes(key.format, key.width, key.height);
-    const u8* memory = host_.PhysicalPointer(key.paddr, static_cast<u32>(bytes));
-    if (memory == nullptr) {
-        ++stats_.failures;
-        Forget(it);
-        return nullptr;
-    }
-    std::array<u64, kSlices> slices;
-    const u64 hash = ContentHash(memory, bytes, &slices);
-    if (!Decode(texture, memory, bytes)) {
-        ++stats_.failures;
-        Forget(it);
-        return nullptr;
-    }
-    ++stats_.repixels;
-    if (hash != texture.content_hash) {  // (changed since its last lookup: other contents)
-        texture.content_hash = hash;
-        texture.slices = slices;
-        texture.spot_hash = SpotHash(memory, bytes);
-        texture.generation = ++next_generation_;
-    }
-    return &texture;
-}
-
-void TextureCache::ReleasePixels(const CacheKey& key) {
-    if (!config_.release_pixels) {
-        return;
-    }
-    auto it = entries_.find(key);
-    if (it == entries_.end() || it->second.changed_once) {
-        return;  // (one whose contents change: Sweep, once it settles)
-    }
-    pixel_bytes_ -= it->second.rgba8.size();
-    std::vector<u8>().swap(it->second.rgba8);
-}
-
-size_t TextureCache::Sweep(u64 unused_frames, u64 settled_frames) {
-    size_t gone = 0;
-    for (auto it = entries_.begin(); it != entries_.end();) {
-        CachedTexture& texture = it->second;
-        if (frame_ - texture.used_frame > unused_frames) {
-            Forget(it++);
-            ++gone;
-            continue;
+    bool spotted = false;
+    if (notified) {
+        ++stats_.rehashes;
+    } else if (spot_due) {
+        entry.spot_frame = frame_;
+        stats_.spot_bytes += std::min<std::size_t>(bytes, kSpotBytes);
+        spotted = SpotHash(memory, bytes) != entry.spot_hash;
+        if (!spotted && config_.rolling_check && bytes > kSpotBytes) {
+            const auto slice = entry.roll;
+            entry.roll = (slice + 1) % kSlices;
+            stats_.spot_bytes += bytes / kSlices;
+            spotted = SliceHash(memory, bytes, slice) != entry.slices[slice];
+            stats_.rolled += spotted;
         }
-        if (config_.release_pixels && texture.changed_once && frame_ - texture.decoded_frame > settled_frames) {
-            pixel_bytes_ -= texture.rgba8.size();
-            std::vector<u8>().swap(texture.rgba8);
-            texture.changed_once = false;  // (settled: let go at once again after its next upload)
-        }
-        ++it;
+        stats_.spotted += spotted;
     }
-    stats_.swept += gone;
-    return gone;
-}
 
-bool TextureCache::Insert(const CacheKey& key, u64 hash, std::vector<u8>&& rgba8) {
-    if (rgba8.empty() || entries_.count(key) != 0 || !IsValidSize(key.width, key.height) ||
-        !IsValidFormat(static_cast<u32>(key.format))) {
-        return false;
+    if (notified || spotted || config_.verify) {
+        std::array<u64, kSlices> slices;
+        const auto hash = ContentHash(memory, bytes, &slices);
+        if (hash != entry.content_hash) {
+            if (config_.verify && !notified && !spotted && ++stats_.stale <= 40) {
+                MH4N_LOG(Warning, kLog, "Texture at {:08X} ({}x{}, format {}) changed without a notification",
+                         key.paddr, key.width, key.height, static_cast<u32>(key.format));
+            }
+            if (!Decode(entry, memory, bytes)) {
+                ++stats_.failures;
+                Forget(it);
+                return nullptr;
+            }
+            entry.changed_once = true;
+            entry.generation = ++next_generation_;
+            entry.decoded_frame = frame_;
+            RecordContent(entry, hash, slices, memory, bytes, frame_);
+            ++stats_.redecodes;
+            return &entry;
+        }
+        if (notified) {
+            entry.maybe_changed = false;
+            entry.spot_frame = frame_;
+            ++stats_.unchanged;
+            return &entry;
+        }
     }
-    const std::size_t bytes = EncodedBytes(key.format, key.width, key.height);
-    const u8* memory = host_.PhysicalPointer(key.paddr, static_cast<u32>(bytes));
-    std::array<u64, kSlices> slices;
-    if (memory == nullptr || ContentHash(memory, bytes, &slices) != hash) {
-        return false;  // (its memory changed since the copy: Get decodes what it holds now)
-    }
-    CachedTexture texture;
-    texture.key = key;
-    texture.content_hash = hash;
-    texture.slices = slices;
-    texture.spot_hash = SpotHash(memory, bytes);
-    texture.spot_frame = frame_;
-    texture.used_frame = frame_;
-    texture.generation = ++next_generation_;
-    SetPixels(texture, std::move(rgba8));
-    ++stats_.misses;
-    max_bytes_ = std::max(max_bytes_, static_cast<u32>(bytes));
-    entries_.emplace(key, std::move(texture));
-    return true;
+
+    ++stats_.hits;
+    return &entry;
 }
 
 void TextureCache::Notify(u32 paddr, u32 size) {
+    if (size == 0) {
+        return;
+    }
     if (config_.check_all_on_notify) {
         for (auto& [key, texture] : entries_) {
             texture.maybe_changed = true;
         }
         return;
     }
-    // (the entries are in address order: only those that begin less than the largest texture's bytes before the range can
-    // reach into it; every entry was looked at for each notification before, and each new area adds hundreds)
-    const u64 begin = paddr;
-    const u64 end = begin + size;
-    const u32 from = paddr > max_bytes_ ? paddr - max_bytes_ : 0;
-    for (auto it = entries_.lower_bound(CacheKey{from, Format::RGBA8, 0, 0}); it != entries_.end() && it->first.paddr < end;
-         ++it) {
-        const u64 texture_begin = it->first.paddr;
-        const u64 texture_end = texture_begin + EncodedBytes(it->first.format, it->first.width, it->first.height);
-        if (begin < texture_end && texture_begin < end) {
+
+    const u32 start = paddr > max_bytes_ ? paddr - max_bytes_ : 0;
+    const u64 end = static_cast<u64>(paddr) + size;
+    for (auto it = entries_.lower_bound(CacheKey{start});
+         it != entries_.end() && it->first.paddr < end; ++it) {
+        const auto& key = it->first;
+        if (static_cast<u64>(key.paddr) + KeyBytes(key) > paddr) {
             it->second.maybe_changed = true;
         }
     }
+}
+
+bool TextureCache::Insert(const CacheKey& key, u64 hash, std::vector<u8>&& rgba8) {
+    const u32 bytes = KeyBytes(key);
+    const auto* memory = bytes ? host_.PhysicalPointer(key.paddr, bytes) : nullptr;
+    if (!memory || rgba8.size() != static_cast<std::size_t>(key.width) * key.height * 4) {
+        return false;
+    }
+
+    std::array<u64, kSlices> slices;
+    if (ContentHash(memory, bytes, &slices) != hash) {
+        return false;
+    }
+    auto [it, inserted] = entries_.try_emplace(key);
+    auto& texture = it->second;
+    texture.key = key;
+    if (inserted || texture.content_hash != hash) {
+        texture.generation = ++next_generation_;
+        texture.decoded_frame = frame_;
+        texture.changed_once = !inserted;
+        if (inserted) {
+            ++stats_.misses;
+        } else {
+            ++stats_.redecodes;
+        }
+    }
+    RecordContent(texture, hash, slices, memory, bytes, frame_);
+    SetPixels(texture, std::move(rgba8));
+    max_bytes_ = std::max(max_bytes_, bytes);
+    return true;
+}
+
+const CachedTexture* TextureCache::Pixels(const CacheKey& key) {
+    const auto* cached = Get(key);
+    if (!cached || !cached->rgba8.empty()) {
+        return cached;
+    }
+    const auto it = entries_.find(key);
+    auto& texture = it->second;
+    const auto bytes = KeyBytes(key);
+    const auto* memory = host_.PhysicalPointer(key.paddr, bytes);
+    if (!memory || !Decode(texture, memory, bytes)) {
+        ++stats_.failures;
+        Forget(it);
+        return nullptr;
+    }
+    std::array<u64, kSlices> slices;
+    const auto hash = ContentHash(memory, bytes, &slices);
+    if (hash != texture.content_hash) {
+        texture.changed_once = true;
+        texture.generation = ++next_generation_;
+        texture.decoded_frame = frame_;
+    }
+    RecordContent(texture, hash, slices, memory, bytes, frame_);
+    ++stats_.repixels;
+    return &texture;
+}
+
+void TextureCache::ReleasePixels(const CacheKey& key) {
+    if (config_.release_pixels) {
+        const auto it = entries_.find(key);
+        if (it != entries_.end() && !it->second.changed_once) {
+            SetPixels(it->second, {});
+        }
+    }
+}
+
+std::size_t TextureCache::Sweep(u64 unused_frames, u64 settled_frames) {
+    std::size_t swept = 0;
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        auto current = it++;
+        auto& texture = current->second;
+        if (frame_ - texture.used_frame > unused_frames) {
+            Forget(current);
+            ++swept;
+        } else if (config_.release_pixels && texture.changed_once &&
+                   frame_ - texture.decoded_frame > settled_frames) {
+            SetPixels(texture, {});
+        }
+    }
+    stats_.swept += swept;
+    return swept;
+}
+
+bool TextureCache::Decode(CachedTexture& texture, const u8* memory, std::size_t bytes) {
+    const auto previous_bytes = texture.rgba8.size();
+    const auto& key = texture.key;
+    if (!DecodeToRgba8(memory, bytes, key.width, key.height, key.format, texture.rgba8)) {
+        return false;
+    }
+    pixel_bytes_ = pixel_bytes_ - previous_bytes + texture.rgba8.size();
+    return true;
+}
+
+void TextureCache::SetPixels(CachedTexture& texture, std::vector<u8>&& rgba8) {
+    pixel_bytes_ -= texture.rgba8.size();
+    texture.rgba8 = std::move(rgba8);
+    pixel_bytes_ += texture.rgba8.size();
+}
+
+void TextureCache::Forget(std::map<CacheKey, CachedTexture>::iterator it) {
+    pixel_bytes_ -= it->second.rgba8.size();
+    entries_.erase(it);
 }
 
 } // namespace mh4n::gpu::texture

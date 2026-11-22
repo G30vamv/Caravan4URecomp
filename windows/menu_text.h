@@ -39,7 +39,7 @@ inline std::string Tr(const std::string& en) {
         // values
         {"On", "Sí"}, {"Off", "No"}, {"default", "Predeterminado"}, {"display", "Tu pantalla"}, {"unlimited", "Sin límite"},
         {"auto", "Auto"}, {"Auto", "Auto"}, {"always", "Siempre"}, {"hidden", "Oculta"}, {"popup", "Recuadro"}, {"stacked", "Apiladas"},
-        {"overlay", "Superpuestas"}, {"single", "Una sola"}, {"side", "Lado a lado"}, {"bottom-right", "Abajo a la derecha"},
+        {"overlay", "Superpuestas"}, {"single", "Una sola"}, {"side", "Lado a lado"}, {"large", "Grande y pequeña"}, {"bottom-right", "Abajo a la derecha"},
         {"bottom-left", "Abajo a la izquierda"}, {"top-right", "Arriba a la derecha"}, {"top-left", "Arriba a la izquierda"},
         {"en", "English"}, {"es", "Español"}, {"password", "contraseña"}, {"members", "miembros"},
         // keys of the bottom line
@@ -61,6 +61,7 @@ inline std::string Tr(const std::string& en) {
         {"Enter on a button, then press the key or the controller's button you want for it.", "Enter sobre un botón y luego pulsa la tecla o el botón del mando que quieras para él."},
         {"Now press a key or a controller button.  Esc or the right mouse button cancels, Backspace puts it back.", "Ahora pulsa una tecla o un botón del mando.  Esc o el botón derecho del ratón cancela, Retroceso lo deja como estaba."},
         {"Press a key or a button...", "Pulsa una tecla o un botón..."},
+        {"Skip a cutscene", "Saltar cinemática"}, {"The key and the controller's button that tap the Skip button of a cutscene. They keep doing what they do in the game too.", "La tecla y el botón del mando que pulsan Omitir en una cinemática. Siguen haciendo lo suyo en el juego."},
         {"Up (D-pad)", "Arriba (cruceta)"}, {"Down (D-pad)", "Abajo (cruceta)"}, {"Left (D-pad)", "Izquierda (cruceta)"}, {"Right (D-pad)", "Derecha (cruceta)"},
         {"The key and the controller's button of this 3DS button. A keyboard key you press replaces the key, a controller button or trigger replaces the controller's.", "La tecla y el botón del mando de este botón de la 3DS. Una tecla que pulses cambia la tecla; un botón o gatillo del mando cambia el del mando."},
         {"Put every control back as it was", "Dejar todos los controles como estaban"}, {"Reset", "Restablecer"},

@@ -1,253 +1,232 @@
-// Derived from Azahar src/core/cheats/cheats.cpp and src/core/cheats/cheats.h at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later: both say "GPLv2 or any later version"):
-// CheatEngine's list (AddCheat, RemoveCheat, UpdateCheat), LoadCheatFile and SaveCheatFile (the file's
-// name and folder, every cheat's ToString in turn) and RunCallback (the cheats that are on, in order,
-// under a shared lock). See the header next to this file for the departures.
-// Copyright 2018-2026 Citra Emulator Project / Azahar Emulator Project (cheats.cpp)
-// Copyright 2018-2025 Citra Emulator Project / Azahar Emulator Project (cheats.h)
-#include "cheats/cheat_engine.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: cheat_engine.h, gateway_cheat.h and cheats_test.cpp.
 
-#include <map>
+#include "cheat_engine.h"
 
 #include <algorithm>
-#include <cstdio>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
-
-#include <fmt/format.h>
-
-#include "../common/utf8.h"
-#include "mh4n/log.h"
+#include <iomanip>
+#include <sstream>
+#include <utility>
 
 namespace mh4n::cheats {
-
 namespace {
-constexpr const char* kLog = "Cheats";
 
-std::mutex g_current_mutex;
-std::shared_ptr<CheatEngine> g_current;
-}  // namespace
+std::mutex current_mutex;
+std::mutex save_mutex;
+std::shared_ptr<CheatEngine> current_engine;
+
+bool Fail(std::string* message, const char* reason) {
+    if (message) *message = reason;
+    return false;
+}
+
+void AppendBigEndian(std::vector<u8>& out, u32 value, unsigned width) {
+    while (width > 0) {
+        out.push_back(static_cast<u8>(value >> (8 * --width)));
+    }
+}
+
+} // namespace
 
 std::string CheatFilePath(const std::string& user_folder, u64 title_id) {
-    std::string dir = user_folder;
-    if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') {
-        dir += '/';
-    }
-    return fmt::format("{}cheats/{:016X}.txt", dir, title_id);
+    if (user_folder.empty()) return {};
+    std::ostringstream filename;
+    filename << std::uppercase << std::hex << std::setfill('0') << std::setw(16) << title_id << ".txt";
+    return (std::filesystem::path(user_folder) / "cheats" / filename.str()).generic_string();
 }
 
 CheatEngine::CheatEngine(std::string path) : path_(std::move(path)) {}
 
 std::size_t CheatEngine::Load() {
-    auto gateway_cheats = path_.empty() ? std::vector<std::shared_ptr<GatewayCheat>>{} : GatewayCheat::LoadFile(path_);
-    const std::size_t count = gateway_cheats.size();
-    {
-        std::unique_lock lock{cheats_list_mutex_};
-        cheats_list_ = std::move(gateway_cheats);
-        Changed();
-    }
-    return count;
+    auto next = GatewayCheat::LoadFile(path_);
+    std::unique_lock lock(cheats_list_mutex_);
+    cheats_list_.swap(next);
+    Changed();
+    return cheats_list_.size();
 }
 
 bool CheatEngine::Save(std::string* error) const {
-    if (path_.empty()) {
-        if (error) *error = "no cheats file";
-        return false;
-    }
-    std::vector<std::shared_ptr<GatewayCheat>> cheats;
-    {
-        std::shared_lock lock{cheats_list_mutex_};
-        cheats = cheats_list_;
-    }
+    if (path_.empty()) return Fail(error, "no_path");
+    std::lock_guard save_lock(save_mutex);
     std::string text;
-    for (const auto& cheat : cheats) {
-        text += cheat->ToString();
-    }
-    const std::filesystem::path path = utf8::PathFromUtf8(path_);
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    std::filesystem::path tmp = path;
-    tmp += ".tmp";
     {
-        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
-        file << text;
-        file.close();
-        if (!file) {
-            if (error) *error = "cannot write " + path_;
-            MH4N_LOG(Error, kLog, "cannot write {}", path_);
-            return false;
+        std::shared_lock lock(cheats_list_mutex_);
+        for (const auto& cheat : cheats_list_) text += cheat->ToString();
+    }
+    const auto parent = std::filesystem::path(path_).parent_path();
+    if (!parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        if (ec) return Fail(error, "unwritable");
+    }
+    auto pending = std::filesystem::path(path_);
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    pending += ".tmp." + std::to_string(stamp);
+    std::ofstream file(pending, std::ios::binary | std::ios::trunc);
+    file << text;
+    file.close();
+    std::error_code ec;
+    if (file) {
+        std::filesystem::rename(pending, std::filesystem::path(path_), ec);
+        if (!ec) {
+            if (error) error->clear();
+            return true;
         }
     }
-    std::filesystem::rename(tmp, path, ec);
-    if (ec) {
-        if (error) *error = "cannot write " + path_ + ": " + ec.message();
-        MH4N_LOG(Error, kLog, "cannot write {}: {}", path_, ec.message());
-        return false;
-    }
-    return true;
+    std::filesystem::remove(pending, ec);
+    return Fail(error, "unwritable");
 }
 
 std::vector<CheatInfo> CheatEngine::List() const {
-    std::shared_lock lock{cheats_list_mutex_};
-    std::vector<CheatInfo> out;
-    out.reserve(cheats_list_.size());
-    const u32 begin = code_begin_.load(), end = code_end_.load();
+    std::shared_lock lock(cheats_list_mutex_);
+    std::vector<CheatInfo> entries;
+    entries.reserve(cheats_list_.size());
+    const u32 begin = code_begin_.load(std::memory_order_relaxed);
+    const u32 end = code_end_.load(std::memory_order_relaxed);
     for (const auto& cheat : cheats_list_) {
-        CheatInfo info;
-        info.name = cheat->GetName();
-        info.comments = cheat->GetComments();
-        info.code = cheat->GetCode();
-        info.enabled = cheat->IsEnabled();
-        info.invalid_lines = cheat->InvalidLines();
-        info.touches_code = end > begin && cheat->TouchesCode(begin, end);
-        out.push_back(std::move(info));
+        entries.push_back({cheat->GetName(), cheat->GetComments(), cheat->GetCode(), cheat->IsEnabled(),
+                           cheat->InvalidLines(), cheat->TouchesCode(begin, end)});
     }
-    return out;
+    return entries;
 }
 
 std::size_t CheatEngine::Count() const {
-    std::shared_lock lock{cheats_list_mutex_};
+    std::shared_lock lock(cheats_list_mutex_);
     return cheats_list_.size();
 }
 
 std::size_t CheatEngine::EnabledCount() const {
-    std::shared_lock lock{cheats_list_mutex_};
-    std::size_t n = 0;
-    for (const auto& cheat : cheats_list_) {
-        n += cheat->IsEnabled() ? 1 : 0;
-    }
-    return n;
+    std::shared_lock lock(cheats_list_mutex_);
+    return static_cast<std::size_t>(std::count_if(cheats_list_.begin(), cheats_list_.end(),
+                                                  [](const auto& cheat) { return cheat->IsEnabled(); }));
 }
 
 u64 CheatEngine::Revision() const {
-    return revision_.load();
+    return revision_.load(std::memory_order_relaxed);
 }
 
 bool CheatEngine::SetEnabled(std::size_t index, bool enabled) {
-    std::shared_lock lock{cheats_list_mutex_};
-    if (index >= cheats_list_.size()) {
-        return false;
+    std::unique_lock lock(cheats_list_mutex_);
+    if (index >= cheats_list_.size()) return false;
+    auto& cheat = cheats_list_[index];
+    if (cheat->IsEnabled() != enabled) {
+        cheat->SetEnabled(enabled);
+        Changed();
     }
-    cheats_list_[index]->SetEnabled(enabled);
-    Changed();
     return true;
 }
 
 bool CheatEngine::SetEnabled(const std::string& name, bool enabled) {
-    std::shared_lock lock{cheats_list_mutex_};
-    for (const auto& cheat : cheats_list_) {
-        if (cheat->GetName() == name) {
-            cheat->SetEnabled(enabled);
-            Changed();
-            return true;
-        }
+    std::unique_lock lock(cheats_list_mutex_);
+    const auto found = std::find_if(cheats_list_.begin(), cheats_list_.end(),
+                                    [&](const auto& cheat) { return cheat->GetName() == name; });
+    if (found == cheats_list_.end()) return false;
+    if ((*found)->IsEnabled() != enabled) {
+        (*found)->SetEnabled(enabled);
+        Changed();
     }
-    return false;
+    return true;
 }
 
 bool CheatEngine::Remove(std::size_t index) {
-    std::unique_lock lock{cheats_list_mutex_};
-    if (index >= cheats_list_.size()) {
-        MH4N_LOG(Error, kLog, "Invalid index {}", index);
-        return false;
-    }
+    std::unique_lock lock(cheats_list_mutex_);
+    if (index >= cheats_list_.size()) return false;
     cheats_list_.erase(cheats_list_.begin() + static_cast<std::ptrdiff_t>(index));
     Changed();
     return true;
 }
 
 int CheatEngine::Import(const std::string& path, std::string* error) {
-    std::ifstream probe(utf8::PathFromUtf8(path), std::ios::binary);
-    if (!probe) {
-        if (error) *error = "unreadable";
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        Fail(error, "unreadable");
         return -1;
     }
-    probe.close();
-    auto incoming = GatewayCheat::LoadFile(path);
-    // (lines before any [Name] make a cheat without a name in Azahar: a file that is not a cheats file)
-    incoming.erase(std::remove_if(incoming.begin(), incoming.end(),
-                                  [](const std::shared_ptr<GatewayCheat>& c) { return c->GetName().empty(); }),
-                   incoming.end());
-    if (incoming.empty()) {
-        if (error) *error = "no_cheats";
+    std::ostringstream text;
+    text << input.rdbuf();
+    auto imports = GatewayCheat::Parse(text.str());
+    if (imports.empty()) {
+        Fail(error, "no_cheats");
         return -1;
     }
-    std::unique_lock lock{cheats_list_mutex_};
-    for (auto& cheat : incoming) {
-        cheat->SetEnabled(false);  // (each one is turned on by the player)
-        auto same = std::find_if(cheats_list_.begin(), cheats_list_.end(),
-                                 [&](const std::shared_ptr<GatewayCheat>& c) { return c->GetName() == cheat->GetName(); });
-        if (same != cheats_list_.end()) {
-            *same = cheat;  // UpdateCheat
-        } else {
-            cheats_list_.push_back(cheat);  // AddCheat
-        }
+
+    std::unique_lock lock(cheats_list_mutex_);
+    for (auto& cheat : imports) {
+        const auto found = std::find_if(cheats_list_.begin(), cheats_list_.end(),
+                                        [&](const auto& entry) { return entry->GetName() == cheat->GetName(); });
+        cheat->SetEnabled(false);
+        if (found == cheats_list_.end()) cheats_list_.push_back(std::move(cheat));
+        else *found = std::move(cheat);
     }
     Changed();
-    return static_cast<int>(incoming.size());
-}
-
-bool CheatEngine::CodePatch(std::size_t index, std::vector<u8>* ips, std::string* why) const {
-    const u32 begin = code_begin_.load(), end = code_end_.load();
-    if (end <= begin) {
-        if (why) *why = "no_code_range";
-        return false;
-    }
-    std::map<u32, u8> bytes;
-    {
-        std::shared_lock lock{cheats_list_mutex_};
-        if (index >= cheats_list_.size()) {
-            if (why) *why = "none";
-            return false;
-        }
-        if (!cheats_list_[index]->CodeWrites(begin, end, &bytes, why)) return false;
-    }
-    // IPS: "PATCH", then records of a 3-byte offset, a 2-byte size and the bytes, then "EOF" (an offset of 0x454F46
-    // would read as the end: such a record can't be written)
-    ips->assign({'P', 'A', 'T', 'C', 'H'});
-    for (auto it = bytes.begin(); it != bytes.end();) {
-        const u32 start = it->first;
-        std::vector<u8> run;
-        u32 next = start;
-        while (it != bytes.end() && it->first == next && run.size() < 0xFFFF) {
-            run.push_back(it->second);
-            ++it, ++next;
-        }
-        const u32 off = start - begin;
-        if (off == 0x454F46) {
-            if (why) *why = "ips_eof";
-            return false;
-        }
-        ips->insert(ips->end(), {static_cast<u8>(off >> 16), static_cast<u8>(off >> 8), static_cast<u8>(off),
-                                 static_cast<u8>(run.size() >> 8), static_cast<u8>(run.size())});
-        ips->insert(ips->end(), run.begin(), run.end());
-    }
-    ips->insert(ips->end(), {'E', 'O', 'F'});
-    return true;
+    if (error) error->clear();
+    return static_cast<int>(imports.size());
 }
 
 void CheatEngine::SetCodeRange(u32 begin, u32 end) {
-    code_begin_.store(begin);
-    code_end_.store(end);
+    std::unique_lock lock(cheats_list_mutex_);
+    code_begin_.store(begin, std::memory_order_relaxed);
+    code_end_.store(end, std::memory_order_relaxed);
+    Changed();
+}
+
+bool CheatEngine::CodePatch(std::size_t index, std::vector<u8>* ips, std::string* why) const {
+    std::shared_ptr<const GatewayCheat> cheat;
+    u32 begin;
+    u32 end;
+    {
+        std::shared_lock lock(cheats_list_mutex_);
+        begin = code_begin_.load(std::memory_order_relaxed);
+        end = code_end_.load(std::memory_order_relaxed);
+        if (begin >= end) return Fail(why, "no_code_range");
+        if (index >= cheats_list_.size()) return Fail(why, "none");
+        cheat = cheats_list_[index];
+    }
+    std::map<u32, u8> bytes;
+    if (!cheat->CodeWrites(begin, end, &bytes, why)) return false;
+
+    std::vector<u8> patch{'P', 'A', 'T', 'C', 'H'};
+    for (auto it = bytes.cbegin(); it != bytes.cend();) {
+        const u32 start = it->first;
+        const u32 offset = start - begin;
+        if (offset == 0x454F46) return Fail(why, "ips_eof");
+        if (offset > 0xFFFFFF) return Fail(why, "ips_range");
+
+        auto next = it;
+        u32 length = 0;
+        do {
+            ++length;
+            ++next;
+        } while (next != bytes.cend() && next->first - start == length && length < 0xFFFF);
+        AppendBigEndian(patch, offset, 3);
+        AppendBigEndian(patch, length, 2);
+        for (; it != next; ++it) patch.push_back(it->second);
+    }
+    patch.insert(patch.end(), {'E', 'O', 'F'});
+    if (ips) *ips = std::move(patch);
+    if (why) why->clear();
+    return true;
 }
 
 void CheatEngine::Run(CheatTarget& target) const {
-    std::shared_lock lock{cheats_list_mutex_};
+    std::shared_lock lock(cheats_list_mutex_);
     for (const auto& cheat : cheats_list_) {
-        if (cheat->IsEnabled()) {
-            cheat->Execute(target);
-        }
+        if (cheat->IsEnabled()) cheat->Execute(target);
     }
 }
 
 std::shared_ptr<CheatEngine> Current() {
-    std::lock_guard lock(g_current_mutex);
-    return g_current;
+    std::lock_guard lock(current_mutex);
+    return current_engine;
 }
 
 void SetCurrent(std::shared_ptr<CheatEngine> engine) {
-    std::lock_guard lock(g_current_mutex);
-    g_current = std::move(engine);
+    std::lock_guard lock(current_mutex);
+    current_engine.swap(engine);
 }
 
-}  // namespace mh4n::cheats
+} // namespace mh4n::cheats

@@ -370,13 +370,34 @@ public:
             Toggle(window);
             return;
         }
-        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {  // L3 + R3 together
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+            // MODIFIED: a button DOWN that is already down, or that comes within 40 ms of the same button's last press, is a
+            // duplicate (a pad SDL lists twice, or a chattering Bluetooth report: the menu jumped two rows / tabs a press) and is
+            // dropped. L3 + R3: both pressed within 400 ms of each other (not "both held": a lost UP no longer blocks it).
             const bool down = e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
-            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK) l3_ = down;
-            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) r3_ = down;
-            if (down && l3_ && r3_ && (e.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK || e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK)) {
-                Toggle(window);
-                return;
+            const Uint8 button = e.gbutton.button;
+            const Uint64 ticks = SDL_GetTicks();
+            if (button < 32) {
+                if (down) {
+                    if ((pad_held_ >> button & 1u) != 0 || ticks - pad_last_down_[button] < 40) {
+                        if (pad_dupes_logged_++ < 20) std::fprintf(stderr, "mh4u-win: menu: duplicate pad button %d dropped (pad %d)\n", button, static_cast<int>(e.gbutton.which));
+                        return;
+                    }
+                    pad_held_ |= 1u << button;
+                    pad_last_down_[button] = ticks;
+                } else {
+                    pad_held_ &= ~(1u << button);
+                }
+            }
+            if (button == SDL_GAMEPAD_BUTTON_LEFT_STICK) l3_ = down;
+            if (button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) r3_ = down;
+            if (down && (button == SDL_GAMEPAD_BUTTON_LEFT_STICK || button == SDL_GAMEPAD_BUTTON_RIGHT_STICK)) {
+                const Uint64 other = pad_last_down_[button == SDL_GAMEPAD_BUTTON_LEFT_STICK ? SDL_GAMEPAD_BUTTON_RIGHT_STICK : SDL_GAMEPAD_BUTTON_LEFT_STICK];
+                if (other != 0 && ticks - other < 400) {
+                    pad_last_down_[SDL_GAMEPAD_BUTTON_LEFT_STICK] = pad_last_down_[SDL_GAMEPAD_BUTTON_RIGHT_STICK] = 0;
+                    Toggle(window);
+                    return;
+                }
             }
         }
         if (e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
@@ -653,6 +674,14 @@ private:
             sel = std::clamp(sel, 0, std::max(0, static_cast<int>(items.size()) - 1));
             if (!items.empty()) sel_id_[static_cast<int>(page_)] = items[static_cast<std::size_t>(sel)].id;
         };
+        if (a.hit >= 0 && scroll_ < 0) {
+            // MODIFIED: the mouse marking a row must not move the list: pin the window where it is until a key or the pad moves the mark again
+            float density = 1.0f;
+            const Layout l = CurrentLayout(window, &density);
+            int first = 0, fit = 1;
+            WindowOf(l, view_.rows.size(), view_.sel, &first, &fit, -1);
+            scroll_ = first;
+        }
         if (a.hit >= 0) {  // the mouse: the row under it
             if (a.hit >= static_cast<int>(items.size()) || !items[static_cast<std::size_t>(a.hit)].Selectable()) return;
             sel = a.hit;
@@ -703,6 +732,9 @@ private:
     bool l3_ = false, r3_ = false;  // the stick clicks held: both open and close the menu
     int dpad_move_ = 0, dpad_change_ = 0, stick_move_ = 0, stick_change_ = 0;
     Uint64 next_repeat_ms_ = 0;
+    Uint32 pad_held_ = 0;            // pad buttons seen down (duplicate filter in OnEvent)
+    Uint64 pad_last_down_[32] = {};  // SDL_GetTicks of each button's last accepted press
+    int pad_dupes_logged_ = 0;
     int scroll_ = -1;               // first row shown after a wheel scroll (-1: follow the marked row)
     int drag_ = -1;                 // the slider (an item's index) the mouse holds
     int hover_tab_ = -1, hover_row_ = -1;
@@ -905,7 +937,7 @@ private:
         case Page::Graphics:
             items.push_back(Choice("Fullscreen", "fullscreen", {"on", "off"}));
             items.push_back(Choice("VSync", "vsync", {"on", "off"}));
-            items.push_back(Choice("Screen layout", "mode", {"popup", "stacked", "overlay", "single", "side"}));
+            items.push_back(Choice("Screen layout", "mode", {"popup", "stacked", "overlay", "single", "side", "large"}));
             if (host_.value("mode") == "popup") {  // the top screen full, the touch screen over it when it is wanted
                 items.push_back(Choice("Touch screen shows", "touch_show", {"auto", "always", "hidden"}));
                 items.push_back(Choice("Touch popup size", "popup_size", Numbers(20, 70, 5)));
@@ -976,6 +1008,21 @@ private:
         items.push_back(Info(capture_ >= 0 ? "Now press a key or a controller button.  Esc or the right mouse button cancels, Backspace puts it back."
                                            : "Enter on a button, then press the key or the controller's button you want for it.",
                              capture_ >= 0 ? 1 : 2));
+        {   // MODIFIED: the skip control for cutscenes: a key and a controller button that also keep their own job in the game
+            Item item;
+            item.kind = Item::Action;
+            item.room = true;
+            item.id = "bind_skip";
+            item.label = Tr("Skip a cutscene");
+            item.value = capture_ == kBindCount ? Tr("Press a key or a button...") : host_.value("skip_binding");
+            item.color = capture_ == kBindCount ? 1 : 0;
+            item.act = [this] {
+                capture_ = kBindCount;
+                dirty_ = true;
+            };
+            item.help = Tr("The key and the controller's button that tap the Skip button of a cutscene. They keep doing what they do in the game too.");
+            items.push_back(std::move(item));
+        }
         for (int i = 0; i < kBindCount; ++i) {
             Item item;
             item.kind = Item::Action;
@@ -1133,7 +1180,10 @@ private:
 
     // While a button waits for its key: true when the event was taken.
     bool Capture(const SDL_Event& e) {
-        const std::string name = Lower(kBindNames[capture_]);
+        const bool skip_capture = capture_ == kBindCount;  // MODIFIED: the skip control (skip_key / skip_pad), not a 3DS button's
+        const std::string name = skip_capture ? "skip" : Lower(kBindNames[capture_]);
+        const std::string key_setting = skip_capture ? "skip_key" : "key_" + name;
+        const std::string pad_setting = skip_capture ? "skip_pad" : "pad_" + name;
         const auto finish = [this] {
             capture_ = -1;
             dirty_ = true;
@@ -1143,14 +1193,14 @@ private:
             if (e.key.key == SDLK_ESCAPE) {
                 finish();
             } else if (e.key.key == SDLK_BACKSPACE || e.key.key == SDLK_DELETE) {
-                host_.apply("key_" + name, "");
-                host_.apply("pad_" + name, "");
+                host_.apply(key_setting, "");
+                host_.apply(pad_setting, "");
                 Say("Put back as it was.");
                 finish();
             } else if (e.key.key != SDLK_F1) {
-                const char* key = SDL_GetScancodeName(e.key.scancode);
-                if (key != nullptr && *key != ' ') {
-                    host_.apply("key_" + name, key);
+                const char* key = skip_capture ? SDL_GetKeyName(e.key.key) : SDL_GetScancodeName(e.key.scancode);
+                if (key != nullptr && *key != '\0') {
+                    host_.apply(key_setting, key);
                     Say(Tr("Saved: ") + key);
                 }
                 finish();
@@ -1167,7 +1217,7 @@ private:
             if (e.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE) {
                 finish();  // (the Guide button cancels: a controller alone can get out)
             } else {
-                host_.apply("pad_" + name, "b" + std::to_string(static_cast<int>(e.gbutton.button)));
+                host_.apply(pad_setting, "b" + std::to_string(static_cast<int>(e.gbutton.button)));
                 Say("Saved.");
                 finish();
             }
@@ -1175,7 +1225,7 @@ private:
         }
         if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
             if (std::abs(static_cast<int>(e.gaxis.value)) > 26000) {
-                host_.apply("pad_" + name, "a" + std::to_string(static_cast<int>(e.gaxis.axis)) + (e.gaxis.value > 0 ? "+" : "-"));
+                host_.apply(pad_setting, "a" + std::to_string(static_cast<int>(e.gaxis.axis)) + (e.gaxis.value > 0 ? "+" : "-"));
                 Say("Saved.");
                 finish();
             }

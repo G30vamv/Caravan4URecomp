@@ -12,10 +12,13 @@ o .cci) y su update v1.3.0 (.cia). Lo que se construya con ellos (la carpeta "ga
 Como se usa (no hay nada que instalar)
 --------------------------------------
 1) Descomprime todo el zip en una carpeta donde puedas escribir (por ejemplo, el Escritorio; no en "Archivos de programa").
-2) Abre Caravan4URecomp.exe. La primera vez te pide los dos archivos del juego (base y update v1.3.0) y abre una ventana
-   que muestra el progreso: construye la "libreria" del juego para TU PC. Tarda unos minutos, y la primera vez descarga un
-   compilador (solo la parte necesaria, unos 50 MB; hace falta Internet y se comprueba cada archivo con su SHA-256). Se hace una sola vez.
-3) Despues el juego arranca solo. Las siguientes veces solo abres Caravan4URecomp.exe.
+2) Abre Caravan4URecomp-Launcher.exe. Es el lanzador: ahi cambias todas las opciones (las mismas del menu del juego, F1, y tambien las
+   que solo valen al abrir el juego, como la escala de resolucion o las texturas HD), ves el registro y actualizas el programa con un
+   clic cuando sale una version nueva (baja solo los archivos que cambiaron). Pulsa JUGAR.
+3) La primera vez el juego te pide los dos archivos de tu copia (base y update v1.3.0) y abre una ventana que muestra el progreso:
+   construye la "libreria" del juego para TU PC. Tarda unos minutos, y la primera vez descarga un compilador (solo la parte
+   necesaria, unos 50 MB; hace falta Internet y se comprueba cada archivo con su SHA-256). Se hace una sola vez.
+4) Despues solo abres el lanzador y pulsas JUGAR. Tambien puedes abrir Caravan4URecomp.exe directamente: funciona igual.
 
 Si cambias de update o algo sale mal: ejecuta  Caravan4URecomp.exe --setup  (vuelve a pedir los archivos).
 

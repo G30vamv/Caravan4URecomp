@@ -55,7 +55,7 @@ constexpr std::size_t MsToFrames(double ms) {
 // ---- the stream's numbers ----------------------------------------------------------------------------
 
 inline constexpr std::size_t kRingFrames = 8192;     // about 250 ms; a power of two
-inline constexpr u32 kDefaultLatencyMs = 40;         // the target fill: first guess
+inline constexpr u32 kDefaultLatencyMs = 60;         // MODIFIED: was 40 (the target fill)
 inline constexpr u32 kMinLatencyMs = 10;             // --audio-latency's range: first guess
 inline constexpr u32 kMaxLatencyMs = 200;
 inline constexpr std::size_t kOverflowFrames = 6546; // 200 ms: the fill above which the oldest frames are dropped (first guess)
@@ -104,6 +104,13 @@ public:
     // True from the start, and after an underrun, until the ring has refilled to the target: the
     // consumer should not steer with the DriftController meanwhile.
     bool Priming() const { return priming_flag_.load(std::memory_order_relaxed); }
+    // MODIFIED: the longest time between two Queue calls since the last call of this, in microseconds (a diagnostic: a DSP that
+    // stalls leaves the ring empty).
+    // the last underrun's numbers: frames asked, frames in the ring, and whether the ring was priming (refilling to the target)
+    u64 LastUnderrunWanted() const { return ur_wanted_.load(std::memory_order_relaxed); }
+    u64 LastUnderrunAvailable() const { return ur_available_.load(std::memory_order_relaxed); }
+    bool LastUnderrunWasPriming() const { return ur_priming_.load(std::memory_order_relaxed); }
+    u64 TakeMaxGapUs() { return max_gap_us_.exchange(0, std::memory_order_relaxed); }
 
 private:
     static constexpr std::size_t kMask = kRingFrames - 1;
@@ -117,6 +124,10 @@ private:
     std::atomic<u64> overflows_{0};
     std::atomic<u64> discarded_{0};
     std::atomic<u64> queued_{0};
+    std::atomic<u64> max_gap_us_{0};
+    std::atomic<u64> ur_wanted_{0}, ur_available_{0};
+    std::atomic<bool> ur_priming_{false};
+    std::atomic<s64> last_queue_ns_{0};
 
     // The consumer's side.
     alignas(kCacheLine) std::atomic<u64> read_{0};       // frames ever read or skipped; the consumer stores

@@ -460,18 +460,18 @@ void HandleEapolPacket(const std::shared_ptr<UdsState>& state, const rooms::Wifi
     }
     if (*type == nwm::kEapolStartMagic) {
         if (!Is(s, NetworkStatus::ConnectedAsHost)) {
-            MH4N_LOG(Debug, kLog, "Connection sequence aborted, because connection status is {}",
+            MH4N_LOG(Info, kLog, "Connection sequence aborted, because connection status is {}",
                      s.connection_status.status);
             return;
         }
         const auto node_it = s.node_map.find(packet.transmitter);
         if (node_it == s.node_map.end()) {
-            MH4N_LOG(Debug, kLog,
+            MH4N_LOG(Info, kLog,
                      "Connection sequence aborted, because the AuthenticationFrame of the client wasn't recieved");
             return;
         }
         if (node_it->second.connected) {
-            MH4N_LOG(Debug, kLog, "Connection sequence aborted, because the client is already connected");
+            MH4N_LOG(Info, kLog, "Connection sequence aborted, because the client is already connected");
             return;
         }
         const auto eapol_start = nwm::ParseEapolStartFrame(packet.data);
@@ -486,6 +486,7 @@ void HandleEapolPacket(const std::shared_ptr<UdsState>& state, const rooms::Wifi
                 return;
             }
             node.network_node_id = node_id;
+            MH4N_LOG(Info, kLog, "handshake: EAPoL-Start accepted, node {} given", node_id);
             s.connection_status.node_bitmask |= static_cast<u16>(1 << (node_id - 1));
             s.connection_status.changed_nodes |= static_cast<u16>(1 << (node_id - 1));
             s.connection_status.nodes[node_id - 1] = node.network_node_id;
@@ -533,7 +534,7 @@ void HandleEapolPacket(const std::shared_ptr<UdsState>& state, const rooms::Wifi
         if (logoff->client_mac != MacAddress{}) {
             const std::optional<MacAddress> mine = rooms::Default().RoomMac();
             if (mine && logoff->client_mac != *mine) {
-                MH4N_LOG(Debug, kLog, "Ignored an EAPoL-Logoff for another console");
+                MH4N_LOG(Info, kLog, "Ignored an EAPoL-Logoff for another console");
                 return;
             }
         }
@@ -688,6 +689,9 @@ void HandleAuthenticationFrame(UdsState& s, const rooms::WifiPacket& packet) {
     auth_response.destination = packet.transmitter;
     auth_response.type = rooms::WifiPacket::Type::Authentication;
     s.node_map[packet.transmitter].connected = false;
+    MH4N_LOG(Info, kLog, "handshake: authentication from {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, answering",
+             packet.transmitter[0], packet.transmitter[1], packet.transmitter[2], packet.transmitter[3],
+             packet.transmitter[4], packet.transmitter[5]);
     SendPacket(auth_response);
     SendAssociationResponseFrame(s, packet.transmitter);
 }
@@ -700,7 +704,9 @@ void HandleDeauthenticationFrame(const std::shared_ptr<UdsState>& state, const r
     }
     const auto found = s.node_map.find(packet.transmitter);
     if (found == s.node_map.end()) {
-        MH4N_LOG(Error, kLog, "Got deauthentication frame from unknown node");
+        MH4N_LOG(Error, kLog, "Got deauthentication frame from unknown node {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                 packet.transmitter[0], packet.transmitter[1], packet.transmitter[2], packet.transmitter[3],
+             packet.transmitter[4], packet.transmitter[5]);
         return;
     }
     const Node node = found->second;
@@ -1063,7 +1069,8 @@ private:
                 if (pending == nullptr || pending->Finished() || pending->Cancelled()) {
                     return;
                 }
-                MH4N_LOG(Error, kLog, "timed out when trying to connect to UDS server");
+                MH4N_LOG(Error, kLog, "timed out when trying to connect to UDS server (status {})",
+                         locked->connection_status.status);
                 Reply reply(pending->CommandId(), 1, 0);
                 reply.Push(kErrConnectTimeout);
                 pending->Deliver(std::move(reply));
@@ -1724,6 +1731,53 @@ void StartNwm(Runtime& rt) {
     rt.OnFinish([link] {
         link->Stop();
         rooms::Default().WithdrawConsole();
+    });
+
+    // MODIFIED for the Windows port: a console that leaves the room sends no deauthentication frame, so the host
+    // kept its node (and kept sending to its MAC: "unknown MAC address" in the room's log). Once a second the host
+    // checks its connected nodes against the room's members and drops those that were absent twice in a row.
+    auto absent = std::make_shared<std::map<MacAddress, int>>();
+    auto ticks = std::make_shared<u32>(0);
+    rt.OnFrame([weak, kernel, absent, ticks](u32, u64) {
+        if (++*ticks % 60 != 0) {
+            return;
+        }
+        const rooms::Status status = rooms::Default().GetStatus();
+        if (status.state != rooms::State::Joined && status.state != rooms::State::Moderator) {
+            absent->clear();
+            return;
+        }
+        std::vector<MacAddress> members;
+        for (const rooms::Member& m : status.members) {
+            members.push_back(m.mac);
+        }
+        kernel->Post([weak, absent, members] {
+            const std::shared_ptr<UdsState> locked = weak.lock();
+            if (!locked || !Is(*locked, NetworkStatus::ConnectedAsHost)) {
+                absent->clear();
+                return;
+            }
+            std::vector<MacAddress> gone;
+            for (const auto& [mac, node] : locked->node_map) {
+                if (!node.connected || node.spec) {
+                    continue;
+                }
+                if (std::find(members.begin(), members.end(), mac) != members.end()) {
+                    (*absent)[mac] = 0;
+                } else if (++(*absent)[mac] >= 2) {
+                    gone.push_back(mac);
+                }
+            }
+            for (const MacAddress& mac : gone) {
+                MH4N_LOG(Info, kLog, "handshake: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} left the room: dropping its node",
+                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                rooms::WifiPacket deauth;
+                deauth.transmitter = mac;
+                deauth.type = rooms::WifiPacket::Type::Deauthentication;
+                HandleDeauthenticationFrame(locked, deauth);
+                absent->erase(mac);
+            }
+        });
     });
 
     SystemPages* pages = rt.Pages();

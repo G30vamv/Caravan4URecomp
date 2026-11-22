@@ -1,35 +1,22 @@
-// Derived from Azahar src/core/hle/applets/applet.cpp, src/core/hle/applets/erreula.cpp,
-// src/core/hle/applets/mint.cpp and src/core/hle/applets/mii_selector.cpp at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later: each of them says "GPLv2 or any later
-// version"): Applet::ReceiveParameter, Applet::SendParameter and Applet::CloseApplet, and the
-// Request/Response handshake the Error, Mint and Mii selector applets share (AnswerFramebufferRequest,
-// from their ReceiveParameterImpl).
-// Copyright 2015 Citra Emulator Project (applet.cpp)
-// Copyright 2016-2025 Citra Emulator Project / Azahar Emulator Project (erreula.cpp)
-// Copyright 2016 Citra Emulator Project (mint.cpp, mii_selector.cpp)
-#include "applets/applet.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: applet contracts, apt_test.cpp and applet_frontend_test.cpp black-box fixtures.
+
+#include "applet.h"
 
 #include <cstring>
-#include <string>
 
 #include "mh4n/log.h"
 
 namespace mh4n::apt {
 
-namespace {
-constexpr const char* kLog = "Service.APT";
-}
-
 Result Applet::ReceiveParameter(const MessageParameter& parameter) {
     switch (parameter.signal) {
-    case SignalType::Wakeup: {
-        const Result result = Start(parameter);
-        if (!IsError(result)) {
-            is_active_ = true;
-        }
-        return result;
-    }
+    case SignalType::Wakeup:
+        return Start(parameter);
+    case SignalType::WakeupByExit:
     case SignalType::WakeupByCancel:
+    case SignalType::WakeupByCancelAll:
         return Finalize();
     default:
         return ReceiveParameterImpl(parameter);
@@ -37,64 +24,44 @@ Result Applet::ReceiveParameter(const MessageParameter& parameter) {
 }
 
 void Applet::SendParameter(const MessageParameter& parameter) {
-    if (const std::shared_ptr<AppletHost> host = host_.lock()) {
+    if (auto host = Host()) {
         host->CancelAndSendParameter(parameter);
-    } else {
-        MH4N_LOG(Error, kLog, "called after destructing applet manager");
     }
 }
 
 void Applet::CloseApplet(std::shared_ptr<Object> object, const std::vector<u8>& buffer) {
-    if (const std::shared_ptr<AppletHost> host = host_.lock()) {
-        // The results are ignored, as Azahar's: a parameter that is still waiting makes the first
-        // one fail, and the closing command then stays what it was.
-        host->PrepareToCloseLibraryApplet(true, false, false);
-        host->CloseLibraryApplet(std::move(object), buffer);
-    } else {
-        MH4N_LOG(Error, kLog, "called after destructing applet manager");
-    }
-
-    is_active_ = false;
     is_running_ = false;
+    is_active_ = false;
+    if (auto host = Host()) {
+        host->PrepareToCloseLibraryApplet(true, true, false);
+        host->CloseLibraryApplet(std::move(object), buffer);
+    }
 }
 
 Result Applet::AnswerFramebufferRequest(ServiceContext& context, const MessageParameter& parameter,
-                                        std::shared_ptr<SharedMemory>& memory, const char* name) {
+                                       std::shared_ptr<SharedMemory>& memory, const char* name) {
+    constexpr const char* kLog = "Service.APT";
     if (parameter.signal != SignalType::Request) {
-        MH4N_LOG(Error, kLog, "unsupported signal {:08X}", static_cast<u32>(parameter.signal));
-        // TODO(Subv): Find the right error code (Azahar's too)
+        MH4N_LOG(Warning, kLog, "{}: unsupported signal {:08X}", name,
+                 static_cast<u32>(parameter.signal));
         return kResultUnknown;
     }
-
-    // The message contains a buffer with the size of the framebuffer shared memory.
     if (parameter.buffer.size() != sizeof(CaptureBufferInfo)) {
-        // Azahar asserts.
-        MH4N_LOG(Error, kLog, "the Request parameter of {} has {} bytes, not {}", name,
-                 parameter.buffer.size(), sizeof(CaptureBufferInfo));
+        MH4N_LOG(Warning, kLog,
+                 "{}: expected a Request parameter of {} bytes, but the Request parameter has {} bytes",
+                 name, sizeof(CaptureBufferInfo), parameter.buffer.size());
         return kResultUnknown;
     }
-    CaptureBufferInfo capture_info;
-    std::memcpy(&capture_info, parameter.buffer.data(), sizeof(capture_info));
 
-    // Create the SharedMemory that will hold the framebuffer data: a block of the system region.
-    memory = context.GetKernel().NewSharedMemoryForApplet(
-        0, capture_info.size, MemoryPermission::ReadWrite, MemoryPermission::ReadWrite,
-        std::string(name) + " Memory");
-    if (!memory) {
-        // Azahar: "Not enough space in region to allocate shared memory!" (an assertion).
-        MH4N_LOG(Error, kLog, "cannot make the framebuffer shared memory of {} bytes for {}",
-                 capture_info.size, name);
+    CaptureBufferInfo capture{};
+    std::memcpy(&capture, parameter.buffer.data(), sizeof(capture));
+    const Result result = context.GetKernel().NewSharedMemory(
+        &memory, nullptr, capture.size, MemoryPermission::ReadWrite,
+        MemoryPermission::ReadWrite, 0, FcramRegion::Base, name);
+    if (!IsError(result)) {
+        SendParameter({id_, parameter.sender_id, SignalType::Response, memory, {}});
     }
-
-    // Send the response message with the newly created SharedMemory.
-    SendParameter({
-        .sender_id = id_,
-        .destination_id = parent_,
-        .signal = SignalType::Response,
-        .object = memory,
-        .buffer = {},
-    });
-    return kResultSuccess;
+    return result;
 }
 
 }  // namespace mh4n::apt

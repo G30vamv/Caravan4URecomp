@@ -1,298 +1,178 @@
-// Derived from Azahar src/core/file_sys/patch.cpp and src/core/file_sys/patch.h at
-// 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-2.0-or-later: both say "GPLv2 or any later version").
-// Copyright 2019-2026 Citra Emulator Project / Azahar Emulator Project (patch.cpp, patch.h)
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: patch.h, layeredfs_test.cpp and the IPS/BPS file formats.
+
 #include "patch.h"
 
-#include <array>
-#include <cstddef>
-#include <cstring>
-#include <optional>
-#include <string_view>
-#include <type_traits>
+#include <algorithm>
+#include <limits>
 
 #include "mh4n/crc32.h"
-#include "mh4n/log.h"
 
 namespace mh4n::layeredfs::patch {
-
 namespace {
-constexpr const char* kLog = "Service.FS";
+
+u32 ReadBig(const u8* data, unsigned count) {
+    u32 value = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        value = (value << 8) | data[i];
+    }
+    return value;
 }
 
+u32 ReadLittle32(const u8* bytes) {
+    return u32{bytes[0]} | (u32{bytes[1]} << 8) | (u32{bytes[2]} << 16) | (u32{bytes[3]} << 24);
+}
+
+bool ReadNumber(const std::vector<u8>& patch, std::size_t end, std::size_t& cursor, u64& value) {
+    constexpr u64 max = std::numeric_limits<u64>::max();
+    value = 0;
+    u64 factor = 1;
+    while (cursor < end) {
+        const u8 byte = patch[cursor++];
+        const u64 digit = byte & 0x7F;
+        if (digit > (max - value) / factor) {
+            return false;
+        }
+        value += digit * factor;
+        if (byte & 0x80) {
+            return true;
+        }
+        if (factor > max / 128 || factor * 128 > max - value) {
+            return false;
+        }
+        factor *= 128;
+        value += factor;
+    }
+    return false;
+}
+
+bool MoveOffset(u64 encoded, u64& offset) {
+    const u64 distance = encoded >> 1;
+    if (encoded & 1) {
+        if (distance > offset) {
+            return false;
+        }
+        offset -= distance;
+    } else {
+        if (distance > std::numeric_limits<u64>::max() - offset) {
+            return false;
+        }
+        offset += distance;
+    }
+    return true;
+}
+
+}  // namespace
+
 Status ApplyIps(const std::vector<u8>& ips, std::vector<u8>& buffer) {
-    // Azahar builds the header string from 5 bytes without looking at the size.
-    if (ips.size() < 5 || std::memcmp(ips.data(), "PATCH", 5) != 0) {
-        MH4N_LOG(Info, kLog, "Attempted to load invalid IPS");
+    if (ips.size() < 5 || !std::equal(ips.begin(), ips.begin() + 5, "PATCH")) {
         return Status::ErrorPatches;
     }
-
-    std::size_t cursor = 5;
-    const std::size_t patch_length = ips.size() - 3;
-
-    while (cursor < patch_length) {
-        if (std::memcmp(&ips[cursor], "EOF", 3) == 0) {
+    std::size_t pos = 5;
+    while (ips.size() - pos > 3) {
+        const u32 offset = ReadBig(ips.data() + pos, 3);
+        if (offset == 0x454F46) {
             break;
         }
-
-        // A record needs its 5-byte header (Azahar reads whatever follows the patch).
-        if (cursor + 5 > ips.size()) {
+        if (ips.size() - pos < 5 || offset > buffer.size()) {
             return Status::ErrorPatches;
         }
-        const std::size_t offset = static_cast<std::size_t>(ips[cursor]) << 16 |
-                                   static_cast<std::size_t>(ips[cursor + 1]) << 8 | ips[cursor + 2];
-        std::size_t length = static_cast<std::size_t>(ips[cursor + 3]) << 8 | ips[cursor + 4];
 
-        // check for an rle record
-        if (length == 0) {
-            if (cursor + 8 > ips.size()) {
+        const u32 length = ReadBig(ips.data() + pos + 3, 2);
+        pos += 5;
+        if (length != 0) {
+            if (length > ips.size() - pos || length > buffer.size() - offset) {
                 return Status::ErrorPatches;
             }
-            length = static_cast<std::size_t>(ips[cursor + 5]) << 8 | ips[cursor + 6];
-
-            if (buffer.size() < offset + length) {
+            std::copy_n(ips.data() + pos, length, buffer.begin() + offset);
+            pos += length;
+        } else {
+            if (ips.size() - pos < 3) {
                 return Status::ErrorPatches;
             }
-
-            for (std::size_t i = 0; i < length; ++i) {
-                buffer[offset + i] = ips[cursor + 7];
+            const u32 repeat = ReadBig(ips.data() + pos, 2);
+            if (repeat > buffer.size() - offset) {
+                return Status::ErrorPatches;
             }
-
-            cursor += 8;
-            continue;
+            std::fill_n(buffer.begin() + offset, repeat, ips[pos + 2]);
+            pos += 3;
         }
-
-        if (buffer.size() < offset + length) {
-            return Status::ErrorPatches;
-        }
-        if (cursor + 5 + length > ips.size()) {
-            return Status::ErrorPatches;  // the record's bytes run past the patch
-        }
-        std::memcpy(&buffer[offset], &ips[cursor + 5], length);
-        cursor += length + 5;
     }
     return Status::Success;
 }
 
-namespace {
-
-// The BPS format uses variable length encoding for all integers.
-// Realistically uint32s are more than enough for code patching.
-using Number = u32;
-
-constexpr std::size_t kMagicSize = 4;
-constexpr std::size_t kFooterSize = 12;
-
-// Utility class to make keeping track of offsets and bound checks less error prone.
-template <typename T>
-class Stream {
-public:
-    Stream(T* ptr, std::size_t size) : ptr_{ptr}, size_{size} {}
-
-    bool Read(void* buffer, std::size_t length) {
-        if (offset_ + length > size_) {
-            return false;
-        }
-        std::memcpy(buffer, ptr_ + offset_, length);
-        offset_ += length;
-        return true;
+Status ApplyBps(const std::vector<u8>& bps, std::vector<u8>& buffer) {
+    if (bps.size() < 19 || !std::equal(bps.begin(), bps.begin() + 4, "BPS1")) {
+        return Status::ErrorPatches;
+    }
+    const std::size_t end = bps.size() - 12;
+    std::size_t cursor = 4;
+    const auto number = [&](u64& value) { return ReadNumber(bps, end, cursor, value); };
+    u64 source_size = 0, target_size = 0, metadata = 0;
+    if (!number(source_size) || !number(target_size) || !number(metadata) || metadata != 0 ||
+        source_size > buffer.size() || target_size > buffer.max_size()) {
+        return Status::ErrorPatches;
+    }
+    if (Crc32(buffer.data(), static_cast<std::size_t>(source_size)) != ReadLittle32(bps.data() + end)) {
+        return Status::ErrorPatchesInvalidTitle;
     }
 
-    template <typename OtherType>
-    bool CopyFrom(Stream<OtherType>& other, std::size_t length) {
-        if (offset_ + length > size_) {
-            return false;
-        }
-        if (!other.Read(ptr_ + offset_, length)) {
-            return false;
-        }
-        offset_ += length;
-        return true;
-    }
-
-    template <typename ValueType>
-    std::optional<ValueType> Read() {
-        static_assert(std::is_trivial_v<ValueType>);
-        ValueType val{};
-        if (!Read(&val, sizeof(val))) {
-            return std::nullopt;
-        }
-        return val;
-    }
-
-    Number ReadNumber() {
-        Number data = 0, shift = 1;
-        std::optional<u8> x;
-        while ((x = Read<u8>())) {
-            data += (*x & 0x7f) * shift;
-            if (*x & 0x80) {
-                break;
-            }
-            shift <<= 7;
-            data += shift;
-        }
-        return data;
-    }
-
-    T* data() const { return ptr_; }
-    std::size_t size() const { return size_; }
-    std::size_t Tell() const { return offset_; }
-
-    bool Seek(std::size_t offset) {
-        if (offset > size_) {
-            return false;
-        }
-        offset_ = offset;
-        return true;
-    }
-
-private:
-    T* ptr_ = nullptr;
-    std::size_t size_ = 0;
-    std::size_t offset_ = 0;
-};
-
-class PatchApplier {
-public:
-    PatchApplier(Stream<const u8> source, Stream<u8> target, Stream<const u8> patch)
-        : source_{source}, target_{target}, patch_{patch} {}
-
-    Status Apply() {
-        // Azahar dereferences the empty optional of a patch shorter than this.
-        if (patch_.size() < kMagicSize + kFooterSize) {
-            MH4N_LOG(Error, kLog, "Invalid BPS magic");
+    std::vector<u8> target;
+    u64 source_offset = 0, target_offset = 0;
+    while (cursor < end) {
+        u64 command = 0;
+        if (!number(command)) {
             return Status::ErrorPatches;
         }
-        const auto magic = *patch_.Read<std::array<char, kMagicSize>>();
-        if (std::string_view(magic.data(), magic.size()) != "BPS1") {
-            MH4N_LOG(Error, kLog, "Invalid BPS magic");
+        const u64 length = (command >> 2) + 1;
+        const std::size_t written = target.size();
+        if (length > target_size - written) {
             return Status::ErrorPatches;
         }
-
-        const Number source_size = patch_.ReadNumber();
-        const Number target_size = patch_.ReadNumber();
-        const Number metadata_size = patch_.ReadNumber();
-        if (source_size > source_.size() || target_size > target_.size() || metadata_size != 0) {
-            MH4N_LOG(Error, kLog, "Invalid sizes");
-            return Status::ErrorPatches;
-        }
-
-        const std::size_t command_start_offset = patch_.Tell();
-        const std::size_t command_end_offset = patch_.size() - kFooterSize;
-        patch_.Seek(command_end_offset);
-        const u32 source_crc32 = *patch_.Read<u32>();
-        const u32 target_crc32 = *patch_.Read<u32>();
-        patch_.Seek(command_start_offset);
-
-        if (Crc32(source_.data(), source_size) != source_crc32) {
-            MH4N_LOG(Error, kLog, "Unexpected source hash");
-            return Status::ErrorPatchesInvalidTitle;
-        }
-
-        // Process all patch commands.
-        std::memset(target_.data(), 0, target_.size());
-        while (patch_.Tell() < command_end_offset) {
-            if (!HandleCommand()) {
+        switch (command & 3) {
+        case 0:
+            if (written > source_size || length > source_size - written) {
                 return Status::ErrorPatches;
             }
-        }
-
-        if (Crc32(target_.data(), target_size) != target_crc32) {
-            MH4N_LOG(Error, kLog, "Unexpected target hash");
-            return Status::ErrorPatches;
-        }
-
-        return Status::Success;
-    }
-
-private:
-    bool HandleCommand() {
-        const std::size_t offset = patch_.Tell();
-        const Number data = patch_.ReadNumber();
-        const Number command = data & 3;
-        const Number length = (data >> 2) + 1;
-
-        const bool ok = [&] {
-            switch (command) {
-            case 0:
-                return SourceRead(length);
-            case 1:
-                return TargetRead(length);
-            case 2:
-                return SourceCopy(length);
-            case 3:
-                return TargetCopy(length);
-            default:
-                return false;
+            target.insert(target.end(), buffer.data() + written, buffer.data() + written + length);
+            break;
+        case 1:
+            if (length > end - cursor) {
+                return Status::ErrorPatches;
             }
-        }();
-        if (!ok) {
-            MH4N_LOG(Error, kLog, "Failed to process command {} at 0x{:x}", command, offset);
+            target.insert(target.end(), bps.data() + cursor, bps.data() + cursor + length);
+            cursor += static_cast<std::size_t>(length);
+            break;
+        case 2: {
+            u64 delta = 0;
+            if (!number(delta) || !MoveOffset(delta, source_offset) || source_offset > source_size ||
+                length > source_size - source_offset) {
+                return Status::ErrorPatches;
+            }
+            target.insert(target.end(), buffer.data() + source_offset, buffer.data() + source_offset + length);
+            source_offset += length;
+            break;
         }
-        return ok;
+        case 3: {
+            u64 delta = 0;
+            if (!number(delta) || !MoveOffset(delta, target_offset) || target_offset >= written) {
+                return Status::ErrorPatches;
+            }
+            target.resize(written + static_cast<std::size_t>(length));
+            for (std::size_t i = written; i < target.size(); ++i) {
+                target[i] = target[static_cast<std::size_t>(target_offset++)];
+            }
+            break;
+        }
+        }
     }
-
-    bool SourceRead(Number length) { return source_.Seek(target_.Tell()) && target_.CopyFrom(source_, length); }
-
-    bool TargetRead(Number length) { return target_.CopyFrom(patch_, length); }
-
-    bool SourceCopy(Number length) {
-        const Number data = patch_.ReadNumber();
-        source_relative_offset_ += (data & 1 ? -1 : +1) * static_cast<int>(data >> 1);
-        if (!source_.Seek(source_relative_offset_) || !target_.CopyFrom(source_, length)) {
-            return false;
-        }
-        source_relative_offset_ += length;
-        return true;
+    if (target.size() != target_size || Crc32(target.data(), target.size()) != ReadLittle32(bps.data() + end + 4)) {
+        return Status::ErrorPatches;
     }
-
-    bool TargetCopy(Number length) {
-        const Number data = patch_.ReadNumber();
-        target_relative_offset_ += (data & 1 ? -1 : +1) * static_cast<int>(data >> 1);
-        if (target_.Tell() + length > target_.size()) {
-            return false;
-        }
-        // Azahar's check alone lets an offset that wrapped below zero through.
-        if (target_relative_offset_ >= target_.size() || target_relative_offset_ + length > target_.size()) {
-            return false;
-        }
-        // Byte by byte copy.
-        for (std::size_t i = 0; i < length; ++i) {
-            target_.data()[target_.Tell() + i] = target_.data()[target_relative_offset_++];
-        }
-        target_.Seek(target_.Tell() + length);
-        return true;
-    }
-
-    std::size_t source_relative_offset_ = 0;
-    std::size_t target_relative_offset_ = 0;
-    Stream<const u8> source_;
-    Stream<u8> target_;
-    Stream<const u8> patch_;
-};
-
-}  // namespace
-
-Status ApplyBps(const std::vector<u8>& bps, std::vector<u8>& buffer) {
-    Stream<const u8> patch_stream{bps.data(), bps.size()};
-
-    // Move the offset past the file format marker (i.e. "BPS1")
-    patch_stream.Seek(kMagicSize);
-
-    const Number source_size = patch_stream.ReadNumber();
-    const Number target_size = patch_stream.ReadNumber();
-
-    if (target_size > source_size) {
-        MH4N_LOG(Info, kLog, "Resizing target to {}", target_size);
-        buffer.resize(target_size);
-    }
-
-    patch_stream.Seek(0);
-
-    const std::vector<u8> source = buffer;
-    Stream<const u8> source_stream{source.data(), source.size()};
-    Stream<u8> target_stream{buffer.data(), buffer.size()};
-    PatchApplier applier{source_stream, target_stream, patch_stream};
-    return applier.Apply();
+    target.resize(std::max(target.size(), buffer.size()), 0);
+    buffer.swap(target);
+    return Status::Success;
 }
 
 }  // namespace mh4n::layeredfs::patch

@@ -1,89 +1,89 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: tool.h and layeredfs_test.cpp.
+
 #include "tool.h"
-
-#include <cerrno>
-#include <cstdlib>
-#include <fstream>
-#include <ostream>
-
-#include "../common/utf8.h"
 #include "layeredfs.h"
 
-namespace mh4n::layeredfs {
+#include "../common/utf8.h"
 
+#include <charconv>
+#include <fstream>
+#include <optional>
+#include <string_view>
+
+namespace mh4n::layeredfs {
 namespace {
 
-bool ParseNumber(const std::string& text, u64* value) {
-    if (text.empty() || text[0] == '-') {
-        return false;
+std::optional<u64> ReadNumber(std::string_view text) {
+    int base = 10;
+    if (text.starts_with("0x") || text.starts_with("0X")) {
+        text.remove_prefix(2);
+        base = 16;
     }
-    char* end = nullptr;
-    errno = 0;
-    const unsigned long long parsed = std::strtoull(text.c_str(), &end, 0);
-    if (errno != 0 || end == text.c_str() || *end != '\0') {
-        return false;
+    u64 value = 0;
+    const auto end = text.data() + text.size();
+    const auto result = std::from_chars(text.data(), end, value, base);
+    if (result.ec != std::errc{} || result.ptr != end) {
+        return std::nullopt;
     }
-    *value = parsed;
-    return true;
+    return value;
 }
 
 }  // namespace
 
 int RunTool(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
-    (void)out;
     if (args.size() != 5) {
         err << "usage: mh4n_layeredfs BASE OFFSET SIZE MODS_DIR OUT\n";
         return 1;
     }
-    u64 offset = 0, size = 0;
-    if (!ParseNumber(args[1], &offset) || !ParseNumber(args[2], &size)) {
-        err << "mh4n_layeredfs: OFFSET and SIZE are numbers (decimal or 0x...)\n";
+    const auto offset = ReadNumber(args[1]);
+    const auto size = ReadNumber(args[2]);
+    if (!offset || !size) {
+        err << "OFFSET and SIZE must be unsigned decimal or hexadecimal numbers\n";
         return 1;
     }
-
     std::string error;
     auto base = fs::PositionedFile::Open(args[0], &error);
-    if (base == nullptr) {
-        err << "mh4n_layeredfs: " << error << "\n";
+    if (!base) {
+        err << error << '\n';
         return 2;
     }
-    if (offset > base->Size()) {
-        err << "mh4n_layeredfs: OFFSET is past the end of BASE\n";
-        return 2;
-    }
-    if (size == 0) {
-        size = base->Size() - offset;
-    }
-
-    const std::string romfs_dir = utf8::PathToUtf8(utf8::PathFromUtf8(args[3]) / "romfs");
-    const std::string romfs_ext = utf8::PathToUtf8(utf8::PathFromUtf8(args[3]) / "romfs_ext");
-    auto image = Build(base, offset, size, romfs_dir, romfs_ext, &error);
-    if (image == nullptr) {
-        err << "mh4n_layeredfs: " << error << "\n";
+    if (*offset > base->Size()) {
+        err << "OFFSET is past the end of BASE\n";
         return 2;
     }
 
-    std::ofstream file(utf8::PathFromUtf8(args[4]), std::ios::binary | std::ios::trunc);
-    if (!file) {
-        err << "mh4n_layeredfs: cannot write " << args[4] << "\n";
+    const auto mods = utf8::PathFromUtf8(args[3]);
+    const u64 length = *size == 0 ? base->Size() - *offset : *size;
+    auto image = Build(std::move(base), *offset, length, utf8::PathToUtf8(mods / "romfs"),
+                       utf8::PathToUtf8(mods / "romfs_ext"), &error);
+    if (!image) {
+        err << error << '\n';
         return 2;
     }
-    std::vector<u8> chunk(1 << 20);
-    const u64 total = image->GetSize();
-    for (u64 at = 0; at < total;) {
-        std::size_t got = 0;
-        image->Read(at, chunk.size(), chunk.data(), &got);
-        if (got == 0) {
-            err << "mh4n_layeredfs: the image ended early at " << at << "\n";
+
+    std::ofstream output(utf8::PathFromUtf8(args[4]), std::ios::binary);
+    if (!output) {
+        err << "cannot open " << args[4] << '\n';
+        return 2;
+    }
+    std::vector<u8> buffer(64 * 1024);
+    for (u64 pos = 0; pos < image->GetSize();) {
+        std::size_t read = 0;
+        if (!IsSuccess(image->Read(pos, buffer.size(), buffer.data(), &read)) || read == 0 ||
+            !output.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(read))) {
+            err << "cannot write " << args[4] << '\n';
             return 2;
         }
-        file.write(reinterpret_cast<const char*>(chunk.data()), static_cast<std::streamsize>(got));
-        at += got;
+        pos += read;
     }
-    file.flush();
-    if (!file) {
-        err << "mh4n_layeredfs: writing " << args[4] << " failed\n";
+    output.close();
+    if (!output) {
+        err << "cannot finish writing " << args[4] << '\n';
         return 2;
     }
+    out << "Wrote " << image->GetSize() << " bytes\n";
     return 0;
 }
 

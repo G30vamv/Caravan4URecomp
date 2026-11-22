@@ -79,6 +79,8 @@ void ClearCameraTurn();
 /// own buttons (kick, target, skip, skip_end): the game reads ZL and ZR only from the Circle Pad Pro, with its option
 /// on, and without it these are how the port's buttons see them. The game's own use of them is unchanged. Any thread.
 void SetHostTriggers(bool zl, bool zr);
+unsigned long long GameFrameCount();  // MODIFIED: frames the game's own loop has run (the limiter's count), for the fps counter
+void SetHostSkip(bool down);  // MODIFIED: the shell's skip key is down / up
 
 /// The lock-on (the app's long press on L, a controller's right stick click): while on, the quest
 /// camera turns toward the Target Cam's monster, else the nearest large one in the hunter's area,

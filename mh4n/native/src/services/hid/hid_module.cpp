@@ -1,203 +1,116 @@
-// Derived from Azahar src/core/hle/service/hid/hid.cpp at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6
-// (GPL-2.0-or-later: it says "GPLv2 or any later version"): the updates of the pad, touch,
-// accelerometer and gyroscope blocks and GetStickDirectionState (see the header next to this file).
-// Copyright 2015-2026 Citra Emulator Project / Azahar Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: HID contract headers, hid_test.cpp and 3dbrew HID Shared Memory.
+
 #include "hid_module.h"
 
 #include <cmath>
 #include <cstring>
+#include <iterator>
 
 namespace mh4n::hid {
-
 namespace {
 
-// Reads the structures out of the memory and writes them back, so that nothing here depends on the
-// alignment of the pointer (the memory is the guest's or a host block).
-SharedMem Load(const u8* memory) {
-    SharedMem mem;
-    std::memcpy(&mem, memory, sizeof(mem));
-    return mem;
+template <typename Block, typename Entry>
+void Append(Block& block, u32& index, const Entry& entry, u64 tick) {
+    block.entries[index] = entry;
+    if (index == 0) {
+        block.index_reset_ticks_previous = block.index_reset_ticks;
+        block.index_reset_ticks = static_cast<s64>(tick);
+    }
+    block.index = index;
+    index = (index + 1) % static_cast<u32>(std::size(block.entries));
 }
-void Store(u8* memory, const SharedMem& mem) {
-    std::memcpy(memory, &mem, sizeof(mem));
+
+template <typename Block>
+Block ReadBlock(const u8* memory) {
+    Block block;
+    std::memcpy(&block, memory, sizeof block);
+    return block;
+}
+
+s16 AverageAxis(s16 sample, std::array<s16, kCirclePadAveraging - 1>& history) {
+    const int average = (sample + history[0] + history[1]) / kCirclePadAveraging;
+    history[1] = history[0];
+    history[0] = sample;
+    return static_cast<s16>(average);
 }
 
 }  // namespace
 
 GyroscopeCalibrateParam DefaultGyroscopeCalibrateParam() {
-    const s16 param_unit = 6700;  // "an approximate value taken from hw"
-    GyroscopeCalibrateParam param{};
-    for (auto& axis : param.values) {
-        axis[0] = 0;
-        axis[1] = param_unit;
-        axis[2] = static_cast<s16>(-param_unit);
-    }
-    return param;
+    return {{{0, 6700, -6700}, {0, 6700, -6700}, {0, 6700, -6700}}};
 }
 
 DirectionState GetStickDirectionState(s16 circle_pad_x, s16 circle_pad_y) {
-    // 30 degree and 60 degree are angular thresholds for directions
-    constexpr float TAN30 = 0.577350269f;
-    constexpr float TAN60 = 1 / TAN30;
-    // a circle pad radius greater than 40 will trigger circle pad direction
-    constexpr int CIRCLE_PAD_THRESHOLD_SQUARE = 40 * 40;
-    DirectionState state{false, false, false, false};
-
-    if (circle_pad_x * circle_pad_x + circle_pad_y * circle_pad_y > CIRCLE_PAD_THRESHOLD_SQUARE) {
-        float t = std::abs(static_cast<float>(circle_pad_y) / circle_pad_x);
-
-        if (circle_pad_x != 0 && t < TAN60) {
-            if (circle_pad_x > 0)
-                state.right = true;
-            else
-                state.left = true;
-        }
-
-        if (circle_pad_x == 0 || t > TAN30) {
-            if (circle_pad_y > 0)
-                state.up = true;
-            else
-                state.down = true;
-        }
+    const s64 x = circle_pad_x;
+    const s64 y = circle_pad_y;
+    const s64 x_squared = x * x;
+    const s64 y_squared = y * y;
+    if (x_squared + y_squared <= 40 * 40) {
+        return {};
     }
-
-    return state;
+    // The squared tangent at 30 degrees is 1/3. At 60 degrees it is 3.
+    const bool vertical = 3 * y_squared > x_squared;
+    const bool horizontal = 3 * x_squared > y_squared;
+    return {vertical && y > 0, vertical && y < 0, horizontal && x < 0, horizontal && x > 0};
 }
 
 s16 CirclePadRaw(float stick) {
-    return static_cast<s16>(std::roundf(stick * kMaxCirclePadPosition));
+    return static_cast<s16>(std::lround(stick * kMaxCirclePadPosition));
 }
 
 void Module::UpdatePad(u8* memory, const InputState& input, u64 tick) {
-    if (memory == nullptr) {
+    if (!memory) {
         return;
     }
-    SharedMem mem = Load(memory);
 
-    // Azahar assigns each button from its device; a bit nobody drives stays clear.
-    state_ = input.buttons & kPadButtonMask;
+    auto pad = ReadBlock<decltype(SharedMem::pad)>(memory + kPadOffset);
+    const s16 x = AverageAxis(input.circle_x, circle_old_x_);
+    const s16 y = AverageAxis(input.circle_y, circle_old_y_);
+    const auto directions = GetStickDirectionState(x, y);
+    const u32 buttons = (input.buttons & kPadButtonMask) |
+                        (directions.up ? kPadCircleUp : 0) |
+                        (directions.down ? kPadCircleDown : 0) |
+                        (directions.left ? kPadCircleLeft : 0) |
+                        (directions.right ? kPadCircleRight : 0);
+    Append(pad, next_pad_index_, PadDataEntry{buttons, buttons & ~state_, state_ & ~buttons, x, y}, tick);
+    state_ = buttons;
+    pad.current_state = buttons;
+    pad.sliderstate_3d = 0.0f;
+    std::memcpy(memory + kPadOffset, &pad, sizeof pad);
 
-    // These are rounded rather than truncated on actual hardware; the source gives the raw reading.
-    // The pad reports the average of the new reading and the previous two, to simulate the
-    // sluggishness of a real circle pad (the Theatrhythm games need at least 3).
-    const s16 circle_pad_new_x = input.circle_x;
-    const s16 circle_pad_new_y = input.circle_y;
-    const s16 circle_pad_x = static_cast<s16>(
-        (circle_pad_new_x + circle_old_x_[0] + circle_old_x_[1]) / kCirclePadAveraging);
-    const s16 circle_pad_y = static_cast<s16>(
-        (circle_pad_new_y + circle_old_y_[0] + circle_old_y_[1]) / kCirclePadAveraging);
-    circle_old_x_ = {circle_old_x_[1], circle_pad_new_x};
-    circle_old_y_ = {circle_old_y_[1], circle_pad_new_y};
-
-    const DirectionState direction = GetStickDirectionState(circle_pad_x, circle_pad_y);
-    state_ |= direction.up ? kPadCircleUp : 0;
-    state_ |= direction.down ? kPadCircleDown : 0;
-    state_ |= direction.left ? kPadCircleLeft : 0;
-    state_ |= direction.right ? kPadCircleRight : 0;
-
-    constexpr u32 pad_entries = 8;
-    mem.pad.current_state = state_;
-    mem.pad.index = next_pad_index_;
-    next_pad_index_ = (next_pad_index_ + 1) % pad_entries;
-
-    // Get the previous Pad state
-    const u32 last_entry_index = (mem.pad.index - 1) % pad_entries;
-    const u32 old_state = mem.pad.entries[last_entry_index].current_state;
-
-    // Compute bitmask with 1s for bits different from the old state
-    const u32 changed = state_ ^ old_state;
-
-    // Update the current Pad entry
-    PadDataEntry& pad_entry = mem.pad.entries[mem.pad.index];
-    pad_entry.current_state = state_;
-    pad_entry.delta_additions = changed & state_;
-    pad_entry.delta_removals = changed & old_state;
-    pad_entry.circle_pad_x = circle_pad_x;
-    pad_entry.circle_pad_y = circle_pad_y;
-
-    // If we just updated index 0, provide a new timestamp
-    if (mem.pad.index == 0) {
-        mem.pad.index_reset_ticks_previous = mem.pad.index_reset_ticks;
-        mem.pad.index_reset_ticks = static_cast<s64>(tick);
-    }
-
-    constexpr u32 touch_entries = 8;
-    mem.touch.index = next_touch_index_;
-    next_touch_index_ = (next_touch_index_ + 1) % touch_entries;
-
-    // Azahar's touch device reports 0, 0 when nothing touches the screen; `valid` is a 7-bit field.
-    TouchDataEntry& touch_entry = mem.touch.entries[mem.touch.index];
-    touch_entry.x = input.touch_down ? input.touch_x : 0;
-    touch_entry.y = input.touch_down ? input.touch_y : 0;
-    touch_entry.valid = (touch_entry.valid & ~0x7Fu) | (input.touch_down ? 1u : 0u);
-
-    // If we just updated index 0, provide a new timestamp
-    if (mem.touch.index == 0) {
-        mem.touch.index_reset_ticks_previous = mem.touch.index_reset_ticks;
-        mem.touch.index_reset_ticks = static_cast<s64>(tick);
-    }
-
-    // The 3D slider: Azahar writes factor_3d / 100 (its default factor is 0).
-    mem.pad.sliderstate_3d = 0.0f;
-
-    Store(memory, mem);
+    auto touch = ReadBlock<decltype(SharedMem::touch)>(memory + kTouchOffset);
+    auto entry = touch.entries[next_touch_index_];
+    entry.x = input.touch_down ? input.touch_x : 0;
+    entry.y = input.touch_down ? input.touch_y : 0;
+    entry.valid = (entry.valid & ~0x7Fu) | static_cast<u32>(input.touch_down);
+    Append(touch, next_touch_index_, entry, tick);
+    std::memcpy(memory + kTouchOffset, &touch, sizeof touch);
 }
 
 void Module::UpdateAccelerometer(u8* memory, const InputState& input, u64 tick) {
-    if (memory == nullptr) {
+    if (!memory) {
         return;
     }
-    SharedMem mem = Load(memory);
 
-    mem.accelerometer.index = next_accelerometer_index_;
-    next_accelerometer_index_ = (next_accelerometer_index_ + 1) % 8;
-
-    AccelerometerDataEntry& entry = mem.accelerometer.entries[mem.accelerometer.index];
-    entry.x = input.accel[0];
-    entry.y = input.accel[1];
-    entry.z = input.accel[2];
-
-    // Make up "raw" entry: "approximately, but not exactly, as twice as corresponding entries (or
-    // with a minus sign)".
-    mem.accelerometer.raw_entry.x = static_cast<s16>(-2 * entry.x);
-    mem.accelerometer.raw_entry.z = static_cast<s16>(2 * entry.y);
-    mem.accelerometer.raw_entry.y = static_cast<s16>(-2 * entry.z);
-
-    // If we just updated index 0, provide a new timestamp
-    if (mem.accelerometer.index == 0) {
-        mem.accelerometer.index_reset_ticks_previous = mem.accelerometer.index_reset_ticks;
-        mem.accelerometer.index_reset_ticks = static_cast<s64>(tick);
-    }
-
-    Store(memory, mem);
+    auto block = ReadBlock<decltype(SharedMem::accelerometer)>(memory + kAccelerometerOffset);
+    const auto& [x, y, z] = input.accel;
+    block.raw_entry = {static_cast<s16>(-2 * x), static_cast<s16>(-2 * z), static_cast<s16>(2 * y)};
+    Append(block, next_accelerometer_index_, AccelerometerDataEntry{x, y, z}, tick);
+    std::memcpy(memory + kAccelerometerOffset, &block, sizeof block);
 }
 
 void Module::UpdateGyroscope(u8* memory, const InputState& input, u64 tick) {
-    if (memory == nullptr) {
+    if (!memory) {
         return;
     }
-    SharedMem mem = Load(memory);
 
-    mem.gyroscope.index = next_gyroscope_index_;
-    next_gyroscope_index_ = (next_gyroscope_index_ + 1) % 32;
-
-    GyroscopeDataEntry& entry = mem.gyroscope.entries[mem.gyroscope.index];
-    entry.x = input.gyro[0];
-    entry.y = input.gyro[1];
-    entry.z = input.gyro[2];
-
-    // Make up "raw" entry
-    mem.gyroscope.raw_entry.x = entry.x;
-    mem.gyroscope.raw_entry.z = static_cast<s16>(-entry.y);
-    mem.gyroscope.raw_entry.y = entry.z;
-
-    // If we just updated index 0, provide a new timestamp
-    if (mem.gyroscope.index == 0) {
-        mem.gyroscope.index_reset_ticks_previous = mem.gyroscope.index_reset_ticks;
-        mem.gyroscope.index_reset_ticks = static_cast<s64>(tick);
-    }
-
-    Store(memory, mem);
+    auto block = ReadBlock<decltype(SharedMem::gyroscope)>(memory + kGyroscopeOffset);
+    const auto& [x, y, z] = input.gyro;
+    block.raw_entry = {x, z, static_cast<s16>(-y)};
+    Append(block, next_gyroscope_index_, GyroscopeDataEntry{x, y, z}, tick);
+    std::memcpy(memory + kGyroscopeOffset, &block, sizeof block);
 }
 
 }  // namespace mh4n::hid

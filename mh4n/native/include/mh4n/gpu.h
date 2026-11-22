@@ -87,6 +87,11 @@ public:
     virtual void InvalidateRegion(u32 vaddr, u32 size) = 0;
     // A refresh of `screen` finished.
     virtual void VBlank(u32 screen) = 0;
+    // Runs `work` on the scheduler thread once the GPU has finished what is queued so far, and returns true; a GPU that
+    // runs everything at once returns false and does nothing (the caller runs `work` itself). MODIFIED for the Windows port.
+    virtual bool PostAfterQueuedWork(const std::function<void()>& work) { (void)work; return false; }
+    // Whether PostAfterQueuedWork is available (the GPU runs on its own thread).
+    virtual bool CanPostAfterQueued() const { return false; }
 };
 
 // A GPU that runs another one (the renderer thread's queue, gpu/queue): what it wraps, for the lookups made while

@@ -1,80 +1,54 @@
-// Derived from Azahar src/video_core/pica/regs_texturing.h, regs_internal.h and
-// src/video_core/renderer_vulkan/vk_rasterizer.cpp (SyncTextureUnits: which units and types load
-// a texture) at 5f3306d13cab40bbd5cf38f2cf3ae8b6e6eedca6 (GPL-3.0-or-later:
-// vk_rasterizer.cpp says "Licensed under GPLv3 or any later version"; regs_texturing.h and
-// regs_internal.h say "GPLv2 or any later version").
-// Copyright 2017-2024 Citra Emulator Project / Azahar Emulator Project (regs_texturing.h)
-// Copyright 2017-2025 Citra Emulator Project / Azahar Emulator Project (regs_internal.h)
-// Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project (vk_rasterizer.cpp)
-#include "gpu/texture/texture_regs.h"
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
+// Our own code, written from: texture_regs.h, gpu_texture_test.cpp and spec/pica_usage.md.
+
+#include "texture_regs.h"
 
 namespace mh4n::gpu::texture {
-namespace {
-
-constexpr u32 Bits(u32 word, u32 first, u32 count) {
-    return (word >> first) & ((1u << count) - 1u);
-}
-
-} // namespace
 
 std::vector<TextureRef> TexturesOfDraw(const u32* regs, u32* skipped) {
-    std::vector<TextureRef> textures;
-    TexturesOfDraw(regs, textures, skipped);
-    return textures;
+    std::vector<TextureRef> out;
+    TexturesOfDraw(regs, out, skipped);
+    return out;
 }
 
-void TexturesOfDraw(const u32* regs, std::vector<TextureRef>& textures, u32* skipped) {
-    textures.clear();
-    u32 left_out = 0;
-    const u32 config_base[3] = {kTexture0, kTexture1, kTexture2};
-    const u32 format_reg[3] = {kTexture0Format, kTexture1Format, kTexture2Format};
-
+void TexturesOfDraw(const u32* regs, std::vector<TextureRef>& out, u32* skipped) {
+    constexpr u32 bases[] = {kTexture0, kTexture1, kTexture2};
+    constexpr u32 formats[] = {kTexture0Format, kTexture1Format, kTexture2Format};
+    constexpr u32 face_mask = (1u << 22) - 1;
+    out.clear();
+    u32 omitted = 0;
     for (u32 unit = 0; unit < 3; ++unit) {
-        if (((regs[kMainConfig] >> unit) & 1) == 0) {
+        if ((regs[kMainConfig] & (1u << unit)) == 0) {
             continue;
         }
-        const u32 base = config_base[unit];
-        const u32 size_word = regs[base + 1];
-        const u32 params = regs[base + 2];
-        const u32 address = Bits(regs[base + 4], 0, 28);
-        const u32 format_value = Bits(regs[format_reg[unit]], 0, 4);
-        // The type field is only valid for unit 0 (regs_texturing.h)
-        const Type type = unit == 0 ? static_cast<Type>(Bits(params, 28, 3)) : Type::Texture2D;
-
-        TextureRef ref;
-        ref.unit = unit;
-        ref.width = Bits(size_word, 16, 11);
-        ref.height = Bits(size_word, 0, 11);
-        ref.format = static_cast<Format>(format_value);
-
-        const bool colour = type == Type::Texture2D || type == Type::Projection2D ||
-                            type == Type::TextureCube;
-        if (!colour || !IsValidFormat(format_value) || !IsValidSize(ref.width, ref.height)) {
-            ++left_out;
+        const u32 base = bases[unit];
+        const u32 size = regs[base + 1];
+        const u32 width = (size >> 16) & 0x7ff;
+        const u32 height = size & 0x7ff;
+        const u32 format = regs[formats[unit]] & 0xf;
+        const auto type = unit == 0 ? static_cast<Type>((regs[base + 2] >> 28) & 7)
+                                    : Type::Texture2D;
+        if (!IsValidSize(width, height) || !IsValidFormat(format) ||
+            type == Type::Shadow2D || type == Type::ShadowCube || type == Type::Disabled) {
+            ++omitted;
             continue;
         }
 
-        if (type == Type::TextureCube) {
-            // GetCubePhysicalAddress: bits 22-27 of the main address are shared by all faces
-            for (u32 face = 0; face < 6; ++face) {
-                u32 face_address = address;
-                if (face != 0) {
-                    const u32 extra = Bits(regs[kCubeAddress + face - 1], 0, 22);
-                    face_address = (face_address & ~0x3FFFFFu) | extra;
-                }
-                TextureRef cube_face = ref;
-                cube_face.cube = true;
-                cube_face.face = face;
-                cube_face.paddr = face_address * 8;
-                textures.push_back(cube_face);
+        const u32 address = regs[base + 4] & 0x0fffffff;
+        const bool cube = type == Type::TextureCube;
+        out.push_back({unit, 0, cube, address * 8, width, height, static_cast<Format>(format)});
+        if (cube) {
+            for (u32 face = 1; face < 6; ++face) {
+                const u32 face_address = (address & ~face_mask) |
+                                         (regs[kCubeAddress + face - 1] & face_mask);
+                out.push_back({unit, face, true, face_address * 8, width, height,
+                               static_cast<Format>(format)});
             }
-        } else {
-            ref.paddr = address * 8;
-            textures.push_back(ref);
         }
     }
-    if (skipped != nullptr) {
-        *skipped = left_out;
+    if (skipped) {
+        *skipped = omitted;
     }
 }
 

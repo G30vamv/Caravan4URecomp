@@ -146,6 +146,7 @@ public:
 
     // present::ScreenSink. Any thread; returns at once, whatever the present thread is doing.
     void Publish(const present::DisplayFrame& frame) override;
+    bool WantsBackendImages() const override { return true; }
 
     // The layer the compositor calls after the screens (N2b-11). The layer must stay alive until SetUiLayer(nullptr)
     // returns: that call waits for a composition in progress, after which the layer is not called again. Called by the
