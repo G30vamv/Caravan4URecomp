@@ -1,0 +1,23 @@
+Codigo fuente correspondiente / Corresponding source code
+==========================================================
+
+Caravan4URecomp is a MODIFIED version of 4u-native by khorne-hub (https://github.com/khorne-hub/4u-native), free
+software under the GNU General Public License, version 3 or (at your option) any later version, with the additional
+terms in LICENSES\ADDITIONAL-TERMS.txt.
+
+The complete corresponding source code of the programs in this package (Caravan4URecomp.exe, game-tools\bin\*.exe, the
+recompiler in game-tools\tools and its tables in game-tools\config) is in the folder SOURCE\ of this package, as
+Caravan4URecomp-source.zip, together with the scripts that build it (windows\build.ps1, windows\package.ps1). It is
+the exact tree these binaries were built from.
+
+El codigo fuente completo correspondiente a los programas de este paquete esta en la carpeta SOURCE\ (archivo
+Caravan4URecomp-source.zip), junto con los scripts que lo compilan. Es el arbol exacto del que se compilaron estos
+binarios.
+
+The unmodified upstream project: https://github.com/khorne-hub/4u-native
+Its runtime and recompiler come from MH4UltimateDC: https://github.com/CompaLarios18/MH4UltimateDC
+
+The third-party libraries and their licenses: LICENSES\THIRD_PARTY_NOTICES.txt and
+LICENSES\THIRD_PARTY_NOTICES_WINDOWS.txt.
+
+The game is not part of this package. Nothing of it is distributed.

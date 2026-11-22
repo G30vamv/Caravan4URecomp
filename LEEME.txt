@@ -1,0 +1,76 @@
+Caravan4URecomp (MH4U para Windows)
+====================================
+
+Esta es una version MODIFICADA de 4u-native (MH4U for Android) de khorne-hub
+(https://github.com/khorne-hub/4u-native). NO es la version oficial, ni esta hecha ni respaldada por khorne-hub.
+Basada en MH4UltimateDC de CompaLarios18, con partes derivadas de Azahar y Citra. Software libre bajo la GPL-3.0 o
+posterior, con los terminos adicionales de ADDITIONAL-TERMS. Mira la carpeta LICENSES.
+
+NO INCLUYE EL JUEGO. Necesitas tu propia copia de Monster Hunter 4 Ultimate (USA) DESCIFRADA: el juego base (.cia, .3ds
+o .cci) y su update v1.3.0 (.cia). Lo que se construya con ellos (la carpeta "game") se queda en tu PC: no lo compartas.
+
+Como se usa (no hay nada que instalar)
+--------------------------------------
+1) Descomprime todo el zip en una carpeta donde puedas escribir (por ejemplo, el Escritorio; no en "Archivos de programa").
+2) Abre Caravan4URecomp-Launcher.exe. Es el lanzador: ahi cambias todas las opciones (las mismas del menu del juego, F1, y tambien las
+   que solo valen al abrir el juego, como la escala de resolucion o las texturas HD), ves el registro y actualizas el programa con un
+   clic cuando sale una version nueva (baja solo los archivos que cambiaron). Pulsa JUGAR.
+3) La primera vez el juego te pide los dos archivos de tu copia (base y update v1.3.0) y abre una ventana que muestra el progreso:
+   construye la "libreria" del juego para TU PC. Tarda unos minutos, y la primera vez descarga un compilador (solo la parte
+   necesaria, unos 50 MB; hace falta Internet y se comprueba cada archivo con su SHA-256). Se hace una sola vez.
+4) Despues solo abres el lanzador y pulsas JUGAR. Tambien puedes abrir Caravan4URecomp.exe directamente: funciona igual.
+
+Si cambias de update o algo sale mal: ejecuta  Caravan4URecomp.exe --setup  (vuelve a pedir los archivos).
+
+Aviso de Windows (SmartScreen): el programa no esta firmado digitalmente (la firma cuesta dinero). Si Windows dice "Windows
+protegio su PC": pulsa "Mas informacion" y luego "Ejecutar de todas formas". Puedes comprobar que el zip es el original
+comparando su SHA-256 con el archivo .sha256 publicado junto a la descarga.
+
+Requisitos: Windows 10 u 11 de 64 bits, una GPU con Vulkan 1.2 o mas (casi cualquiera de 2016 en adelante) y unos
+1 GB libres junto al programa mientras se prepara el juego (despues ocupa unos 350 MB: la libreria del juego y el compilador).
+
+Controles (teclado)
+-------------------
+F = A, Espacio = B, V = X, E = Y, Enter = Start, Backspace = Select, flechas = cruceta,
+W A S D = stick izquierdo, O L K ; = stick derecho, Q = ZL, C = ZR, Ctrl izq = L, Shift izq = R,
+Tab = saltar cinematica (pulsa Y), F11 o Alt+Enter = pantalla completa. El raton hace de lapiz en la pantalla de abajo.
+Con mando: funciona solo; en el teclado del juego (nombre) aparece una mano para elegir las teclas.
+
+Pantallas: la pantalla de arriba ocupa toda la ventana y la tactil aparece como un recuadro encima solo cuando el juego
+espera algo ahi (seleccion de partida, creacion de personaje, teclado del juego, algunas paginas del pueblo). El raton
+funciona sobre el recuadro. F2 la muestra u oculta a mano; el menu (F1) deja elegir cuando aparece, su tamano y su esquina.
+
+Menu en el juego: F1 (o L3 + R3 a la vez en el mando). Se maneja con teclado, raton (clic, rueda, clic derecho = atras) y mando
+(cruceta o stick izquierdo, A, B; LB y RB o Q y E cambian de pagina). Tiene: Graficos (pantalla completa, VSync, disposicion de pantallas, resolucion interna,
+contador de fps), Juego (limite de fps, fps estables, efectos), Audio (volumen), Online y Sistema (idioma del menu:
+ingles o espanol, "auto" sigue el de Windows).
+Online (salas de Azahar, compatibles con Azahar/Citra; todos deben usar MH4U USA v1.3.0): en el menu, Online > Public rooms
+lista las salas publicas; o escribe una direccion HOST:PORT; o aloja tu propia sala (abre el puerto UDP en tu router).
+Despues, en el juego: Gathering Hall > Local Play.
+Por linea de comandos: --list-rooms [URL], --join HOST:PORT, --host PORT, --nick NOMBRE, --room-password TEXTO.
+
+FPS y resolucion: el limite de fps tiene los escalones 30, 60, 90, 120, 144, 165, 180, 240 y sin limite (menu F1 > Game; "display" = la frecuencia de tu pantalla; con VSync solo
+llegas a la frecuencia de tu pantalla). La resolucion interna (menu F1 > Graphics, pide reiniciar) va de 1x a 7x la de la
+3DS, o "auto" (la mas cercana a tu ventana): afecta a todo lo que dibuja la GPU (3D, HUD y texto); las texturas del juego
+siguen siendo las originales, salvo que uses un pack de texturas HD (formato Azahar/Citra, en game\user\load\textures).
+
+Todo cambio del menu se guarda al instante en el ini (aunque el juego se cierre mal). Lo que solo se aplica al volver a
+abrir el juego (resolucion interna, texturas HD, volver a "default" en opciones del juego) el menu lo guarda y lo avisa, sin
+reiniciar nada por si solo. Graficos > "Open the HD textures folder" abre la carpeta de los packs de texturas.
+
+Ajustes: Caravan4URecomp.ini (con comentarios; %EXEDIR% es la carpeta del programa). Por ejemplo:
+  scale = 3        resolucion interna (1 es la de la 3DS; baja a 1 o 2 si va lento)
+  fps_counter = on contador de fps sobre el juego
+  volume = 50      volumen (0 a 100)
+
+Codigo fuente
+-------------
+La GPL exige entregarte el codigo fuente: esta en SOURCE\ (ver OFERTA-DE-CODIGO-FUENTE.txt).
+
+--------------------------------------------------------------------------------------------------------------------
+
+English summary: Caravan4URecomp is a MODIFIED version of 4u-native by khorne-hub (not the official version). It does
+not include the game: bring your own decrypted copy (USA base game + v1.3.0 update). Unzip everywhere you can write, open
+Caravan4URecomp.exe, choose the two files on the first start, and wait for the window that builds the game's code for
+your PC (the part of a compiler that it needs, about 50 MB, is downloaded once). Nothing needs to be installed. Licenses: LICENSES\. Source code:
+SOURCE\.
