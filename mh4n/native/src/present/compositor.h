@@ -38,6 +38,9 @@ namespace mh4n::present {
 struct ComposeOptions {
     // The app's `linear_filter`: bilinear sampling of the screens, else nearest.
     bool linear_filter = false;
+    // MODIFIED (2026-11-22): AMD FidelityFX Super Resolution 1.0 (EASU upscaling and RCAS sharpening, MIT) for each screen that is
+    // drawn larger than its picture: the renderer draws at a lower internal resolution and this brings it to the window's.
+    bool fsr = false;
     // Called last, with the recorder and the target's size, while the target's pass is open (N2b-11).
     UiLayer* ui = nullptr;
 };

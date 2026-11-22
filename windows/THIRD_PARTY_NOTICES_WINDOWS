@@ -32,6 +32,11 @@ Python 3.12.8, the embeddable package of python.org (game-tools\python, run by t
     The package also holds OpenSSL (libssl, libcrypto), libffi, SQLite and other libraries of python.org's build, with
     their own licenses (summarised in PYTHON-LICENSE.txt).
 
+AMD FidelityFX Super Resolution 1.0 (FSR 1), the upscaler option of the program (mh4n/native/src/present/fsr/: ffx_a.h and ffx_fsr1.h)
+    Copyright (c) 2021 Advanced Micro Devices, Inc. MIT license (FidelityFX-FSR license text in LICENSES\LICENSE-FidelityFX-FSR.txt).
+    https://github.com/GPUOpen-Effects/FidelityFX-FSR. Compiled into the program as GLSL (comment lines left out, one line changed to
+    take the position from the picture's uv); nothing else of AMD's is included.
+
 The launcher (Caravan4URecomp-Launcher.exe, windows/launcher/ in the source tree)
     Python code adapted from the author's own other launcher project, under the GNU Affero General Public License v3
     (the author, G30vamv, is the copyright holder of that code). It is packed with PyInstaller (GPL-2.0 with the bootloader

@@ -12,7 +12,8 @@ import threading
 import webbrowser
 
 from PySide6.QtCore import QEvent, QTimer, Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QRectF
+from PySide6.QtGui import QColor, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QApplication, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
 
 import qtanim
@@ -114,6 +115,65 @@ class Window(QWidget):
     def closeEvent(self, event):
         self._app.on_app_close()
         event.accept()
+
+
+class ArtPanel(GlassPanel):
+    """The header: the port's art on the left, scaled (to ART_WIDTH wide, showing the middle of it vertically), fading out into the
+    glass with no visible edge; a soft dark veil over the fading part keeps the text on top readable."""
+
+    ART_WIDTH = 520   # px the picture takes
+    TOP_CUT = 0.12    # the share of the scaled picture's height cut at the top (the rest of the cut goes at the bottom)
+
+    def __init__(self, art_path, level="card", radius=20, parent=None):
+        super().__init__(level, radius, parent)
+        self._source = QPixmap(art_path) if art_path and os.path.exists(art_path) else None
+        self._radius = radius
+        self._cache = None
+        self._cache_key = None
+
+    def art_width(self, height=None):
+        return self.ART_WIDTH if self._source is not None and not self._source.isNull() else 0
+
+    def _scaled(self):
+        dpr = self.devicePixelRatioF()
+        key = (self.height(), dpr)
+        if key != self._cache_key:
+            w = int(self.ART_WIDTH * dpr)
+            h = int(self.height() * dpr)
+            pic = self._source.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+            top = int(pic.height() * self.TOP_CUT)
+            top = max(0, min(top, pic.height() - h))
+            out = QPixmap(w, h)
+            out.fill(Qt.GlobalColor.transparent)
+            p = QPainter(out)
+            p.drawPixmap(0, -top, pic)
+            # a dark veil that grows towards the right, where the text goes
+            veil = QLinearGradient(0, 0, w, 0)
+            veil.setColorAt(0.0, QColor(10, 6, 3, 0))
+            veil.setColorAt(0.40, QColor(10, 6, 3, 0))
+            veil.setColorAt(0.75, QColor(10, 6, 3, 120))
+            veil.setColorAt(1.0, QColor(10, 6, 3, 170))
+            p.fillRect(out.rect(), veil)
+            # then the whole thing fades out into the glass, slowly, to nothing at the right edge
+            fade = QLinearGradient(0, 0, w, 0)
+            for pos, alpha in ((0.0, 255), (0.40, 255), (0.55, 235), (0.68, 190), (0.80, 120), (0.91, 45), (1.0, 0)):
+                fade.setColorAt(pos, QColor(0, 0, 0, alpha))
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
+            p.fillRect(out.rect(), fade)
+            p.end()
+            out.setDevicePixelRatio(dpr)
+            self._cache, self._cache_key = out, key
+        return self._cache
+
+    def paint_extra(self, p):
+        if self._source is None or self._source.isNull():
+            return
+        clip = QPainterPath()
+        clip.addRoundedRect(QRectF(self.rect()), self._radius, self._radius)
+        p.save()
+        p.setClipPath(clip)
+        p.drawPixmap(0, 0, self._scaled())
+        p.restore()
 
 
 class IniStore:
@@ -366,20 +426,19 @@ class C4ULauncherApp(C4ULogic):
         self.save_config()
 
     def create_header(self):
-        header = GlassPanel("card", 20)
+        header = ArtPanel(os.path.join(self.assets_dir, "header.jpg"), "card", 20)
+        header.setFixedHeight(170)
         lay = QHBoxLayout(header)
-        lay.setContentsMargins(20, 14, 18, 14)
+        # the text starts over the faded part of the picture
+        lay.setContentsMargins(max(0, header.art_width() - 150), 14, 18, 14)
         lay.setSpacing(16)
-        logo = QLabel()
-        icon = os.path.join(self.assets_dir, "caravan4u.ico")
-        if os.path.exists(icon):
-            logo.setPixmap(QIcon(icon).pixmap(64, 64))
-        lay.addWidget(logo)
         text = QVBoxLayout()
-        text.setSpacing(2)
+        text.setSpacing(4)
+        text.addStretch(1)
         text.addWidget(Label("CARAVAN4URECOMP", "#f2b94b", 24, bold=True, family="Georgia"))
-        text.addWidget(Label(self.tr("Monster Hunter 4 Ultimate for Windows • native, no emulator",
-                                     "Monster Hunter 4 Ultimate para Windows • nativo, sin emulador"), "#e2d2a6", 11))
+        text.addWidget(Label(self.tr("Monster Hunter 4 Ultimate for Windows", "Monster Hunter 4 Ultimate para Windows"), "#e2d2a6", 11.5))
+        text.addWidget(Label(self.tr("Native, no emulator", "Nativo, sin emulador"), "#c7b48f", 10.5))
+        text.addStretch(1)
         lay.addLayout(text, 1)
 
         badge = GlassPanel("inset", 14)
@@ -397,7 +456,7 @@ class C4ULauncherApp(C4ULogic):
         blay.addWidget(self.btn_update)
         blay.addWidget(self.lbl_update_status)
         blay.addWidget(self.progress)
-        lay.addWidget(badge)
+        lay.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)  # its own size, centred (the pane is taller than it)
         return header
 
     def create_footer(self):

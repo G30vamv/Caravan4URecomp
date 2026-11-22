@@ -16,7 +16,7 @@ _GROUPS = (
     ("Video", ("scale", "fullscreen", "width", "height", "display", "vsync",
                "fps", "steady", "effects", "aspect", "mode", "touch_show",
                "popup_size", "popup_corner", "fps_counter", "pace", "gpu_thread",
-               "hd_textures")),
+               "hd_textures", "hd_texture_max", "upscaler", "fsr_quality")),
     ("Audio", ("volume",)),
     ("Controls", ("skip_key", "skip_pad", "circle_pad_pro", "mouse_camera",
                   "hid_pads", "hidhide_ask")),

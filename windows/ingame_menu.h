@@ -897,6 +897,9 @@ private:
             {"touch_show", "When the touch screen's popup appears: when the game needs it (auto), always, or never. F2 shows or hides it by hand."},
             {"popup_size", "The height of the touch screen's popup, as a percentage of the window's height."},
             {"popup_corner", "The corner of the window where the touch screen's popup sits."},
+            {"upscaler", "AMD FidelityFX Super Resolution 1.0: the game is drawn at a lower internal resolution and brought up to your window's size, sharpened. Costs the GPU much less than drawing at the full resolution. Best with Internal resolution on auto."},
+            {"fsr_quality", "How much lower the internal resolution is than your window with FSR on and Internal resolution on auto: Ultra quality 1.3x, Quality 1.5x, Balanced 1.7x, Performance 2x. Needs a restart."},
+            {"hd_texture_max", "A texture of an HD pack larger than this (on its longer side) is reduced before it is loaded: it takes less video memory and loads faster, with less detail. Off: no limit. Needs a restart."},
             {"scale", "How sharp the 3D scene, the HUD and the text are drawn: a multiple of the 3DS top screen's 400 x 240. Auto picks the one closest to your window."},
             {"fps_counter", "Shows the game's frame rate in the top-left corner."},
             {"Open the HD textures folder", "Opens the folder for HD texture packs (Azahar or Citra format). They are read when the game starts."},
@@ -945,6 +948,9 @@ private:
             }
             items.push_back(Choice("Picture shape", "aspect", {"default", "stretch", "16:9", "16:10", "21:9", "4:3"}));
             items.push_back(Choice("Internal resolution", "scale", {"auto", "1", "2", "3", "4", "5", "6", "7", "8"}, true));
+            items.push_back(Choice("Upscaler (AMD FSR 1.0)", "upscaler", {"off", "fsr"}));
+            items.push_back(Choice("FSR quality", "fsr_quality", {"quality", "ultra", "balanced", "performance"}, true));
+            items.push_back(Choice("HD texture size limit", "hd_texture_max", {"off", "4096", "2048", "1024", "512"}, true));
             items.push_back(Choice("FPS counter", "fps_counter", {"off", "on"}));
             items.push_back(Action("Open the HD textures folder", [this] {
                 const std::string said = host_.action ? host_.action("open_textures") : "Not available";

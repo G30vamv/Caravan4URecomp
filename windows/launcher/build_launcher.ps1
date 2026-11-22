@@ -15,6 +15,7 @@ try {
     Copy-Item (Join-Path $src "Caravan4URecomp-Launcher.spec") $work
     New-Item -ItemType Directory -Force (Join-Path $work "assets") | Out-Null
     Copy-Item (Join-Path $src "assets\caravan4u.ico") (Join-Path $work "assets")
+    Copy-Item (Join-Path $src "assets\header.jpg") (Join-Path $work "assets")
     if ($Version) {
         $parts = ($Version -split '\.') + @("0", "0", "0", "0") | Select-Object -First 4
         $quad = ($parts -join ".")

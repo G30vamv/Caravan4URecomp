@@ -7,6 +7,7 @@
 
 #include "gpu/backend/targets/upload.h"
 #include "mh4n/log.h"
+#include "present/fsr/fsr_source.inc"  // MODIFIED: kFfxA, kFfxFsr1 (AMD FidelityFX FSR 1, MIT)
 #include "present/shader_compile.h"
 
 namespace mh4n::present {
@@ -59,6 +60,72 @@ void main() {
 }
 )";
 
+// MODIFIED (2026-11-22): FSR 1.0 in one pass. EASU gives the colour of the picture at the pixel's position in the picture (the position
+// comes from the interpolated uv, so a rotated screen works too); RCAS needs the colour of the four neighbours of the output pixel, which
+// are got by running EASU at the neighbouring positions (the screen's uv derivatives say where those are).
+const char* const kFsrHead = R"(#version 450
+#define A_GPU 1
+#define A_GLSL 1
+#define FSR_EASU_F 1
+#define FSR_RCAS_F 1
+layout(set = 0, binding = 0) uniform texture2D tex;
+layout(set = 0, binding = 1) uniform sampler smp;
+layout(location = 0) in vec2 v_uv;
+layout(location = 1) flat in vec4 v_bounds;
+layout(location = 2) flat in float v_alpha;
+layout(location = 0) out vec4 out_color;
+vec2 g_easu_pp;
+vec2 g_dx;
+vec2 g_dy;
+uvec4 g_con1;
+uvec4 g_con2;
+uvec4 g_con3;
+vec2 g_size;
+)";
+
+const char* const kFsrTail = R"(
+vec4 FsrEasuRF(vec2 p) { return textureGather(sampler2D(tex, smp), p, 0); }
+vec4 FsrEasuGF(vec2 p) { return textureGather(sampler2D(tex, smp), p, 1); }
+vec4 FsrEasuBF(vec2 p) { return textureGather(sampler2D(tex, smp), p, 2); }
+vec3 easu_at(vec2 uv) {
+    uv = clamp(uv, v_bounds.xy, v_bounds.zw);
+    g_easu_pp = uv * g_size - 0.5;
+    vec3 c;
+    FsrEasuF(c, uvec2(0u), uvec4(0u), g_con1, g_con2, g_con3);
+    return c;
+}
+vec4 FsrRcasLoadF(ivec2 p) {
+    return vec4(easu_at(v_uv + float(p.x) * g_dx + float(p.y) * g_dy), 1.0);
+}
+void FsrRcasInputF(inout float r, inout float g, inout float b) {}
+void main() {
+    g_size = vec2(textureSize(sampler2D(tex, smp), 0));
+    vec2 inv = 1.0 / g_size;
+    g_con1 = floatBitsToUint(vec4(inv.x, inv.y, inv.x, -inv.y));
+    g_con2 = floatBitsToUint(vec4(-inv.x, 2.0 * inv.y, inv.x, 2.0 * inv.y));
+    g_con3 = floatBitsToUint(vec4(0.0, 4.0 * inv.y, 0.0, 0.0));
+    g_dx = dFdx(v_uv);
+    g_dy = dFdy(v_uv);
+    uvec4 rcon;
+    FsrRcasCon(rcon, 0.25);
+    float r, g, b;
+    FsrRcasF(r, g, b, uvec2(0u), rcon);
+    out_color = vec4(r, g, b, v_alpha);
+}
+)";
+
+// The whole fragment shader: the head, AMD's two headers (with the one line that works the position out from the output pixel replaced by
+// the position the head computes), and the tail.
+std::string FsrFragmentSource() {
+    std::string fsr1 = kFfxFsr1;
+    const std::string line = "AF2 pp=AF2(ip)*AF2_AU2(con0.xy)+AF2_AU2(con0.zw);";
+    const std::size_t at = fsr1.find(line);
+    if (at != std::string::npos) {
+        fsr1.replace(at, line.size(), "AF2 pp=g_easu_pp;");
+    }
+    return std::string(kFsrHead) + kFfxA + "\n" + fsr1 + kFsrTail;
+}
+
 const rhi::BindingSetDesc kSetDesc{{{0, rhi::BindingType::SampledImage}, {1, rhi::BindingType::Sampler}}};
 
 constexpr u64 kVertexRingSize = 256 * 1024;
@@ -79,6 +146,9 @@ struct Compositor::State {
     std::vector<u32> vertex_spirv;
     std::vector<u32> fragment_spirv;
     std::map<rhi::Format, std::shared_ptr<rhi::Pipeline>> pipelines;
+    std::vector<u32> fsr_spirv;  // MODIFIED: made on first use (about 110 KB of GLSL)
+    bool fsr_tried = false;
+    std::map<rhi::Format, std::shared_ptr<rhi::Pipeline>> fsr_pipelines;
     std::shared_ptr<rhi::Sampler> nearest;
     std::shared_ptr<rhi::Sampler> linear;
     std::unique_ptr<rhi::Ring> vertices;
@@ -91,16 +161,34 @@ struct Compositor::State {
     bool warned_invalid_bottom = false;
 
     // The pipeline for a target of `format`, made on first use; null when the format cannot be drawn to.
-    rhi::Pipeline* PipelineFor(rhi::Format format) {
-        auto found = pipelines.find(format);
-        if (found != pipelines.end()) {
+    rhi::Pipeline* PipelineFor(rhi::Format format) { return PipelineWith(format, false); }
+
+    // The FSR 1.0 pipeline for `format`: null when FSR cannot be had (its shader did not compile: said once in the log).
+    rhi::Pipeline* FsrPipelineFor(rhi::Format format) {
+        if (!fsr_tried) {
+            fsr_tried = true;
+            std::string error;
+            if (!CompileGlsl(GlslStage::Fragment, FsrFragmentSource(), fsr_spirv, error)) {
+                MH4N_LOG(Error, kLog, "the FSR shader does not compile, so FSR stays off: {}", error);
+                fsr_spirv.clear();
+            } else {
+                MH4N_LOG(Info, kLog, "FSR 1.0 (EASU + RCAS) is ready");
+            }
+        }
+        return fsr_spirv.empty() ? nullptr : PipelineWith(format, true);
+    }
+
+    rhi::Pipeline* PipelineWith(rhi::Format format, bool fsr) {
+        auto& cache = fsr ? fsr_pipelines : pipelines;
+        auto found = cache.find(format);
+        if (found != cache.end()) {
             return found->second.get();
         }
         std::shared_ptr<rhi::Pipeline> made;
         if (backend->QueryFormat(format).attachment) {
             rhi::GraphicsPipelineDesc desc;
             desc.vertex.spirv = vertex_spirv;
-            desc.fragment.spirv = fragment_spirv;
+            desc.fragment.spirv = fsr ? fsr_spirv : fragment_spirv;
             desc.vertex_layout.bindings = {{0, sizeof(Vertex), false}};
             desc.vertex_layout.attributes = {
                 {0, 0, rhi::Format::Rg32Float, offsetof(Vertex, pos)},
@@ -119,7 +207,7 @@ struct Compositor::State {
             desc.state.dst_alpha = rhi::BlendFactor::One;
             desc.state.alpha_op = rhi::BlendOp::Add;
             desc.sets = {kSetDesc};
-            desc.name = "compositor";
+            desc.name = fsr ? "compositor (FSR)" : "compositor";
             rhi::Result<std::shared_ptr<rhi::Pipeline>> pipeline = backend->CreateGraphicsPipeline(desc);
             if (pipeline.ok()) {
                 made = *pipeline;
@@ -127,7 +215,7 @@ struct Compositor::State {
                 MH4N_LOG(Error, kLog, "compositor pipeline for a target format: {}", pipeline.error());
             }
         }
-        pipelines.emplace(format, made);
+        cache.emplace(format, made);
         return made.get();
     }
 
@@ -428,7 +516,18 @@ ComposeResult Compositor::Compose(rhi::Recorder& recorder, rhi::Image& target, c
             MH4N_LOG(Error, kLog, "binding a screen's image failed");
             return;
         }
-        recorder.SetPipeline(*pipeline);
+        // FSR when asked for and the screen is drawn larger than its picture (in both directions); else the plain pipeline
+        rhi::Pipeline* use = pipeline;
+        if (options.fsr && src.scaled_width > 0 && src.scaled_height > 0) {
+            const double out_w = rect.right - rect.left, out_h = rect.bottom - rect.top;
+            const double in_w = src.scaled_width * (crop.right - crop.left), in_h = src.scaled_height * (crop.bottom - crop.top);
+            if (out_w > in_w * 1.05 && out_h > in_h * 1.05) {
+                if (rhi::Pipeline* fsr = s.FsrPipelineFor(target.GetFormat())) {
+                    use = fsr;
+                }
+            }
+        }
+        recorder.SetPipeline(*use);
         recorder.Bind(**set, 0);
         const rhi::VertexBufferBinding binding{s.vertices->GetBuffer().get(), allocation->offset};
         recorder.SetVertexBuffers(0, std::span<const rhi::VertexBufferBinding>(&binding, 1));

@@ -6,7 +6,7 @@ a = Analysis(
     ['c4u_launcher_qt.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/caravan4u.ico', 'assets')],
+    datas=[('assets/caravan4u.ico', 'assets'), ('assets/header.jpg', 'assets')],
     hiddenimports=['c4u_options', 'c4u_ini', 'c4u_updater', 'c4u_form', 'c4u_logic', 'c4u_mods'],
     hookspath=[],
     hooksconfig={},

@@ -19,6 +19,15 @@ derived from Azahar.
   <img src="images/launcher-graphics.png" alt="The launcher: Graphics tab" width="48%">
 </p>
 
+## What's new in 0.4.1
+
+A small update on top of 0.4.0:
+
+- **AMD FSR 1.0 (optional, off by default).** The game is drawn at a lower internal resolution and brought up to your window's size with AMD's FidelityFX Super Resolution 1.0 (upscaling and sharpening). Turn it on in the in-game menu (Graphics) or in the launcher; the *FSR quality* option picks how much lower the internal resolution is when the resolution is on auto. I'm being honest about it: on my RTX 4070 it did not raise the frame rate (the game's CPU thread is the limit there), and another player's GPU saw it cost frames, so it is for you to test. It is meant for weaker GPUs.
+- **HD texture size limit (optional).** A texture of an HD pack larger than the limit you choose (4096, 2048, 1024 or 512 pixels on its longer side) is reduced before it is loaded, so it takes less video memory and loads faster, with less detail. With my pack a limit of 1024 cut the textures from 440 to 277 MB. Off by default.
+- **A new header for the launcher**, with art made for the port.
+- Discord Rich Presence is confirmed to work on a real Discord.
+
 ## What's new in 0.4.0
 
 This is a big one: it collects everything I did since 0.3.1.
@@ -44,13 +53,13 @@ I'd rather be upfront about what I have actually tested.
 - The skip button for the cutscene of eating and the one after killing a monster.
 - The in-game menu and the launcher: I checked each page, changed options and saw them applied.
 - Network rooms that speak the same protocol as Azahar's: I joined a real public room from the menu while the game was running, and I played Local Play in a Gathering Hall with another player.
-- Saves backups, and mods listed, turned on and off and ordered from the launcher.
+- Saves backups, mods listed, turned on and off and ordered from the launcher, and Discord Rich Presence on a real Discord.
 
 **Not tested yet:**
 - The **update system of the launcher** against a real release: 0.4.0 is the first one that has it, so there is nothing newer to update to yet. It has been tested with local files.
 - The launcher on other PCs and on Windows 10, and with other languages than English and Spanish.
 - The new controller reader with real controllers (a DualSense over Bluetooth works through the usual path), and the HidHide offer.
-- The Discord card on a real profile (I checked the protocol with a test client).
+- FSR on weaker GPUs, and what the game's CPU thread costs in the village: the game runs at about 100 to 115 fps there whatever the resolution, and I plan to look into it.
 - The skip button in cutscenes other than the two above, and the mouse as the camera (**F3**, or `mouse_camera = on`).
 - Resolutions of 9x and 10x: the picture still comes out black there.
 - Other GPUs and drivers, building with MSVC (I build with clang from llvm-mingw), and Windows and Android crossplay.
@@ -58,7 +67,7 @@ I'd rather be upfront about what I have actually tested.
 
 ## Getting it
 
-The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.4.0**, tagged `windows-v0.4.0`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.4.1**, tagged `windows-v0.4.1`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
@@ -151,6 +160,7 @@ texture packs.
   is still black on my card, so the menu stops at 8x.
 - **Picture shape:** the 3DS's top screen is 5:3, so on a 16:9 screen there are black bars at the sides. **Graphics > Picture
   shape > stretch** fills the whole window (the picture is stretched a little); the fixed ratios are there too.
+- **FSR and the HD texture limit:** see [What's new in 0.4.1](#whats-new-in-041).
 - **Sound:** the audio buffer is 60 ms by default; `options = --audio-latency 100` in the ini makes it larger if you hear cuts.
 
 ## Playing online
@@ -178,7 +188,7 @@ PowerShell window:
 
 ```
 powershell -ExecutionPolicy Bypass -File windows\build.ps1 [-Launcher]
-powershell -ExecutionPolicy Bypass -File windows\package.ps1 -Version 0.4.0
+powershell -ExecutionPolicy Bypass -File windows\package.ps1 -Version 0.4.1
 ```
 
 `build.ps1` downloads SDL3 and builds the program (with `-Launcher` it builds the launcher too); `package.ps1` makes the zip.
@@ -206,6 +216,7 @@ Every changed file says so in its header. The Android app is untouched.
   and its contributors.
 - 4u-native, the Android app this port is based on: [khorne-hub](https://github.com/khorne-hub/4u-native).
 - Parts of the runtime come from [Azahar](https://github.com/azahar-emu/azahar) and Citra.
+- The optional upscaler is AMD's [FidelityFX Super Resolution 1.0](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT license).
 - The libraries used, with their licenses, are listed in `THIRD_PARTY_NOTICES` and `windows/THIRD_PARTY_NOTICES_WINDOWS`.
 - The full credits of 4u-native are in its [README](../README.md), which is kept as it was.
 
@@ -235,6 +246,8 @@ alrededor de ese runtime, un launcher y código propio para buena parte de lo qu
 
 **No incluye el juego.** Necesitas tu propia copia descifrada de Monster Hunter 4 Ultimate (USA) y su update v1.3.0.
 
+**Novedades de la 0.4.1:** FSR 1.0 de AMD como opción (apagada por defecto; en mi RTX 4070 no subió los fps porque el límite es el hilo del juego, y en otra GPU costó fotogramas, así que es para probar), un límite de tamaño para las texturas HD (4096, 2048, 1024 o 512 px; con mi pack, 1024 bajó las texturas de 440 a 277 MB), una cabecera nueva en el launcher y Discord Rich Presence confirmado en un Discord real.
+
 **Novedades de la 0.4.0:**
 - **Un launcher** (`Caravan4URecomp-Launcher.exe`): cambia todas las opciones del menú del juego y también las que solo valen al abrirlo (escala de resolución, texturas HD, hilo de render...), gestiona tus mods, enseña tus partidas y el registro del juego, y **se actualiza solo** bajando únicamente los archivos que cambian, sin tener que descargar el zip completo.
 - **El skip de cinemáticas funciona:** Tab salta la de comer y la de la muerte del monstruo. Puedes elegir la tecla y un botón del mando en el launcher o en el menú del juego, y ese botón sigue haciendo lo suyo en el juego.
@@ -244,9 +257,9 @@ alrededor de ese runtime, un launcher y código propio para buena parte de lo qu
 - **Más código propio:** el kernel, varios servicios, el DSP y las partes principales del renderizador tienen implementaciones independientes que comprobé contra el comportamiento anterior. La parte online sigue usando el protocolo de salas de Azahar a propósito, para ser compatible.
 - Hilo de render opcional, lector propio de mandos DualSense/DualShock 4/HID, aviso de HidHide, marca de tiempo en el log con `F8`, Discord Rich Presence, opción `hd_textures` y un `.ini` más ordenado.
 
-**Estado:** probado en Windows 11 con una RTX 4070: el juego corre, he completado misiones y cacerías, funciona con teclado, ratón y mando (también un DualSense por Bluetooth), entré a una sala pública real de Azahar y jugué Local Play con otra persona. En la aldea con texturas HD a 6x va a unos 90–115 fps. **Sin probar todavía:** el sistema de actualización del launcher contra una release real (la 0.4.0 es la primera que lo trae), el launcher en otros PC y en Windows 10, el lector de mandos nuevo con mandos reales, la tarjeta de Discord, 9x y 10x (siguen en negro), otras GPU y MSVC. Algunos momentos aún se entrecortan un poco (el rugido de algunos monstruos y los límites de fps muy altos).
+**Estado:** probado en Windows 11 con una RTX 4070: el juego corre, he completado misiones y cacerías, funciona con teclado, ratón y mando (también un DualSense por Bluetooth), entré a una sala pública real de Azahar y jugué Local Play con otra persona. En la aldea con texturas HD a 6x va a unos 90–115 fps. **Sin probar todavía:** el sistema de actualización del launcher contra una release real (la 0.4.0 es la primera que lo trae), el launcher en otros PC y en Windows 10, el lector de mandos nuevo con mandos reales, 9x y 10x (siguen en negro), el FSR en GPU más flojas, otras GPU y MSVC. Algunos momentos aún se entrecortan un poco (el rugido de algunos monstruos y los límites de fps muy altos).
 
-**Cómo se usa:** la última versión es la 0.4.0, en la página de Releases (con su suma SHA-256). Descomprime todo en una carpeta y abre `Caravan4URecomp-Launcher.exe` (o `Caravan4URecomp.exe` directamente). La primera vez que pulses Jugar te pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con **F1** o **L3 + R3**. Online usa las mismas salas que Azahar: menú → Online → **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
+**Cómo se usa:** la última versión es la 0.4.1, en la página de Releases (con su suma SHA-256). Descomprime todo en una carpeta y abre `Caravan4URecomp-Launcher.exe` (o `Caravan4URecomp.exe` directamente). La primera vez que pulses Jugar te pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con **F1** o **L3 + R3**. Online usa las mismas salas que Azahar: menú → Online → **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
 
-Para compilarlo: `windows\build.ps1 [-Launcher]` y `windows\package.ps1 -Version 0.4.0` (CMake, Ninja, llvm-mingw y Python). Los créditos y la licencia
+Para compilarlo: `windows\build.ps1 [-Launcher]` y `windows\package.ps1 -Version 0.4.1` (CMake, Ninja, llvm-mingw y Python). Los créditos y la licencia
 están arriba; los términos adicionales de khorne-hub siguen aplicando.

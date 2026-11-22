@@ -135,6 +135,11 @@ std::atomic<bool> g_touch_visible{false};
 constexpr const char* kAspects[] = {"default", "stretch", "16:9", "16:10", "21:9", "4:3"};
 std::atomic<int> g_aspect{0};
 std::atomic<int> g_popup_size{38};    // the popup's height, % of the window's
+std::atomic<bool> g_fsr{false};       // upscaler = fsr: AMD FSR 1.0 brings the internal resolution to the window's (live)
+// The factor of fsr_quality (the window is this many times the internal resolution): AMD's Ultra Quality 1.3, Quality 1.5, Balanced 1.7, Performance 2.0
+inline float FsrFactor(const std::string& quality) {
+    return quality == "ultra" ? 1.3f : quality == "balanced" ? 1.7f : quality == "performance" ? 2.0f : 1.5f;
+}
 std::atomic<int> g_popup_corner{3};   // Port::ScreenOverlay::Corner: 0 top left, 1 top right, 2 bottom left, 3 bottom right
 
 // Once the display GPU exists (the `devices` phase), the presenter becomes one of its screen sinks and the runtime is
@@ -721,7 +726,7 @@ struct Ini {
         static const Group kGroups[] = {
             {"Game", {"game", "code", "user", "options"}},
             {"Video", {"scale", "fullscreen", "width", "height", "display", "vsync", "fps", "steady", "effects", "aspect", "mode",
-                       "touch_show", "popup_size", "popup_corner", "fps_counter", "pace", "gpu_thread", "hd_textures"}},
+                       "touch_show", "popup_size", "popup_corner", "fps_counter", "pace", "gpu_thread", "hd_textures", "hd_texture_max", "upscaler", "fsr_quality"}},
             {"Audio", {"volume"}},
             {"Controls", {"skip_key", "skip_pad", "circle_pad_pro", "mouse_camera", "hid_pads", "hidhide_ask"}},
             {"Online", {"nick", "join_address", "host_port", "lobby", "online_touch"}},
@@ -940,6 +945,8 @@ int main(int argc, char** argv) {
     int window_h = std::max(240, std::atoi(ini.Get("height", "720").c_str()));
     std::string skip_key_name = ini.Get("skip_key", "Tab");  // "none": no skip key
     std::string scale_value = ini.Get("scale", "3");
+    std::string fsr_quality = ini.Get("fsr_quality", "quality");  // quality: ultra | quality | balanced | performance (the "auto" resolution with FSR on)
+    g_fsr.store(ini.Get("upscaler") == "fsr");
     bool show_fps = on(ini.Get("fps_counter"), false);  // the counter over the game: off unless the settings say so
     std::string volume_value = ini.Get("volume", "50");  // percent, 0 to 100
     int display_index = std::atoi(ini.Get("display", "-1").c_str());  // -1: the first display that is not the primary
@@ -1069,6 +1076,8 @@ int main(int argc, char** argv) {
         if (ini.Get("trace_panels") == "on" && !std::getenv("MH4U_TRACE_PANELS")) _putenv_s("MH4U_TRACE_PANELS", "1");
         // hd_textures = off: no texture pack is read (the folder stays as it is), to compare with and without
         if (!on(ini.Get("hd_textures"), true) && !std::getenv("MH4N_HD_TEXTURES")) _putenv_s("MH4N_HD_TEXTURES", "0");
+        // hd_texture_max = 512 | 1024 | 2048 | 4096 (off: none): a pack texture larger than that is reduced before it is uploaded (little GPU memory)
+        if (const std::string cap = ini.Get("hd_texture_max"); !cap.empty() && cap != "off" && !std::getenv("MH4N_HD_MAX_SIZE")) _putenv_s("MH4N_HD_MAX_SIZE", cap.c_str());
         if (!std::getenv("MH4U_PACE")) _putenv_s("MH4U_PACE", ini.Get("pace").empty() ? "vblank" : ini.Get("pace").c_str());
         if (popup) {  // the touch screen's menus go to the top screen (the game's own single-screen mode)
             game_args.push_back("--set");
@@ -1187,6 +1196,7 @@ int main(int argc, char** argv) {
             request.inputs.overlay = overlay;
         }
         request.options.linear_filter = true;  // bilinear when the window is not a whole multiple of the picture
+        request.options.fsr = g_fsr.load();
         return request;
     };
     sc::Options presenter_options;
@@ -1342,7 +1352,9 @@ int main(int argc, char** argv) {
         give("--input-source", "live");
         give("--input-latch", "none");
         // "auto": a whole number of times the 3DS's 240 rows that is nearest to the window's height (3 at 720, 5 at 1080)
-        const std::string scale_arg = scale_value == "auto" ? std::to_string(std::clamp((pixel_h + 120) / 240, 1, 8))
+        // (with FSR on, the window is that many times the picture: 6x of 1440 rows at Quality becomes 4x)
+        const float auto_factor = g_fsr.load() ? FsrFactor(fsr_quality) : 1.0f;
+        const std::string scale_arg = scale_value == "auto" ? std::to_string(std::clamp(static_cast<int>(std::lround(pixel_h / (240.0f * auto_factor))), 1, 8))
                                                            : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 8));
         give("--scale", scale_arg.c_str());
         {   // Every emulated VBlank reads the two scaled screens back (CPU copy), so the VBlank rate (= an fps cap above 60) is
@@ -1471,7 +1483,7 @@ int main(int argc, char** argv) {
         if (key == "scale_auto") {  // the multiple "auto" picks for this window
             int w = 0, h = 0;
             SDL_GetWindowSizeInPixels(window, &w, &h);
-            return std::to_string(std::clamp((h + 120) / 240, 1, 8));
+            return std::to_string(std::clamp(static_cast<int>(std::lround(h / (240.0f * (g_fsr.load() ? FsrFactor(fsr_quality) : 1.0f)))), 1, 8));
         }
         if (key == "lobby") return ini.Get("lobby").empty() ? "http://88.198.47.46:5000" : ini.Get("lobby");
         if (key.rfind("bind:", 0) == 0) {  // "A button: its keys, and its controller's button"
@@ -1563,6 +1575,11 @@ int main(int argc, char** argv) {
             g_cursor.show_fps.store(show_fps);
         } else if (key == "scale") {
             scale_value = value;  // read when the game starts
+        } else if (key == "upscaler") {
+            g_fsr.store(value == "fsr");  // live
+            (*presenter)->RequestRedraw();
+        } else if (key == "fsr_quality") {
+            fsr_quality = value;  // the "auto" resolution, read when the game starts
         } else if (key == "volume") {
             volume_value = value;
             const std::lock_guard<std::recursive_mutex> rt_guard(g_runtime_mutex);

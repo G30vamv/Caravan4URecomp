@@ -20,6 +20,8 @@
 //
 //   MH4N_TEXTURE_PACKS=<dir>   the folder of the packs (the app: the game folder's textures/)
 //   MH4N_HD_TEXTURES=0         no pack is read
+//   MH4N_HD_MAX_SIZE=<px>      (MODIFIED, 2026-11-22) a pack texture larger than <px> on its longer side is reduced (halved, again and again,
+//                              by averaging) before it is uploaded: for GPUs with little memory. 0 or none: no limit
 //   MH4N_HD_DUMP=<dir>         (debug) each texture the game draws, once, as <dir>/tex1_<w>x<h>_<old hash>_<format>.png,
 //                              upright: a pack of the game's own textures, for tests
 #pragma once
@@ -64,6 +66,8 @@ public:
     // nullptr when no pack has it. Answered once for each content.
     const Replacement* Find(u64 content, const u8* data, std::size_t size, u32 width, u32 height, texture::Format format);
 
+    // The size a texture of the pack is drawn at: the file's, or halved as many times as it takes to fit MH4N_HD_MAX_SIZE.
+    void CappedSize(u32 width, u32 height, u32& out_width, u32& out_height) const;
     // Its pixels, RGBA8 upright as the texture cache's, read and decoded now. False when the file can't be read.
     bool Pixels(const Replacement& r, std::vector<u8>& rgba);
 
@@ -94,6 +98,8 @@ public:
     u64 replaced() const { return replaced_; }
 
 private:
+    u32 max_size_ = 0;  // MH4N_HD_MAX_SIZE (0: none)
+    bool cap_logged_ = false;
     struct File {
         std::string path;
         bool flip = false;  // the rows are turned over as they are read (the pack's flip_png_files false)
