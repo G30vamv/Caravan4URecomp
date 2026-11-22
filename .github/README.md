@@ -23,7 +23,7 @@ derived from Azahar.
 
 A small update on top of 0.4.0:
 
-- **AMD FSR 1.0 (optional, off by default).** The game is drawn at a lower internal resolution and brought up to your window's size with AMD's FidelityFX Super Resolution 1.0 (upscaling and sharpening). Turn it on in the in-game menu (Graphics) or in the launcher; the *FSR quality* option picks how much lower the internal resolution is when the resolution is on auto. I'm being honest about it: on my RTX 4070 it did not raise the frame rate (the game's CPU thread is the limit there), and another player's GPU saw it cost frames, so it is for you to test. It is meant for weaker GPUs.
+- **AMD FSR 1.0 (optional, off by default).** The game is drawn at a lower internal resolution and brought up to your window's size with AMD's FidelityFX Super Resolution 1.0 (upscaling and sharpening). Turn it on in the in-game menu (Graphics) or in the launcher; the *FSR quality* option picks how much lower the internal resolution is when the resolution is on auto. I'm being honest about it: on my RTX 4070 it did not raise the frame rate (the game's CPU thread is the limit there), and in my own play it even cost a few frames, so it is for you to test. It is meant for weaker GPUs.
 - **HD texture size limit (optional).** A texture of an HD pack larger than the limit you choose (4096, 2048, 1024 or 512 pixels on its longer side) is reduced before it is loaded, so it takes less video memory and loads faster, with less detail. With my pack a limit of 1024 cut the textures from 440 to 277 MB. Off by default.
 - **A new header for the launcher**, with art made for the port.
 - Discord Rich Presence is confirmed to work on a real Discord.
