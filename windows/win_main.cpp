@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <optional>
@@ -302,6 +303,9 @@ public:
     std::atomic<int> fps{-1};
     std::atomic<bool> show_monster_hp{false};  // the life of the monster being fought (monster_hp in the ini)
     std::atomic<bool> hud_spanish{false};
+    // the monsters' names of the user's own game (monster_names.txt, made by tools/monster_names.py): row of the monster table -> name,
+    // set once before the game starts and then only read
+    std::map<std::uint32_t, std::string> monster_names;
     std::atomic<sc::Presenter*> presenter{nullptr};
     const ingame::Overlay* menu = nullptr;  // the in-game settings menu, drawn last (ingame_menu.h)
 
@@ -340,7 +344,9 @@ private:
             if (e.actor != snapshot.focus) continue;
             ingame::HudBar bar;
             bar.id = e.actor;
-            bar.name = std::string(hud_spanish.load() ? "Monstruo " : "Monster ") + std::to_string(e.order);
+            const auto known = monster_names.find(e.kind);
+            bar.name = known != monster_names.end() ? known->second
+                                                    : std::string(hud_spanish.load() ? "Monstruo " : "Monster ") + std::to_string(e.order);
             bar.hp = e.hp;
             bar.max = e.max;
             bar.since_hit = e.hit_at > 0.0 ? static_cast<float>(snapshot.now - e.hit_at) : 99.0f;
@@ -764,10 +770,11 @@ struct Ini {
         static const Group kGroups[] = {
             {"Game", {"game", "code", "user", "options"}},
             {"Video", {"scale", "fullscreen", "width", "height", "display", "vsync", "fps", "steady", "effects", "aspect", "mode",
-                       "touch_show", "popup_size", "popup_corner", "fps_counter", "monster_hp", "pace", "gpu_thread", "hd_textures", "hd_texture_max", "upscaler", "fsr_quality"}},
+                       "touch_show", "popup_size", "popup_corner", "fps_counter", "pace", "gpu_thread", "hd_textures", "hd_texture_max", "upscaler", "fsr_quality"}},
             {"Audio", {"volume"}},
             {"Controls", {"skip_key", "skip_pad", "circle_pad_pro", "mouse_camera", "hid_pads", "hidhide_ask"}},
             {"Online", {"nick", "join_address", "host_port", "lobby", "online_touch"}},
+            {"Mods", {"monster_hp"}},
             {"Other", {"language", "discord_presence", "auto_backup", "trace_panels"}},
         };
         std::vector<std::string> out;
@@ -1266,6 +1273,19 @@ int main(int argc, char** argv) {
             hud_lang = name[0] == L'e' && name[1] == L's' ? "es" : "en";
         }
         g_cursor.hud_spanish.store(hud_lang == "es");
+        // the names of the monsters, in the language of the menu (spa or eng; the file is written from the user's own game)
+        if (show_monster_hp && !ini.Get("game").empty()) {
+            std::ifstream names(ini.Get("game") + "/monster_names.txt");  // (a narrow path, as PathExists reads it: a u8string path throws "locale not supported" here)
+            const std::string want = hud_lang == "es" ? "spa" : "eng";
+            for (std::string line; std::getline(names, line);) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                const std::size_t a = line.find('\t'), b = a == std::string::npos ? a : line.find('\t', a + 1);
+                if (b == std::string::npos || line.compare(0, a, want) != 0) continue;
+                const long id = std::strtol(line.c_str() + a + 1, nullptr, 10);
+                if (id > 0) g_cursor.monster_names[static_cast<std::uint32_t>(id)] = line.substr(b + 1);
+            }
+            std::printf("mh4u-win: monster names: %zu (%s)\n", g_cursor.monster_names.size(), want.c_str());
+        }
     }
     if (std::getenv("MH4U_TEST_CURSOR")) g_cursor.visible.store(true);  // draws the selector without a game (a check)
     std::printf("mh4u-win: window %dx%d, vsync %s\n", pixel_w, pixel_h, vsync ? "on" : "off");
@@ -1275,8 +1295,19 @@ int main(int argc, char** argv) {
     bool game = !game_args.empty() && !need_setup;
     auto pads = std::make_unique<HidAugmentedPads>(mh4n::app::MakeSdlGamepads());
     const char* hid_env = std::getenv("MH4U_HID_PADS");
-    const bool hid_on = on(ini.Get("hid_pads"), true) && !(hid_env && std::string(hid_env) == "0");
-    if (hid_on) hidpads::Start();
+    bool hid_wanted = on(ini.Get("hid_pads"), true) && !(hid_env && std::string(hid_env) == "0");
+    if (hid_wanted && hidpads::GuardTripped()) {  // the last start died inside the HID reading: leave it off, the game opens anyway
+        std::fprintf(stderr, "mh4u-win: HID pads stay off: the last start ended inside their reading (MH4U_HID_FORCE=1 tries again)\n");
+        hid_wanted = false;
+    }
+    const bool hid_on = hid_wanted;
+    const auto hid_started_at = std::chrono::steady_clock::now();
+    bool hid_guard_armed = false;
+    if (hid_on) {
+        hidpads::ArmGuard();
+        hid_guard_armed = true;
+        hidpads::Start();
+    }
     // HidHide (DSX's leftover) hides a PlayStation pad from every program not on its list: offer to add this one (once; "No" is kept)
     if (hid_on && game && !std::getenv("MH4U_TEST_SCRIPT") && on(ini.Get("hidhide_ask"), true)) {
         wchar_t exe_buffer[MAX_PATH] = {};
@@ -1453,6 +1484,11 @@ int main(int argc, char** argv) {
 
     KeyboardTyping typing;
     SDL_Keycode skip_key = skip_key_name == "none" ? SDLK_UNKNOWN : SDL_GetKeyFromName(skip_key_name.c_str());
+    if (ingame::ReservedKey(skip_key)) {  // a key the program itself uses (F1 the menu, F2, F8, F11, Esc) cannot be the skip key
+        std::fprintf(stderr, "mh4u-win: the key %s is used by the program, so it cannot skip: Tab is used instead\n", skip_key_name.c_str());
+        skip_key_name = "Tab";
+        skip_key = SDLK_TAB;
+    }
     // MODIFIED: skip_pad = "b<N>" (a controller button) or "a<N>+" / "a<N>-" (a trigger or stick axis), chosen in the menu's Controls page; empty = none
     int skip_pad_kind = 0, skip_pad_index = 0;
     bool skip_pad_positive = true;
@@ -1581,7 +1617,8 @@ int main(int argc, char** argv) {
     menu_host.apply = [&](const std::string& key, const std::string& value) {
         if (key == "skip_key" || key == "skip_pad") {  // MODIFIED: the skip control, changed in the menu (Backspace there = key Tab, no controller button)
             if (key == "skip_key") {
-                const std::string name = value.empty() ? "Tab" : value;
+                std::string name = value.empty() ? "Tab" : value;
+                if (ingame::ReservedKey(SDL_GetKeyFromName(name.c_str()))) name = "Tab";  // (the menu does not offer these keys)
                 ini.Set("skip_key", name);
                 skip_key = SDL_GetKeyFromName(name.c_str());
                 g_skip_held = false;
@@ -1948,6 +1985,10 @@ int main(int argc, char** argv) {
     const auto pump_hid = [&] {
         if (!hid_on) return;
         const auto now = std::chrono::steady_clock::now();
+        if (hid_guard_armed && now - hid_started_at > std::chrono::seconds(8)) {  // it has run well: the start guard is lifted
+            hidpads::DisarmGuard();
+            hid_guard_armed = false;
+        }
         if (now >= hid_check_at) {
             hid_check_at = now + std::chrono::seconds(1);
             hid_blocked = hidpads::XInputConnected();
@@ -2299,6 +2340,7 @@ int main(int argc, char** argv) {
         }
         ini.Save();
     }
+    if (hid_guard_armed) hidpads::DisarmGuard();  // a normal end, however short the run was
     SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+﻿# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
 # Our own code, written from: windows/ingame_menu.h, windows/menu_text.h, windows/win_main.cpp, windows/addr_parse.h and windows/package/LEEME.txt.
 """INI options understood by the Windows game and its launcher."""
@@ -33,6 +33,7 @@ TABS: tuple[tuple[str, str, str], ...] = (
     ("graphics", "Graphics", "Gráficos"),
     ("game", "Game", "Juego"),
     ("controls", "Controls", "Controles"),
+    ("mods", "Mods", "Mods"),
     ("audio", "Audio", "Audio"),
     ("online", "Online", "En línea"),
     ("saves", "Saves", "Partidas"),
@@ -111,10 +112,10 @@ OPTIONS: tuple[Option, ...] = (
            label_en="FPS counter", label_es="Contador de FPS",
            help_en="Shows the game's frame rate in the top-left corner.",
            help_es="Muestra los fotogramas por segundo del juego en la esquina superior izquierda."),
-    Option("monster_hp", "graphics", "Rendering", "bool", "off",
-           label_en="Monster life", label_es="Vida del monstruo",
-           help_en="Shows the life of the large monster you hurt last, top right, and how much it drops as you hit it. It only reads the game: nothing changes, so it is fine online.",
-           help_es="Muestra la vida del monstruo grande al que golpeaste por última vez, arriba a la derecha, y cómo baja con cada golpe. Solo lee el juego: no cambia nada, así que es seguro en línea."),
+    Option("monster_hp", "mods", "Built-in mods", "bool", "off",
+           label_en="Monster life bar", label_es="Barra de vida del monstruo",
+           help_en="A mod of this program, not a graphics option: it shows the life of the large monster you hurt last, top right, with its name, and how much it drops as you hit it. It only reads the game's memory and changes nothing, so it is fine online.",
+           help_es="Un mod de este programa, no una opción de gráficos: muestra la vida del monstruo grande al que golpeaste por última vez, arriba a la derecha, con su nombre, y cómo baja con cada golpe. Solo lee la memoria del juego y no cambia nada, así que es seguro en línea."),
     Option("hd_textures", "graphics", "Rendering", "bool", "on", restart=True, in_game=False,
            label_en="HD textures", label_es="Texturas HD",
            help_en="Loads HD texture packs (Azahar or Citra format, or the converted .mh4hdpk file) from the textures folder when the game starts.",
@@ -215,9 +216,9 @@ OPTIONS: tuple[Option, ...] = (
            help_es="Copia tus guardados cada vez que abres el juego, si cambiaron desde la última copia. Se guardan las 5 automáticas más nuevas; las tuyas nunca se borran."),
     Option("language", "system", "Menu", "choice", "auto",
            choices=(_AUTO, ("en", "English", "English"), ("es", "Español", "Español")),
-           label_en="Language", label_es="Idioma",
-           help_en="The language of this menu. Auto follows Windows.",
-           help_es="El idioma de este menú. Auto sigue el de Windows."),
+           label_en="In-game menu language", label_es="Idioma del menú del juego",
+           help_en="The language of the menu inside the game (F1) and of the monster names on the life bar. Auto follows Windows. The launcher's own language is the one in its gear menu, top right.",
+           help_es="El idioma del menú dentro del juego (F1) y de los nombres de monstruo en la barra de vida. Auto sigue el de Windows. El idioma del launcher es el del menú del engranaje, arriba a la derecha."),
     Option("discord_presence", "system", "Integration", "bool", "on", restart=True, in_game=False,
            label_en="Discord Rich Presence", label_es="Presencia enriquecida de Discord",
            help_en="Shows in your Discord profile that you are playing, and for how long.",
@@ -314,6 +315,8 @@ def validate(key, value) -> tuple[bool, str]:
         # Actual key names are resolved by SDL in the game.
         if not value or value.lower() == "tab":
             return True, "Tab"
+        if value.lower() in ("f1", "f2", "f3", "f8", "f11", "escape", "esc"):  # the keys the program itself uses while the game runs
+            return False, "That key is used by the program (F1 menu, F2 touch popup, F3 mouse camera, F8 log mark, F11 full screen, Esc)."
         return True, "none" if value.lower() == "none" else value
 
     if option.kind == "padbutton":

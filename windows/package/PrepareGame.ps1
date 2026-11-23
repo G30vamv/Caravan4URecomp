@@ -73,6 +73,9 @@ try {
     & $runner (Join-Path $out "folder") --from-dump "$Base,$Update" --print-process | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "the game folder could not be made" }
 
+    # the names of the monsters, read from this game's own files, for the life bar (not important: the bar works without them)
+    & $python (Join-Path $tools "tools\monster_names.py") (Join-Path $out "folder") | Out-Null
+
     $user = Join-Path $out "user"
     New-Item -ItemType Directory -Force $user | Out-Null
 

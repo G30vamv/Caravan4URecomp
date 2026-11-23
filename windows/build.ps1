@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-or-later
+﻿# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by
 # khorne-hub (https://github.com/khorne-hub/4u-native); see ADDITIONAL-TERMS and THIRD_PARTY_NOTICES.
 # Builds mh4u-win for Windows x64 with llvm-mingw (clang), CMake and Ninja, and assembles a folder to run it from.
@@ -17,7 +17,8 @@ param(
     [string]$DistDir = "",
     [string]$Sdl3Dir = "",
     [string]$Sdl3Version = "3.4.20",
-    [switch]$Launcher   # also build Caravan4URecomp-Launcher.exe (PyInstaller) into the dist folder
+    [switch]$Launcher,  # also build Caravan4URecomp-Launcher.exe (PyInstaller) into the dist folder
+    [switch]$Release    # a build to give to other people: no path of this PC in the program (see below)
 )
 $ErrorActionPreference = "Stop"
 
@@ -60,8 +61,20 @@ if (-not (Test-Path (Join-Path $sdlPrefix "bin\SDL3.dll"))) { throw "SDL3 not fo
 
 # configure and build
 # -include cstdlib: the vendored {fmt} 11.2.0 lacks the include with a recent libc++ (llvm-mingw 2025 and later)
+# A release is for other people: the compiler writes the path of each source file into the program (the log's file:line, asserts) and
+# those paths would be this PC's (the user's name, the folders). -ffile-prefix-map rewrites them: the user's profile folder becomes
+# "<home>", the tree becomes "." (so a log line reads ./4u-native/mh4n/... ). The dist folder for testing keeps the real paths.
+$mapFlags = ""
+if ($Release) {
+    $maps = @()
+    $home1 = $env:USERPROFILE
+    foreach ($p in @($home1, $home1.Replace('\', '/'))) { $maps += "-ffile-prefix-map=$p=HOME" }   # the general one first: the last match wins
+    foreach ($p in @($parent, $parent.Replace('\', '/'))) { $maps += "-ffile-prefix-map=$p=." }
+    $mapFlags = " " + ($maps -join " ")
+    Write-Host "release build: source paths are rewritten"
+}
 & $cmake -S $source -B $BuildDir -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ `
-    "-DCMAKE_CXX_FLAGS=-include cstdlib" "-DCMAKE_PREFIX_PATH=$sdlPrefix"
+    "-DCMAKE_CXX_FLAGS=-include cstdlib$mapFlags" "-DCMAKE_C_FLAGS=$($mapFlags.Trim())" "-DCMAKE_PREFIX_PATH=$sdlPrefix"
 if ($LASTEXITCODE -ne 0) { throw "configure failed" }
 & $cmake --build $BuildDir --target mh4u-win mh4n_hdpack_tool
 if ($LASTEXITCODE -ne 0) { throw "build failed" }

@@ -15,12 +15,13 @@ _GROUPS = (
     ("Game", ("game", "code", "user", "options")),
     ("Video", ("scale", "fullscreen", "width", "height", "display", "vsync",
                "fps", "steady", "effects", "aspect", "mode", "touch_show",
-               "popup_size", "popup_corner", "fps_counter", "monster_hp", "pace", "gpu_thread",
+               "popup_size", "popup_corner", "fps_counter", "pace", "gpu_thread",
                "hd_textures", "hd_texture_max", "upscaler", "fsr_quality")),
     ("Audio", ("volume",)),
     ("Controls", ("skip_key", "skip_pad", "circle_pad_pro", "mouse_camera",
                   "hid_pads", "hidhide_ask")),
     ("Online", ("nick", "join_address", "host_port", "lobby", "online_touch")),
+    ("Mods", ("monster_hp",)),
     ("Other", ("language", "discord_presence", "auto_backup", "trace_panels")),
 )
 _DEFAULTS = {option.key: option.default for option in OPTIONS}

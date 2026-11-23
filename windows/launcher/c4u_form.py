@@ -6,7 +6,7 @@ Every change is written to Caravan4URecomp.ini at once (the game is closed while
 also what the in-game menu can only apply after a restart).
 """
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QScrollArea, QVBoxLayout, QWidget
 
@@ -22,7 +22,7 @@ SECTIONS_ES = {
     "Window": "Ventana", "Screen layout": "Disposición de pantallas", "Rendering": "Dibujo", "Upscaling": "Escalado",
     "Frame rate": "Fotogramas", "Effects": "Efectos", "Skip a cutscene": "Saltar cinemáticas", "Input devices": "Dispositivos de entrada",
     "Game audio": "Audio del juego", "Rooms": "Salas", "Touch screen": "Pantalla táctil", "Backups": "Copias de seguridad",
-    "Menu": "Menú", "Integration": "Integración", "Diagnostics": "Diagnóstico", "Game files": "Archivos del juego",
+    "Menu": "Menú", "Built-in mods": "Mods incluidos", "Integration": "Integración", "Diagnostics": "Diagnóstico", "Game files": "Archivos del juego",
 }
 CREAM = "#e3d8bd"
 GOLD_TEXT = "#eab84c"
@@ -50,7 +50,10 @@ PAD_CHOICES = [
 
 # Qt's name of a key -> SDL's (the game finds the key with SDL_GetKeyFromName, which ignores case)
 _QT_TO_SDL = {"Esc": "Escape", "Return": "Return", "Enter": "Return", "Backspace": "Backspace", "Del": "Delete", "Ins": "Insert",
-              "PgUp": "PageUp", "PgDown": "PageDown", "Caps Lock": "CapsLock", "Space": "Space", "Tab": "Tab"}
+              "PgUp": "PageUp", "PgDown": "PageDown", "Caps Lock": "CapsLock", "Space": "Space", "Tab": "Tab", "Backtab": "Tab"}
+# the keys the program uses itself while the game runs (F1 the in-game menu, F2 the touch popup, F8 the log mark, F11 full screen): they
+# cannot be given to the skip, or one press would do two things
+RESERVED_KEYS = {"F1", "F2", "F3", "F8", "F11", "Escape"}
 
 
 class KeyCapture(QPushButton):
@@ -93,17 +96,31 @@ class KeyCapture(QPushButton):
     def get(self):
         return self._value
 
+    def event(self, event):
+        # Tab and Shift+Tab move the focus in Qt before keyPressEvent sees them: while a key is awaited they are the key (Tab is the skip's default)
+        if self._waiting and event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+            self.keyPressEvent(event)
+            return True
+        return super().event(event)
+
     def keyPressEvent(self, event):
         if not self._waiting:
             return super().keyPressEvent(event)
-        self.releaseKeyboard()
-        self._waiting = False
+        if event.key() in (Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_Meta):
+            return  # a modifier alone: wait for the key it goes with
+        name = ""
         if event.key() != Qt.Key.Key_Escape:
             name = QKeySequence(event.key()).toString()
             name = _QT_TO_SDL.get(name, name)
-            if name:
-                self._value = name
-                self._on_change(name)
+        if name in RESERVED_KEYS:  # keep waiting: say why in the button itself
+            self.setText(self._tr(f"{name} is used by the program. Press another key...", f"{name} la usa el programa. Pulsa otra tecla..."))
+            event.accept()
+            return
+        self.releaseKeyboard()
+        self._waiting = False
+        if name:
+            self._value = name
+            self._on_change(name)
         self._show()
         event.accept()
 
@@ -137,12 +154,9 @@ class OptionsForm:
         return (opt.help_es or opt.help_en) if self.lang() == "es" else opt.help_en
 
     # ---- pages -----------------------------------------------------------------------------------------------------------
-    def build_page(self, tab):
+    def build_cards(self, tab, layout):
+        """The cards of a tab's options (one per section), added to `layout`."""
         options = [o for o in self.schema.by_tab(tab) if o.visible]
-        inner = QWidget()
-        lay = QVBoxLayout(inner)
-        lay.setContentsMargins(4, 4, 10, 4)
-        lay.setSpacing(12)
         section = None
         card = card_lay = None
         for opt in options:
@@ -154,7 +168,7 @@ class OptionsForm:
                 card_lay.setSpacing(10)
                 title = Label((SECTIONS_ES.get(section, section) if self.lang() == "es" else section).upper(), GOLD_TEXT, 10, bold=True)
                 card_lay.addWidget(title)
-                lay.addWidget(card)
+                layout.addWidget(card)
             row = self._row(opt)
             help_text = self.help_of(opt)
             if help_text:  # the explanation is written under the option, not only in its tooltip
@@ -169,6 +183,13 @@ class OptionsForm:
                 self.rows[opt.key] = holder
                 row = holder
             card_lay.addWidget(row)
+
+    def build_page(self, tab):
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(4, 4, 10, 4)
+        lay.setSpacing(12)
+        self.build_cards(tab, lay)
         reset = Button(self.tr("Restore defaults of this page", "Restaurar los valores de esta página"), "default",
                        lambda t=tab: self.reset_tab(t), height=32, size=10)
         lay.addWidget(reset, 0, Qt.AlignmentFlag.AlignLeft)

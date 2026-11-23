@@ -119,12 +119,116 @@ class C4ULogic:
         p = self.game_process
         return p is not None and p.poll() is None
 
+    # ---- the code library: is it the one these tools would make? ---------------------------------------------------------
+    def _read_ini_key(self, key):
+        try:
+            with open(self.ini_path, encoding="utf-8-sig") as f:
+                for line in f:
+                    k, _, v = line.partition("=")
+                    if k.strip() == key:
+                        return v.strip()
+        except OSError:
+            pass
+        return ""
+
+    @staticmethod
+    def library_embedded_id(dll):
+        """The 16 hex digits of the tools that made the library (the runtime logs them as `tools ...`): after the game version's key
+        near the end of the file. None when not found."""
+        import re
+
+        try:
+            size = os.path.getsize(dll)
+            with open(dll, "rb") as f:
+                f.seek(max(0, size - 24 * 1024 * 1024))
+                data = f.read()
+        except OSError:
+            return None
+        m = re.search(rb"[a-z]{3}_v\d+\x00+([0-9a-f]{16})\x00", data)
+        return m.group(1).decode() if m else None
+
+    def library_expected_id(self):
+        """The id a library made with the tools of this package has (game-tools: the translator, the runtime and the hook tables),
+        by asking those same tools. None when they are not there or do not answer."""
+        tools = os.path.join(self.base_dir, "game-tools")
+        python = os.path.join(tools, "python", "python.exe")
+        if not os.path.isfile(os.path.join(tools, "tools", "build_game.py")) or not os.path.isfile(python):
+            return None
+        code = "import sys; sys.path.insert(0, 'tools'); import build_game; print(build_game.code_library_id())"
+        try:
+            out = subprocess.run([python, "-I", "-c", code], cwd=tools, capture_output=True, text=True, timeout=60,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip().splitlines()
+        except (OSError, subprocess.SubprocessError):
+            return None
+        last = out[-1].strip() if out else ""
+        return last if len(last) == 16 and all(c in "0123456789abcdef" for c in last) else None
+
+    def library_status(self):
+        """'ok', 'stale' (made by other tools than this package's: its hooks or tables changed, so the code library has to be made again),
+        'missing' (no library) or 'unknown' (cannot tell: nothing is asked of the user)."""
+        dll = self._read_ini_key("code")
+        if not dll or not os.path.isfile(dll):
+            return "missing"
+        have, want = self.library_embedded_id(dll), self.library_expected_id()
+        if not have or not want:
+            return "unknown"
+        return "ok" if have == want else "stale"
+
+    def setup_files(self):
+        """(base, update): the game files the library was made from, as the game folder's source.txt records them; '' when unknown or moved."""
+        game = self._read_ini_key("game")
+        out = {"base": "", "update": ""}
+        try:
+            with open(os.path.join(game, "source.txt"), encoding="utf-8") as f:
+                for line in f:
+                    key, _, value = line.strip().partition("=")
+                    if key in out:
+                        out[key] = value if os.path.isfile(value) else ""
+        except OSError:
+            pass
+        return out["base"], out["update"]
+
+    def recompile(self, on_exit=None):
+        """Makes the code library again: starts the program's own window for it (the one of the first start) with the same game files, no
+        questions. Returns None or a text with what went wrong."""
+        base, update = self.setup_files()
+        if not base or not update:
+            return "files"
+        return self.launch_game(["--setup", "--base-game", base, "--update", update], on_exit=on_exit)
+
+    def ensure_monster_names(self):
+        """The life bar's monster names come from the user's own game: monster_names.txt in the game folder, made once by
+        game-tools/tools/monster_names.py (a second or two). Never raises: the bar works without the names."""
+        try:
+            game = ""
+            with open(self.ini_path, encoding="utf-8-sig") as f:
+                for line in f:
+                    key, _, value = line.partition("=")
+                    if key.strip() == "game":
+                        game = value.strip()
+            script = os.path.join(self.base_dir, "game-tools", "tools", "monster_names.py")
+            if not game or not os.path.isdir(game) or os.path.isfile(os.path.join(game, "monster_names.txt")) or not os.path.isfile(script):
+                return
+            import runpy
+
+            old_argv = sys.argv
+            try:
+                sys.argv = [script, game]
+                runpy.run_path(script, run_name="__main__")
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+        except Exception:
+            pass
+
     def launch_game(self, extra_args=(), on_exit=None):
         """Starts Caravan4URecomp.exe in its folder. Returns None, or a text with what went wrong."""
         if not self.game_exe_present():
             return "missing"
         if self.is_running():
             return "running"
+        self.ensure_monster_names()
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         try:
             self.game_process = subprocess.Popen([self.game_exe, *extra_args], cwd=self.base_dir, creationflags=flags, close_fds=True)

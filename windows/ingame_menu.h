@@ -295,6 +295,12 @@ inline const char* const kTabNames[kTabCount] = {"Graphics", "Game", "Controls",
 // pad_<lower case name>).
 inline const char* const kBindNames[] = {"A", "B", "X", "Y", "L", "R", "ZL", "ZR", "Start", "Select", "Up", "Down", "Left", "Right"};
 constexpr int kBindCount = 14;
+// The keys the program itself uses while the game runs: F1 opens the menu, F2 the touch popup, F8 marks the log, F11 (and Alt+Enter) full
+// screen, Esc cancels. None of them can be the skip key (they would do two things at once).
+inline bool ReservedKey(SDL_Keycode key) {
+    return key == SDLK_F1 || key == SDLK_F2 || key == SDLK_F3 || key == SDLK_F8 || key == SDLK_F11 || key == SDLK_ESCAPE;
+}
+
 inline std::string Lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
@@ -915,7 +921,7 @@ private:
             {"hd_texture_max", "A texture of an HD pack larger than this (on its longer side) is reduced before it is loaded: it takes less video memory and loads faster, with less detail. Off: no limit. Needs a restart."},
             {"scale", "How sharp the 3D scene, the HUD and the text are drawn: a multiple of the 3DS top screen's 400 x 240. Auto picks the one closest to your window."},
             {"fps_counter", "Shows the game's frame rate in the top-left corner."},
-            {"monster_hp", "Shows the life of the large monster you hurt last, top right, and how much it drops as you hit it. It only reads the game: nothing changes, so it is fine online."},
+            {"monster_hp", "A mod of this program, not a graphics option: it shows the life of the large monster you hurt last, top right, with its name, and how much it drops as you hit it. It only reads the game memory and changes nothing, so it is fine online."},
             {"Open the HD textures folder", "Opens the folder for HD texture packs (Azahar or Citra format). They are read when the game starts."},
             {"fps", "Caps the game's frame rate. Default is the game's own, Display matches your screen, Unlimited uses all the CPU."},
             {"steady", "Keeps the frame rate even instead of letting it vary. Default leaves the game's own setting."},
@@ -966,7 +972,6 @@ private:
             items.push_back(Choice("FSR quality", "fsr_quality", {"quality", "ultra", "balanced", "performance"}, true));
             items.push_back(Choice("HD texture size limit", "hd_texture_max", {"off", "4096", "2048", "1024", "512"}, true));
             items.push_back(Choice("FPS counter", "fps_counter", {"off", "on"}));
-            items.push_back(Choice("Monster life", "monster_hp", {"off", "on"}));
             items.push_back(Action("Open the HD textures folder", [this] {
                 const std::string said = host_.action ? host_.action("open_textures") : "Not available";
                 NeedRestart("HD textures");
@@ -1064,7 +1069,7 @@ private:
             if (host_.action) Say(host_.action("reset_controls"));
         }, "Reset"));
         items.push_back(Info("The sticks: W A S D and the left stick (circle pad), O L K ; and the right stick (C-stick)."));
-        items.push_back(Info("F1 (the menu), F2, F3 and F11 are the program's own keys."));
+        items.push_back(Info("F1 (the menu), F2, F3, F8 and F11 are the program's own keys."));
     }
 
     // What a host action answers, said in the language: a known sentence, or a sentence that ends with a name.
@@ -1155,7 +1160,10 @@ private:
     // ---- the mods page: the folders of <user>\load\mods, on or off, in the order they are applied ----
     void BuildMods(std::vector<Item>& items) {
         const std::vector<std::string> mods = SplitLines(host_.action ? host_.action("mods_list") : "");  // name|flags|on
-        items.push_back(Info("Mods change the game's files. A change applies the next time the game starts.", 2));
+        // the mods of this program itself (they read or change the game; none is a graphics option)
+        items.push_back(Info("Built-in mods: they live in the game while it runs.", 2));
+        items.push_back(Choice("Monster life bar (mod)", "monster_hp", {"off", "on"}));
+        items.push_back(Info("Mods you add change the game's files. A change applies the next time the game starts.", 2));
         if (mods.empty()) {
             items.push_back(Info("No mods yet. Drop a mod's folder or .zip on this window, or open the folder and copy it there.", 1));
         }
@@ -1218,15 +1226,17 @@ private:
                 host_.apply(pad_setting, "");
                 Say("Put back as it was.");
                 finish();
-            } else if (e.key.key != SDLK_F1) {
+            } else if (e.key.key == SDLK_F1) {
+                return false;  // F1 closes the menu
+            } else if (ReservedKey(e.key.key)) {
+                Say(Tr("That key is used by the program (menu, touch popup, log mark, full screen). Press another one."));
+            } else {
                 const char* key = skip_capture ? SDL_GetKeyName(e.key.key) : SDL_GetScancodeName(e.key.scancode);
                 if (key != nullptr && *key != '\0') {
                     host_.apply(key_setting, key);
                     Say(Tr("Saved: ") + key);
                 }
                 finish();
-            } else {
-                return false;  // F1 closes the menu
             }
             return true;
         }

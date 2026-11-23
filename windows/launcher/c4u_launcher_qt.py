@@ -117,6 +117,11 @@ class Window(QWidget):
     def closeEvent(self, event):
         self._app.on_app_close()
         event.accept()
+        # Closing the window ends the launcher. Qt does that by itself when no other window of the program is left, but a window that is
+        # still alive (a menu, a tip, a fade) kept one process running with no window at all (seen on Windows): quit now, and if the
+        # loop has not ended in two seconds, leave anyway (everything that had to be saved was, in on_app_close).
+        QApplication.quit()
+        threading.Timer(2.0, lambda: os._exit(0)).start()
 
 
 class ArtPanel(GlassPanel):
@@ -240,7 +245,9 @@ class C4ULauncherApp(C4ULogic):
         self.log_timer = QTimer()
         self.log_timer.timeout.connect(self.refresh_log)
         self.log_timer.start(1500)
+        self._library_state = "unknown"
         self.refresh_status()
+        self.check_library()
         if c4u_updater:
             threading.Thread(target=self._prune, daemon=True).start()
             if self.config.get("auto_check_updates", True):
@@ -285,6 +292,9 @@ class C4ULauncherApp(C4ULogic):
                     self.progress.set(data)
                 elif kind == "game_exit":
                     self._game_exited(data)
+                elif kind == "library_status":
+                    self._library_state = data
+                    self.refresh_status()
                 elif kind == "info":
                     qtshim.messagebox.showinfo(*data)
                 elif kind == "error":
@@ -493,6 +503,19 @@ class C4ULauncherApp(C4ULogic):
         sg.setColumnStretch(1, 1)
         lay.addWidget(status)
 
+        # shown only when the code library has to be made again (the tools of this version changed it: new hooks or tables)
+        self.card_recompile = GlassPanel("inset", 14)
+        rl = QHBoxLayout(self.card_recompile)
+        rl.setContentsMargins(16, 10, 16, 10)
+        rl.addWidget(Label("🔧", None, 16))
+        self.lbl_recompile = Label("", CREAM, 10.5)
+        self.lbl_recompile.setWordWrap(True)
+        rl.addWidget(self.lbl_recompile, 1)
+        self.btn_recompile = Button("", "gold", self.on_recompile, height=40, size=11)
+        rl.addWidget(self.btn_recompile)
+        self.card_recompile.setVisible(False)
+        lay.addWidget(self.card_recompile)
+
         self.btn_play = Button("", "gold", self.on_play, height=64, size=16)
         self.btn_play.setMinimumWidth(460)
         lay.addWidget(self.btn_play, 0, Qt.AlignmentFlag.AlignHCenter)
@@ -603,6 +626,9 @@ class C4ULauncherApp(C4ULogic):
         self.lbl_mods_msg.setWordWrap(True)
         tl.addWidget(self.lbl_mods_msg)
         lay.addWidget(top)
+
+        if self.form is not None:  # the mods this program carries itself (the monster life bar): switches, with what each one does
+            self.form.build_cards("mods", lay)
 
         self.mods_card = GlassPanel("card", 16)
         self.mods_lay = QVBoxLayout(self.mods_card)
@@ -739,6 +765,7 @@ class C4ULauncherApp(C4ULogic):
         self.btn_play.configure(text=play, state="normal" if (state != "missing" and not running) else "disabled")
         self.btn_setup.configure(text=self.tr("🛠️  Prepare the game again (choose files)", "🛠️  Preparar el juego de nuevo (elegir archivos)"),
                                  state="normal" if state != "missing" else "disabled")
+        self._refresh_recompile_card(state, running)
         self.lbl_summary.setText(self.summary())
         self.refresh_saves_label()
         self.refresh_log()
@@ -793,6 +820,47 @@ class C4ULauncherApp(C4ULogic):
         self.refresh_status()
         if self.config.get("minimize_on_play", True):
             QTimer.singleShot(600, self.window.showMinimized)
+
+    def check_library(self):
+        """Asks, in the background, whether the code library is the one this version's tools make (c4u_logic.library_status)."""
+        def work():
+            try:
+                self.ui_queue.put(("library_status", self.library_status()))
+            except Exception:
+                self.ui_queue.put(("library_status", "unknown"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _refresh_recompile_card(self, state, running):
+        stale = getattr(self, "_library_state", "unknown") == "stale" and state == "ready"
+        self.card_recompile.setVisible(stale)
+        if not stale:
+            return
+        base, update = self.setup_files()
+        if base and update:
+            text = self.tr(
+                "This version changed the game's code library (new hooks), so it has to be made again for this PC. It takes a few minutes and "
+                "uses the same game files; your saves are not touched. The game keeps working in the meantime, without the new features.",
+                "Esta versión cambió la biblioteca de código del juego (ganchos nuevos), así que hay que hacerla de nuevo para este PC. Tarda unos "
+                "minutos y usa los mismos archivos de tu juego; tus partidas no se tocan. Mientras tanto el juego funciona, sin las novedades.")
+        else:
+            text = self.tr(
+                "This version changed the game's code library, so it has to be made again. The files it was made from were not found: use "
+                "'Prepare the game again' and choose them.",
+                "Esta versión cambió la biblioteca de código del juego, así que hay que hacerla de nuevo. No se encuentran los archivos con los que "
+                "se hizo: usa 'Preparar el juego de nuevo' y elígelos.")
+        self.lbl_recompile.setText(text)
+        self.btn_recompile.configure(text=self.tr("🔧  Make it again", "🔧  Hacerla de nuevo"),
+                                     state="normal" if (base and update and not running) else "disabled")
+
+    def on_recompile(self):
+        err = self.recompile(on_exit=lambda code: self.ui_queue.put(("game_exit", code)))
+        if err == "files":
+            qtshim.messagebox.showerror("Caravan4URecomp", self.tr("The game files it was made from were not found: use 'Prepare the game again'.",
+                                                                  "No se encuentran los archivos del juego: usa 'Preparar el juego de nuevo'."))
+        elif err:
+            qtshim.messagebox.showerror("Caravan4URecomp", self.tr(f"It could not start: {err}", f"No se pudo iniciar: {err}"))
+        else:
+            self.refresh_status()
 
     def on_setup(self):
         err = self.launch_game(["--setup"], on_exit=lambda code: self.ui_queue.put(("game_exit", code)))
@@ -900,6 +968,7 @@ class C4ULauncherApp(C4ULogic):
 
     def _game_exited(self, code):
         self.refresh_status()
+        self.check_library()
         if self.window.isMinimized():
             self.window.showNormal()
             self.window.activateWindow()

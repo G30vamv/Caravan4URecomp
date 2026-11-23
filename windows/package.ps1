@@ -22,7 +22,7 @@ $source = $PSScriptRoot
 $repo = Split-Path $source -Parent
 $parent = Split-Path $repo -Parent
 if (-not $OutDir) { $OutDir = Join-Path $parent "dist\package" }
-if (-not $BuildDir) { $BuildDir = Join-Path $parent "build\win" }
+if (-not $BuildDir) { $BuildDir = Join-Path $parent "buildelease" }   # its own build folder: the release build rewrites the source paths, the test build (build\win) does not
 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
 
 # the portable Python (the embeddable package of python.org; PSF license): downloaded once into deps\, kept by its SHA-256
@@ -43,7 +43,7 @@ if (Test-Path $pkg) { Remove-Item $pkg -Recurse -Force }
 New-Item -ItemType Directory -Force $pkg | Out-Null
 
 # 1. the program, the DLLs, the licenses and a settings file (build.ps1 makes them)
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $source "build.ps1") -BuildDir $BuildDir -DistDir $pkg
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $source "build.ps1") -BuildDir $BuildDir -DistDir $pkg -Release
 if ($LASTEXITCODE -ne 0) { throw "build.ps1 failed" }
 
 # 2. the two tools the setup needs besides the program (they come from the same build)

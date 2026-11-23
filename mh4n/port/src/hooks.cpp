@@ -1331,6 +1331,14 @@ void PanelTouchAllowed(RCtx* ctx, RFunc original) {
     const int index = PanelIndex(ctx, SkipPanel());
     if (index < 0) {
         if (!skip_offered.load(std::memory_order_relaxed)) {  // MODIFIED: a scene skip with no such button on this screen: nothing to tap
+            // (said in the log, once a press: a skip that does nothing in a scene shows here what the touch screen held, e.g. the game's
+            // own menu taking the Back button)
+            const u32 mode = rd8(ctx, PANEL_MANAGER + PANEL_MODE);
+            LogInfo("skip: nothing to tap, no button {} on this touch screen (mode {}: panels {} {} {} {})", SkipPanel(), mode,
+                    rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16) & 0xFF)),
+                    rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16 + 4) & 0xFF)),
+                    rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16 + 8) & 0xFF)),
+                    rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16 + 12) & 0xFF)));
             skip_tap = 0;
             return;
         }

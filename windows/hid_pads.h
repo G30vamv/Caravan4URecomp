@@ -25,6 +25,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -335,8 +338,9 @@ inline Open OpenDevice(const std::string& path, std::shared_ptr<Pad>& out, std::
             if (c.UsagePage != kPageGeneric) continue;
             const USHORT first = c.IsRange ? c.Range.UsageMin : c.NotRange.Usage;
             const USHORT last = c.IsRange ? c.Range.UsageMax : c.NotRange.Usage;
-            for (USHORT u = first; u <= last; ++u) {
-                pad->axes.push_back({static_cast<std::uint8_t>(c.ReportID), u, c.LogicalMin, c.LogicalMax, c.BitSize});
+            // 32-bit counter and a cap: a range ending at 0xFFFF made a 16-bit counter loop forever (and fill the memory)
+            for (unsigned u = first; u <= last && u < first + 64u; ++u) {
+                pad->axes.push_back({static_cast<std::uint8_t>(c.ReportID), static_cast<std::uint16_t>(u), c.LogicalMin, c.LogicalMax, c.BitSize});
             }
         }
     }
@@ -356,7 +360,7 @@ inline Open OpenDevice(const std::string& path, std::shared_ptr<Pad>& out, std::
     return Open::Pad;
 }
 
-inline void ReadLoop(std::shared_ptr<Pad> pad) {
+inline void ReadLoopBody(const std::shared_ptr<Pad>& pad) {
     std::vector<std::uint8_t> buffer(pad->report_len);
     bool first = true, unread = false;
     for (;;) {
@@ -385,6 +389,16 @@ inline void ReadLoop(std::shared_ptr<Pad> pad) {
     pad->alive.store(false);
 }
 
+/// The reader thread: whatever goes wrong with one pad (an exception) ends that pad only, never the program.
+inline void ReadLoop(std::shared_ptr<Pad> pad) {
+    try {
+        ReadLoopBody(pad);
+    } catch (...) {
+        std::fprintf(stderr, "[hid] the reader of %04x:%04x failed; the pad is dropped\n", pad->vendor, pad->product);
+    }
+    pad->alive.store(false);
+}
+
 }  // namespace detail
 
 /// Whether an XInput pad is connected (a real Xbox pad, or the virtual one DSX, DS4Windows or Steam Input make).
@@ -407,6 +421,7 @@ inline bool XInputConnected() {
 inline void Start() {
     if (detail::g_started.exchange(true)) return;
     std::thread([] {
+      try {
         std::set<std::string> rejected, warned, open;
         for (;;) {
             const std::vector<std::string> paths = detail::DevicePaths();
@@ -442,7 +457,30 @@ inline void Start() {
             }
             std::this_thread::sleep_for(std::chrono::seconds(2));
         }
+      } catch (...) {
+        std::fprintf(stderr, "[hid] the pad scanner failed and stopped; the HID pads are off for this run\n");
+      }
     }).detach();
+}
+
+// A start guard. A crash cannot be caught, and the HID code opens every gamepad-like device of the PC, so a marker file lives from
+// the moment the HID reading starts until it has run for a while (or the program ends normally). If the marker is still there at the
+// next start, the program died inside it: the HID pads stay off and the game opens as usual (SDL still serves the pads it can).
+// MH4U_HID_FORCE=1 tries again.
+inline std::filesystem::path GuardPath() {
+    std::error_code ec;
+    return std::filesystem::temp_directory_path(ec) / "Caravan4URecomp_hid_start.marker";
+}
+inline bool GuardTripped() {
+    const char* force = std::getenv("MH4U_HID_FORCE");
+    if (force && std::string(force) == "1") return false;
+    std::error_code ec;
+    return std::filesystem::exists(GuardPath(), ec);
+}
+inline void ArmGuard() { std::ofstream(GuardPath(), std::ios::trunc) << "hid\n"; }
+inline void DisarmGuard() {
+    std::error_code ec;
+    std::filesystem::remove(GuardPath(), ec);
 }
 
 /// The pads connected now with what each one holds.

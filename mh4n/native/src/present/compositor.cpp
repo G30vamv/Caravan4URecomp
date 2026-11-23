@@ -149,6 +149,24 @@ std::string RcasFragmentSource() {
     return std::string(kFsrHead) + kRcasHead + kFfxA + "\n" + kFfxFsr1 + kRcasTail;
 }
 
+// MODIFIED (2026-11-23): the AMD proprietary driver (amdvlk, also the Vulkan of Radeon Adrenalin) crashed inside vkCreateGraphicsPipelines on
+// the two FSR modules (found on a Radeon iGPU; the plain copies were fine). With the debug names of the module (OpName, OpMemberName) removed
+// the same modules work there: the shaders are drawn and look right. Nothing else about them changes.
+void StripNames(std::vector<u32>& spirv) {
+    std::vector<u32> out(spirv.begin(), spirv.begin() + 5);
+    for (std::size_t at = 5; at < spirv.size();) {
+        const u32 count = spirv[at] >> 16, op = spirv[at] & 0xFFFF;
+        if (count == 0 || at + count > spirv.size()) {
+            return;
+        }
+        if (op != 5 && op != 6) {
+            out.insert(out.end(), spirv.begin() + at, spirv.begin() + at + count);
+        }
+        at += count;
+    }
+    spirv = std::move(out);
+}
+
 const rhi::BindingSetDesc kSetDesc{{{0, rhi::BindingType::SampledImage}, {1, rhi::BindingType::Sampler}}};
 
 constexpr u64 kVertexRingSize = 256 * 1024;
@@ -196,7 +214,9 @@ struct Compositor::State {
         std::error_code ec;
         return std::filesystem::temp_directory_path(ec) / "Caravan4URecomp_fsr_pipeline.marker";
     }
-    std::string FsrGpu() const { return backend->Caps().device_name + " / " + backend->Caps().driver_name; }
+    // (the marker also names the version of the shaders: a crash recorded before the names were removed from them, which is what crashed
+    // amdvlk, no longer keeps FSR off)
+    std::string FsrGpu() const { return backend->Caps().device_name + " / " + backend->Caps().driver_name + " / shaders 2"; }
     bool FsrCrashedBefore() const {
         const char* force = std::getenv("MH4N_FSR_FORCE");
         if (force != nullptr && force[0] == '1') {
@@ -221,6 +241,8 @@ struct Compositor::State {
                 easu_spirv.clear();
                 rcas_spirv.clear();
             } else {
+                StripNames(easu_spirv);
+                StripNames(rcas_spirv);
                 MH4N_LOG(Info, kLog, "FSR 1.0 (EASU, then RCAS) is ready");
             }
         }
