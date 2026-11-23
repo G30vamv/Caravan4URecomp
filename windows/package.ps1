@@ -55,10 +55,11 @@ $bin = Join-Path $tools "bin"
 New-Item -ItemType Directory -Force $bin | Out-Null
 Copy-Item (Join-Path $BuildDir "bin\mh4u_native_runner.exe") $bin -Force
 Copy-Item (Join-Path $BuildDir "bin\mh4n_vkprobe.exe") $bin -Force
+Copy-Item (Join-Path $BuildDir "bin\mh4n_hdpack.exe") $bin -Force  # the launcher converts the HD textures with it
 $mingwBin = Split-Path (Get-Command clang).Source -Parent
 $strip = Join-Path $mingwBin "llvm-strip.exe"
 if (Test-Path $strip) {  # the debug information makes each program about 180 MB; the player does not need it
-    foreach ($exe in (Join-Path $pkg "Caravan4URecomp.exe"), (Join-Path $bin "mh4u_native_runner.exe"), (Join-Path $bin "mh4n_vkprobe.exe")) {
+    foreach ($exe in (Join-Path $pkg "Caravan4URecomp.exe"), (Join-Path $bin "mh4u_native_runner.exe"), (Join-Path $bin "mh4n_vkprobe.exe"), (Join-Path $bin "mh4n_hdpack.exe")) {
         & $strip --strip-all $exe
     }
 }

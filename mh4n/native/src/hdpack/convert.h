@@ -34,6 +34,9 @@ struct ConvertOptions {
     u32 threads = 0; // 0: the number of hardware threads
     Bc7Quality quality;
     bool restart = false; // ignore the partial work of an earlier run
+    // MODIFIED for the Windows port: a texture whose longer side is above this is halved (the levels of its mip chain) until it is not;
+    // 0: every texture keeps its size. Only RGBA8 sources (PNG) are reduced.
+    u32 max_size = 0;
     // Polled between files; true stops the run (the partial work is kept).
     std::function<bool()> cancel;
     // Called from the calling thread after a file is written, at most once a second and after

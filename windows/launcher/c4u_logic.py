@@ -149,6 +149,14 @@ class C4ULogic:
                 pass
 
     # ---- folders and the log -----------------------------------------------------------------------------------------
+    def hdpack_exe(self):
+        """The HD texture converter (mh4n_hdpack.exe), or "" when this package does not have it."""
+        for rel in (os.path.join("game-tools", "bin", "mh4n_hdpack.exe"), "mh4n_hdpack.exe"):
+            path = os.path.join(self.base_dir, rel)
+            if os.path.isfile(path):
+                return path
+        return ""
+
     def user_dir(self, ini_values):
         path = ini_values.get("user", "")
         return path if path and os.path.isdir(path) else os.path.join(self.base_dir, "game", "user")

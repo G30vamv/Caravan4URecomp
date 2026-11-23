@@ -175,13 +175,23 @@ void QueueGpu::Start(std::function<void()> make_inner) {
 }
 
 void QueueGpu::RendererMain() {
+    // MODIFIED for the Windows port: MH4N_QUEUE_STATS=1 logs every 5 s how long the renderer thread was busy, idle (nothing
+    // queued) and how long its longest item took (a measurement aid for the frame pipeline).
+    const bool stats = std::getenv("MH4N_QUEUE_STATS") != nullptr;
+    u64 stat_busy = 0, stat_idle = 0, stat_items = 0, stat_max = 0, stat_depth = 0;
+    auto stat_start = Clock::now();
     for (;;) {
         std::function<void()> item;
         {
+            const auto idle_start = Clock::now();
             std::unique_lock lock(mutex_);
             work_cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
             if (queue_.empty()) {
                 return;
+            }
+            if (stats) {
+                stat_idle += Elapsed(idle_start);
+                stat_depth = std::max<u64>(stat_depth, queue_.size());
             }
             item = std::move(queue_.front());
             queue_.pop_front();
@@ -195,7 +205,19 @@ void QueueGpu::RendererMain() {
         } catch (...) {
             MH4N_LOG(Error, kLog, "Renderer call failed with an unknown exception");
         }
-        busy_ns_.fetch_add(Elapsed(start), std::memory_order_relaxed);
+        const u64 spent = Elapsed(start);
+        busy_ns_.fetch_add(spent, std::memory_order_relaxed);
+        if (stats) {
+            stat_busy += spent;
+            ++stat_items;
+            stat_max = std::max(stat_max, spent);
+            if (Elapsed(stat_start) >= 5000000000ull) {
+                MH4N_LOG(Info, kLog, "renderer thread over 5 s: busy {:.0f} ms, idle {:.0f} ms, {} items, longest {:.1f} ms, deepest queue {}",
+                         stat_busy / 1e6, stat_idle / 1e6, stat_items, stat_max / 1e6, stat_depth);
+                stat_busy = stat_idle = stat_items = stat_max = stat_depth = 0;
+                stat_start = Clock::now();
+            }
+        }
         {
             std::lock_guard lock(mutex_);
             ++completed_;

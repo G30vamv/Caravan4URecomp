@@ -63,13 +63,16 @@ if (-not (Test-Path (Join-Path $sdlPrefix "bin\SDL3.dll"))) { throw "SDL3 not fo
 & $cmake -S $source -B $BuildDir -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ `
     "-DCMAKE_CXX_FLAGS=-include cstdlib" "-DCMAKE_PREFIX_PATH=$sdlPrefix"
 if ($LASTEXITCODE -ne 0) { throw "configure failed" }
-& $cmake --build $BuildDir --target mh4u-win
+& $cmake --build $BuildDir --target mh4u-win mh4n_hdpack_tool
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
 # the folder to run it from: the exe, SDL3 and llvm-mingw's runtime DLLs; the settings file is kept if there is one
 New-Item -ItemType Directory -Force $DistDir | Out-Null
 Copy-Item (Join-Path $BuildDir "Caravan4URecomp.exe") $DistDir -Force
 Copy-Item (Join-Path $sdlPrefix "bin\SDL3.dll") $DistDir -Force
+# the HD texture converter the launcher runs (mh4n_hdpack.exe, in game-tools\bin as in the package)
+New-Item -ItemType Directory -Force (Join-Path $DistDir "game-tools\bin") | Out-Null
+Copy-Item (Join-Path $BuildDir "bin\mh4n_hdpack.exe") (Join-Path $DistDir "game-tools\bin") -Force
 foreach ($dll in "libc++.dll", "libunwind.dll", "libwinpthread-1.dll") {
     Copy-Item (Join-Path $mingwBin $dll) $DistDir -Force
 }

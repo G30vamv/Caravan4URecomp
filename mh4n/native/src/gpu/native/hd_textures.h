@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "gpu/texture/formats.h"
+#include "hdpack/archive.h"
 #include "mh4n/types.h"
 
 namespace mh4n::gpu::native {
@@ -65,6 +66,19 @@ public:
     // The pack's texture for a texture whose content hash (the texture cache's) is `content` and whose memory is `data`;
     // nullptr when no pack has it. Answered once for each content.
     const Replacement* Find(u64 content, const u8* data, std::size_t size, u32 width, u32 height, texture::Format format);
+
+    // MODIFIED for the Windows port: converted packs (*.mh4hdpk, made by mh4n_hdpack: BC7 blocks with mips, rows as the
+    // renderer's images hold them) are read too. Set before Load: false when the device cannot sample block-compressed images.
+    void SetCompressedAllowed(bool allowed) { compressed_allowed_ = allowed; }
+    // A texture of such an archive: its bytes (Take) are the blob of the levels, level 0 first, not RGBA8.
+    bool Compressed(const Replacement& r) const { return files_[r.file].archive >= 0; }
+    u32 Mips(const Replacement& r) const { return files_[r.file].mips; }
+    hdpack::PixelFormat PackFormat(const Replacement& r) const { return static_cast<hdpack::PixelFormat>(files_[r.file].pfmt); }
+    // What the texture takes on the GPU (and what the upload counts): the blob's size, or width * height * 4
+    u64 UploadBytes(const Replacement& r) const {
+        const File& f = files_[r.file];
+        return f.archive >= 0 ? f.size : u64{r.width} * r.height * 4;
+    }
 
     // The size a texture of the pack is drawn at: the file's, or halved as many times as it takes to fit MH4N_HD_MAX_SIZE.
     void CappedSize(u32 width, u32 height, u32& out_width, u32& out_height) const;
@@ -106,6 +120,9 @@ private:
         bool refused = false;  // (Refuse)
         u64 retry_at = 0;      // (DelayUploadRetry) the frame from which it may be asked for again
         u32 width = 0, height = 0;
+        int archive = -1;  // index into archives_ (a converted pack), else a PNG file
+        u64 offset = 0, size = 0;
+        u8 mips = 1, pfmt = 0;
     };
     struct Answer {
         bool found = false;
@@ -116,6 +133,8 @@ private:
                           const std::vector<u8>* rgba);
 
     std::vector<File> files_;
+    std::vector<hdpack::ArchiveReader> archives_;
+    bool compressed_allowed_ = true;
     std::unordered_map<u64, u32> by_hash_[2];  // old hash, new hash -> file
     std::unordered_map<u64, Answer> answers_;  // by content hash (and size, format)
     std::string dump_dir_;

@@ -7,6 +7,8 @@ c4u_form.py from the schema (c4u_options.py)."""
 
 import os
 import queue
+import re
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -14,7 +16,7 @@ import webbrowser
 from PySide6.QtCore import QEvent, QTimer, Qt
 from PySide6.QtCore import QRectF
 from PySide6.QtGui import QColor, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap
-from PySide6.QtWidgets import QApplication, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QScrollArea, QVBoxLayout, QWidget
 
 import qtanim
 import qtglass
@@ -509,6 +511,8 @@ class C4ULauncherApp(C4ULogic):
         al.addWidget(Button(self.tr("💾  Open the saves folder", "💾  Abrir la carpeta de partidas"),
                             "default", lambda: self.open_folder(self.save_dirs(self.store.values)[0])))
         al.addWidget(Button(self.tr("📄  Open the HD textures folder", "📄  Abrir la carpeta de texturas HD"), "default", self.open_textures))
+        al.addWidget(Button(self.tr("🧩  Convert the HD textures (faster, less video memory)", "🧩  Convertir las texturas HD (más rápido, menos memoria de vídeo)"),
+                            "default", self.on_convert_textures))
         al.addStretch(1)
         row.addWidget(actions, 2)
 
@@ -805,6 +809,95 @@ class C4ULauncherApp(C4ULogic):
             pass
         self.open_folder(path)
 
+    # ---- HD textures: PNG pack -> one BC7 file ---------------------------------------------------------------------------------
+    def on_convert_textures(self):
+        """Converts every texture of the HD pack in <user>\\load\\textures into one block-compressed file (MH4U-BC7.mh4hdpk) that the game
+        reads in place of the PNG files: it takes about a third of the video memory and loads faster. All the textures are converted;
+        the only choice is a size limit (the originals are not touched)."""
+        if getattr(self, "_busy_convert", False):
+            return
+        if self.is_running():
+            qtshim.messagebox.showinfo("Caravan4URecomp", self.tr("Close the game first.", "Cierra el juego primero."))
+            return
+        exe = self.hdpack_exe()
+        folder = os.path.join(self.user_dir(self.store.values), "load", "textures")
+        if not exe:
+            qtshim.messagebox.showerror("Caravan4URecomp", self.tr("This package has no texture converter (mh4n_hdpack.exe).",
+                                                                   "Este paquete no trae el conversor de texturas (mh4n_hdpack.exe)."))
+            return
+        if not os.path.isdir(folder):
+            qtshim.messagebox.showinfo("Caravan4URecomp", self.tr(f"There is no texture pack yet. Put it in:\n{folder}",
+                                                                  f"Todavía no hay un pack de texturas. Ponlo en:\n{folder}"))
+            return
+        sizes = [(self.tr("No limit: every texture keeps its size", "Sin límite: cada textura conserva su tamaño"), 0),
+                 (self.tr("4096 px at most", "4096 px como máximo"), 4096),
+                 (self.tr("2048 px at most (about half the disk space)", "2048 px como máximo (la mitad de espacio en disco, aprox.)"), 2048),
+                 (self.tr("1024 px at most (the smallest)", "1024 px como máximo (lo más pequeño)"), 1024)]
+        names = [name for name, _ in sizes]
+        choice, ok = QInputDialog.getItem(self.window, "Caravan4URecomp",
+                                          self.tr("Every texture of the pack is converted. Size limit:", "Se convierten todas las texturas del pack. Límite de tamaño:"),
+                                          names, 0, False)
+        if not ok:
+            return
+        limit = dict(sizes)[choice]
+        text = self.tr("The conversion makes one new file in the textures folder (it can take as much disk space as the PNG pack, or more with no limit) "
+                       "and keeps working in the background; your PNG files are not changed or deleted. Start?",
+                       "La conversión crea un archivo nuevo en la carpeta de texturas (puede ocupar tanto como el pack de PNG, o más sin límite) "
+                       "y trabaja en segundo plano; tus PNG no se cambian ni se borran. ¿Empezar?")
+        if not qtshim.messagebox.askyesno("Caravan4URecomp", text):
+            return
+        out = os.path.join(folder, "MH4U-BC7.mh4hdpk")
+        args = [exe, folder, "-o", out, "--threads", str(max(1, (os.cpu_count() or 4) - 2)), "--quality", "normal"]
+        if limit:
+            args += ["--max-size", str(limit)]
+        self._busy_convert = True
+        self.progress.setVisible(True)
+        self.ui_queue.put(("update_state", self.tr("Converting textures...", "Convirtiendo texturas...")))
+
+        def work():
+            error = ""
+            summary = ""
+            try:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # normal priority: the conversion is the only thing the user is waiting for
+                self._convert_process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                                         creationflags=flags, close_fds=True)
+                pattern = re.compile(r"hdpack: (\d+)/(\d+) textures.*?(?:about (\d+) s left)?$")
+                for line in self._convert_process.stdout:
+                    m = pattern.search(line)
+                    if m:
+                        done, total = int(m.group(1)), max(1, int(m.group(2)))
+                        self.ui_queue.put(("progress", done / total))
+                        left = int(m.group(3)) if m.group(3) else 0
+                        eta_en = f", about {max(1, round(left / 60))} min left" if left else ""
+                        eta_es = f", faltan unos {max(1, round(left / 60))} min" if left else ""
+                        self.ui_queue.put(("update_state", self.tr(f"Converting textures... {done}/{total} ({100 * done // total}%){eta_en}",
+                                                                   f"Convirtiendo texturas... {done}/{total} ({100 * done // total}%){eta_es}")))
+                    elif "done:" in line:
+                        summary = line.strip()
+                    elif line.strip():
+                        error = line.strip()
+                code = self._convert_process.wait()
+                if code == 0:
+                    self.ui_queue.put(("info", ("Caravan4URecomp", self.tr(
+                        "Done. The game reads the converted file from now on (open it again if it was running). Your PNG files are still there: delete them "
+                        "only when you have checked that everything looks right.\n\n" + summary,
+                        "Listo. El juego usa el archivo convertido desde ahora (ábrelo de nuevo si estaba abierto). Tus PNG siguen ahí: bórralos solo cuando hayas "
+                        "comprobado que todo se ve bien.\n\n" + summary))))
+                elif code == 4:
+                    self.ui_queue.put(("info", ("Caravan4URecomp", self.tr("The conversion was interrupted. Start it again to continue where it stopped.",
+                                                                           "La conversión se interrumpió. Empiézala de nuevo para seguir donde se quedó."))))
+                else:
+                    self.ui_queue.put(("error", ("Caravan4URecomp", self.tr(f"The conversion failed: {error}", f"La conversión falló: {error}"))))
+            except Exception as e:
+                self.ui_queue.put(("error", ("Caravan4URecomp", str(e))))
+            finally:
+                self._convert_process = None
+                self._busy_convert = False
+                self.ui_queue.put(("update_state", ""))
+                self.after(0, lambda: self.progress.setVisible(False))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _game_exited(self, code):
         self.refresh_status()
         if self.window.isMinimized():
@@ -812,6 +905,12 @@ class C4ULauncherApp(C4ULogic):
             self.window.activateWindow()
 
     def on_app_close(self):
+        proc = getattr(self, "_convert_process", None)
+        if proc is not None:  # the converter keeps what it did: starting it again continues
+            try:
+                proc.terminate()
+            except OSError:
+                pass
         self.poll.stop()
         self.log_timer.stop()
 

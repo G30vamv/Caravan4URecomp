@@ -17,6 +17,7 @@ MH4N_OPTION("hdpack", "--out", "OUT", "the archive to write (required); -o is th
 MH4N_OPTION("hdpack", "--threads", "N", "worker threads (default: all hardware threads)");
 MH4N_OPTION("hdpack", "--quality", "Q", "BC7 effort: fast, normal (default) or high");
 MH4N_OPTION("hdpack", "--restart", "", "ignore the partial work of an interrupted run");
+MH4N_OPTION("hdpack", "--max-size", "PX", "halve a texture until its longer side is at most PX (default: keep every size)");
 MH4N_OPTION("hdpack", "--verify", "", "after writing, check every blob against its CRC");
 
 namespace {
@@ -63,6 +64,12 @@ int RunHdPack(const std::vector<std::string>& args, std::ostream& out, std::ostr
         return 2;
     }
     convert.restart = options.Has("--restart");
+    try {
+        convert.max_size = static_cast<u32>(options.GetUInt("--max-size", 0));
+    } catch (const OptionError& e) {
+        err << "mh4n_hdpack: " << e.what() << "\n";
+        return 2;
+    }
     g_interrupted = false;
     std::signal(SIGINT, OnSignal);
     std::signal(SIGTERM, OnSignal);

@@ -8,6 +8,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import shutil
 import stat
 import sys
@@ -135,8 +136,10 @@ def build_manifest(version, package_dir, out, prev_manifest=None, notes_en="", n
                 if old and old["sha256"].lower() == digest and old["size"] == size:
                     url = old["url"]
                     prefix = RELEASE_URL + "/download/"
-                    if (not url.startswith(prefix)
-                            or not _historical_asset(url[len(prefix):], name, version)):
+                    # an older release's asset, or a file of the updates branch (publish_updates_branch.py rewrites the URLs of a
+                    # published manifest to the raw files of its commit, which stay reachable)
+                    if not ((url.startswith(prefix) and _historical_asset(url[len(prefix):], name, version))
+                            or _historical_raw(url, relative)):
                         raise _release_error(f"Invalid historical asset URL: {relative}",
                                              f"URL histórica del asset no válida: {relative}")
                     snapshot.unlink()
@@ -169,6 +172,15 @@ def build_manifest(version, package_dir, out, prev_manifest=None, notes_en="", n
         for item in (assets, archive, manifest, upload):
             item.rename(output / item.name)
     return data
+
+
+def _historical_raw(url, relative):
+    """True for https://raw.githubusercontent.com/<update repo>/<40-hex commit>/<this file's path>."""
+    prefix = f"https://raw.githubusercontent.com/{UPDATE_REPO}/"
+    if not url.startswith(prefix):
+        return False
+    commit, separator, path = url[len(prefix):].partition("/")
+    return bool(separator and re.fullmatch(r"[0-9a-f]{40}", commit) and unquote(path) == relative)
 
 
 def _historical_asset(suffix, name, version):

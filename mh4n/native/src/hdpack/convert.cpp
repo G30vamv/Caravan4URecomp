@@ -45,10 +45,10 @@ struct Record {
 constexpr char kJournalMagic[8] = {'M', 'H', '4', 'H', 'D', 'J', '0', '1'};
 constexpr std::size_t kJournalHeader = 12;
 
-u32 Fingerprint(const PackOptions& options, const Bc7Quality& quality) {
-    const std::string text = fmt::format("v1 new={} flip={} uber={} parts={}", options.use_new_hash,
+u32 Fingerprint(const PackOptions& options, const Bc7Quality& quality, u32 max_size) {
+    const std::string text = fmt::format("v1 new={} flip={} uber={} parts={} max={}", options.use_new_hash,
                                          options.flip_png_files, quality.uber_level,
-                                         quality.max_partitions);
+                                         quality.max_partitions, max_size);
     return Crc32(text.data(), text.size());
 }
 
@@ -139,7 +139,7 @@ bool ReadWhole(const fs::path& path, std::vector<u8>& out) {
 }
 
 Converted ConvertFile(const std::string& dir, const PackFile& file, const PackOptions& options,
-                      const Bc7Quality& quality) {
+                      const Bc7Quality& quality, u32 max_size) {
     Converted result;
     Record& r = result.record;
     r.path = file.path;
@@ -179,10 +179,20 @@ Converted ConvertFile(const std::string& dir, const PackFile& file, const PackOp
         const auto chain = BuildMipChain(image.levels[0].data(), image.width, image.height,
                                          file.type == MapType::Color);
         r.format = PixelFormat::BC7;
-        r.mips = static_cast<u8>(chain.size());
+        // the first levels of the chain that go beyond max_size are left out (the picture is the one that fits)
+        std::size_t skip = 0;
         u32 w = image.width;
         u32 h = image.height;
-        for (const auto& level : chain) {
+        while (max_size != 0 && std::max(w, h) > max_size && w > 1 && h > 1 && skip + 1 < chain.size()) {
+            w = std::max(1u, w >> 1);
+            h = std::max(1u, h >> 1);
+            ++skip;
+        }
+        r.width = w;
+        r.height = h;
+        r.mips = static_cast<u8>(chain.size() - skip);
+        for (std::size_t index = skip; index < chain.size(); ++index) {
+            const auto& level = chain[index];
             const std::size_t at = result.blob.size();
             result.blob.resize(at + LevelBytes(PixelFormat::BC7, w, h));
             EncodeBc7(level.data(), w, h, quality, result.blob.data() + at);
@@ -241,7 +251,7 @@ ConvertResult Convert(const ConvertOptions& options) {
 
     const std::string part_path = options.out_path + ".part";
     const std::string journal_path = options.out_path + ".journal";
-    const u32 fingerprint = Fingerprint(pack.options, options.quality);
+    const u32 fingerprint = Fingerprint(pack.options, options.quality, options.max_size);
 
     // Take over what an earlier run finished.
     std::map<std::string, Record> records;
@@ -346,7 +356,7 @@ ConvertResult Convert(const ConvertOptions& options) {
             }
             Converted converted = ConvertFile(options.pack_dir,
                                               pack.files[static_cast<std::size_t>(pending[i])],
-                                              pack.options, options.quality);
+                                              pack.options, options.quality, options.max_size);
             std::unique_lock lock(mutex);
             space_free.wait(lock, [&] { return queue.size() < queue_limit || stop.load(); });
             if (stop.load()) {

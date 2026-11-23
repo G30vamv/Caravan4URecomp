@@ -4,6 +4,7 @@
 #include "renderer.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <limits>
 
 #include "gpu/backend/targets/upload.h"
+#include "hdpack/image.h"
 #include "mh4n/log.h"
 
 namespace mh4n::gpu::native {
@@ -50,12 +52,62 @@ bool UploadFace(rhi::Backend& backend, rhi::Recorder& recorder, rhi::Ring& stagi
     return rhi::UploadToImage(backend, recorder, image, region, flipped).ok();
 }
 
+// MODIFIED for the Windows port: the levels of a converted HD texture (block-compressed, level 0 first) into an image made with
+// that many levels. A level goes through the staging ring, or alone when the ring cannot hold it.
+bool UploadBlocks(rhi::Backend& backend, rhi::Recorder& recorder, rhi::Ring& staging, rhi::Image& image,
+                  hdpack::PixelFormat format, u32 mips, std::span<const u8> blob) {
+    u64 offset = 0;
+    for (u32 level = 0; level < mips; ++level) {
+        const u32 width = std::max(1u, image.Width() >> level), height = std::max(1u, image.Height() >> level);
+        const u64 bytes = hdpack::LevelBytes(format, width, height);
+        if (offset + bytes > blob.size()) return false;
+        const std::span<const u8> data = blob.subspan(offset, bytes);
+        rhi::BufferImageRegion region{};
+        region.mip_level = level;
+        region.image_rect = {0, 0, width, height};
+        bool done = false;
+        if (const auto allocation = staging.Map(bytes, 16)) {
+            std::memcpy(allocation->data.data(), data.data(), bytes);
+            staging.GetBuffer()->Flush(allocation->offset, bytes);
+            if (staging.Commit(bytes)) {
+                region.buffer_offset = allocation->offset;
+                recorder.CopyBufferToImage(*staging.GetBuffer(), image, std::span{&region, 1});
+                done = true;
+            }
+        }
+        if (!done && !rhi::UploadToImage(backend, recorder, image, region, data).ok()) return false;
+        offset += bytes;
+    }
+    return true;
+}
+
+rhi::Format BlockFormat(hdpack::PixelFormat format) {
+    switch (format) {
+    case hdpack::PixelFormat::BC1: return rhi::Format::Bc1Unorm;
+    case hdpack::PixelFormat::BC3: return rhi::Format::Bc3Unorm;
+    case hdpack::PixelFormat::BC5: return rhi::Format::Bc5Unorm;
+    default: return rhi::Format::Bc7Unorm;
+    }
+}
+
+// MODIFIED for the Windows port: only the textures a notification touches are marked (cache.h says this is the intended way;
+// the struct default marked all of them, so every flush rehashed every texture the frame drew). MH4N_TEXTURE_CHECK_ALL=1 brings
+// the old behaviour back.
+texture::TextureCache::Config CacheConfig() {
+    texture::TextureCache::Config config;
+    config.check_all_on_notify = false;
+    const char* all = std::getenv("MH4N_TEXTURE_CHECK_ALL");
+    if (all) config.check_all_on_notify = std::string_view{all} == "1";
+    return config;
+}
+
 } // namespace
 
 TextureBindings::TextureBindings(Host& host, std::shared_ptr<rhi::Backend> backend, Surfaces& surfaces,
                                  const NativeOptions& options, CounterMap& counters)
     : host_(host), backend_(std::move(backend)), surfaces_(surfaces), target_textures_(options.target_textures),
-      counters_(counters), cache_(host), samplers_(backend_) {
+      counters_(counters), cache_(host, CacheConfig()), samplers_(backend_) {
+    hd_.SetCompressedAllowed(backend_ && backend_->ChooseFormat(rhi::Format::Bc7Unorm, rhi::FormatUse::Sampled).conversion == rhi::Conversion::None);
     const char* enabled = std::getenv("MH4N_HD_TEXTURES");
     if (enabled && std::string_view{enabled} == "0") return;
     const char* packs = std::getenv("MH4N_TEXTURE_PACKS");
@@ -152,7 +204,7 @@ std::shared_ptr<rhi::Image> TextureBindings::GuestImage(std::span<const texture:
             kept.hd_pending.reset();
             return kept.image;
         }
-        const u64 size = u64{kept.hd_pending->width} * kept.hd_pending->height * 4;
+        const u64 size = hd_.UploadBytes(*kept.hd_pending);
         if (status == HdTextures::State::Pending || (hd_upload_bytes_ != 0 && hd_upload_bytes_ + size > kHdUploadPerFrame)) {
             return kept.image;
         }
@@ -184,7 +236,7 @@ std::shared_ptr<rhi::Image> TextureBindings::GuestImage(std::span<const texture:
             }
         }
         if (found) {
-            const u64 size = u64{found->width} * found->height * 4;
+            const u64 size = hd_.UploadBytes(*found);
             const auto status = pending_hd ? HdTextures::State::Ready : hd_.Status(*found);
             // (a texture bigger than the cap goes up alone, first in its frame: the pack's 4096x4096 fonts are 64 MB)
             if (status == HdTextures::State::Ready && (hd_upload_bytes_ == 0 || hd_upload_bytes_ + size <= kHdUploadPerFrame)) {
@@ -200,11 +252,22 @@ std::shared_ptr<rhi::Image> TextureBindings::GuestImage(std::span<const texture:
     if (hd) {
         desc.width = hd->width;
         desc.height = hd->height;
+        const bool blocks = hd_.Compressed(*hd);
+        if (blocks) {
+            desc.format = BlockFormat(hd_.PackFormat(*hd));
+            desc.mip_levels = std::min<u32>(hd_.Mips(*hd), std::bit_width(std::max(desc.width, desc.height)));
+        }
         auto replacement = backend_->CreateImage(desc);
-        if (replacement && UploadFace(*backend_, recorder, staging, **replacement, 0, hd_pixels)) {
+        const bool uploaded = replacement && (blocks ? UploadBlocks(*backend_, recorder, staging, **replacement, hd_.PackFormat(*hd),
+                                                                    desc.mip_levels, hd_pixels)
+                                                     : UploadFace(*backend_, recorder, staging, **replacement, 0, hd_pixels));
+        desc.format = rhi::Format::Rgba8Unorm;
+        desc.mip_levels = 1;
+        if (uploaded) {
+            const u64 vram = hd_.UploadBytes(*hd);
             if (old != images_.end()) retired_.push_back(std::move(old->second.image));
-            hd_upload_bytes_ += u64{hd->width} * hd->height * 4;
-            images_.insert_or_assign(key, Upload{*replacement, generations, cache_.frame(), u64{hd->width} * hd->height * 4, std::nullopt});
+            hd_upload_bytes_ += vram;
+            images_.insert_or_assign(key, Upload{*replacement, generations, cache_.frame(), vram, std::nullopt});
             cache_.ReleasePixels(guest_keys[0]);
             ++counters_["texture_uploads"];
             return *replacement;
