@@ -3,7 +3,10 @@
 #include "present/compositor.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 #include "gpu/backend/targets/upload.h"
 #include "mh4n/log.h"
@@ -60,70 +63,90 @@ void main() {
 }
 )";
 
-// MODIFIED (2026-11-22): FSR 1.0 in one pass. EASU gives the colour of the picture at the pixel's position in the picture (the position
-// comes from the interpolated uv, so a rotated screen works too); RCAS needs the colour of the four neighbours of the output pixel, which
-// are got by running EASU at the neighbouring positions (the screen's uv derivatives say where those are).
+// MODIFIED (2026-11-22): FSR 1.0 in two passes. EASU draws a screen into an image of the size it is shown at (the position it samples
+// comes from the interpolated uv, so a rotated screen works too); RCAS then reads that image 1:1 and sharpens it into the target.
 const char* const kFsrHead = R"(#version 450
 #define A_GPU 1
 #define A_GLSL 1
-#define FSR_EASU_F 1
-#define FSR_RCAS_F 1
 layout(set = 0, binding = 0) uniform texture2D tex;
 layout(set = 0, binding = 1) uniform sampler smp;
 layout(location = 0) in vec2 v_uv;
 layout(location = 1) flat in vec4 v_bounds;
 layout(location = 2) flat in float v_alpha;
 layout(location = 0) out vec4 out_color;
+)";
+
+const char* const kEasuHead = R"(
+#define FSR_EASU_F 1
 vec2 g_easu_pp;
-vec2 g_dx;
-vec2 g_dy;
 uvec4 g_con1;
 uvec4 g_con2;
 uvec4 g_con3;
-vec2 g_size;
 )";
 
-const char* const kFsrTail = R"(
+const char* const kEasuTail = R"(
 vec4 FsrEasuRF(vec2 p) { return textureGather(sampler2D(tex, smp), p, 0); }
 vec4 FsrEasuGF(vec2 p) { return textureGather(sampler2D(tex, smp), p, 1); }
 vec4 FsrEasuBF(vec2 p) { return textureGather(sampler2D(tex, smp), p, 2); }
-vec3 easu_at(vec2 uv) {
-    uv = clamp(uv, v_bounds.xy, v_bounds.zw);
-    g_easu_pp = uv * g_size - 0.5;
-    vec3 c;
-    FsrEasuF(c, uvec2(0u), uvec4(0u), g_con1, g_con2, g_con3);
-    return c;
-}
-vec4 FsrRcasLoadF(ivec2 p) {
-    return vec4(easu_at(v_uv + float(p.x) * g_dx + float(p.y) * g_dy), 1.0);
-}
-void FsrRcasInputF(inout float r, inout float g, inout float b) {}
 void main() {
-    g_size = vec2(textureSize(sampler2D(tex, smp), 0));
-    vec2 inv = 1.0 / g_size;
+    vec2 size = vec2(textureSize(sampler2D(tex, smp), 0));
+    vec2 inv = 1.0 / size;
     g_con1 = floatBitsToUint(vec4(inv.x, inv.y, inv.x, -inv.y));
     g_con2 = floatBitsToUint(vec4(-inv.x, 2.0 * inv.y, inv.x, 2.0 * inv.y));
     g_con3 = floatBitsToUint(vec4(0.0, 4.0 * inv.y, 0.0, 0.0));
-    g_dx = dFdx(v_uv);
-    g_dy = dFdy(v_uv);
+    g_easu_pp = clamp(v_uv, v_bounds.xy, v_bounds.zw) * size - 0.5;
+    vec3 c;
+    FsrEasuF(c, uvec2(0u), uvec4(0u), g_con1, g_con2, g_con3);
+    out_color = vec4(c, 1.0);
+}
+)";
+
+const char* const kRcasHead = R"(
+#define FSR_RCAS_F 1
+)";
+
+const char* const kRcasTail = R"(
+vec4 FsrRcasLoadF(ivec2 p) {
+    return texelFetch(sampler2D(tex, smp), clamp(p, ivec2(0), textureSize(sampler2D(tex, smp), 0) - 1), 0);
+}
+void FsrRcasInputF(inout float r, inout float g, inout float b) {}
+void main() {
+    ivec2 base = ivec2(floor(v_uv * vec2(textureSize(sampler2D(tex, smp), 0))));
     uvec4 rcon;
     FsrRcasCon(rcon, 0.25);
     float r, g, b;
-    FsrRcasF(r, g, b, uvec2(0u), rcon);
+    FsrRcasF(r, g, b, uvec2(base), rcon);
     out_color = vec4(r, g, b, v_alpha);
 }
 )";
 
-// The whole fragment shader: the head, AMD's two headers (with the one line that works the position out from the output pixel replaced by
-// the position the head computes), and the tail.
-std::string FsrFragmentSource() {
+// The fragment shaders: the head, AMD's two headers (for EASU, with the one line that works the position out from the output pixel
+// replaced by the position the shader computes), and the tail.
+// MH4N_FSR_VARIANT (a debugging aid for drivers that fail on the FSR shaders): 1 both passes plain copies, 2 EASU real and RCAS a plain
+// copy, 3 EASU a plain copy and RCAS real
+int FsrVariant() {
+    const char* text = std::getenv("MH4N_FSR_VARIANT");
+    return text != nullptr ? std::atoi(text) : 0;
+}
+
+std::string EasuFragmentSource() {
+    if (FsrVariant() == 1 || FsrVariant() == 3) {
+        return std::string(kFsrHead) + "void main() { out_color = vec4(texture(sampler2D(tex, smp), clamp(v_uv, v_bounds.xy, v_bounds.zw)).rgb, 1.0); }\n";
+    }
     std::string fsr1 = kFfxFsr1;
     const std::string line = "AF2 pp=AF2(ip)*AF2_AU2(con0.xy)+AF2_AU2(con0.zw);";
     const std::size_t at = fsr1.find(line);
     if (at != std::string::npos) {
         fsr1.replace(at, line.size(), "AF2 pp=g_easu_pp;");
     }
-    return std::string(kFsrHead) + kFfxA + "\n" + fsr1 + kFsrTail;
+    return std::string(kFsrHead) + kEasuHead + kFfxA + "\n" + fsr1 + kEasuTail;
+}
+
+std::string RcasFragmentSource() {
+    if (FsrVariant() == 1 || FsrVariant() == 2) {
+        return std::string(kFsrHead) + "void main() { out_color = vec4(texelFetch(sampler2D(tex, smp), ivec2(floor(v_uv * vec2(textureSize(sampler2D(tex, smp), 0)))), 0).rgb, v_alpha); }\n";
+    }
+    return std::string(kFsrHead) + kRcasHead + kFfxA + "\n" + kFfxFsr1 + kRcasTail;
 }
 
 const rhi::BindingSetDesc kSetDesc{{{0, rhi::BindingType::SampledImage}, {1, rhi::BindingType::Sampler}}};
@@ -146,9 +169,11 @@ struct Compositor::State {
     std::vector<u32> vertex_spirv;
     std::vector<u32> fragment_spirv;
     std::map<rhi::Format, std::shared_ptr<rhi::Pipeline>> pipelines;
-    std::vector<u32> fsr_spirv;  // MODIFIED: made on first use (about 110 KB of GLSL)
+    std::vector<u32> easu_spirv;  // MODIFIED: FSR's two passes, made on first use (about 110 KB of GLSL each)
+    std::vector<u32> rcas_spirv;
     bool fsr_tried = false;
-    std::map<rhi::Format, std::shared_ptr<rhi::Pipeline>> fsr_pipelines;
+    std::map<rhi::Format, std::shared_ptr<rhi::Pipeline>> easu_pipelines;
+    std::map<rhi::Format, std::shared_ptr<rhi::Pipeline>> rcas_pipelines;
     std::shared_ptr<rhi::Sampler> nearest;
     std::shared_ptr<rhi::Sampler> linear;
     std::unique_ptr<rhi::Ring> vertices;
@@ -161,25 +186,52 @@ struct Compositor::State {
     bool warned_invalid_bottom = false;
 
     // The pipeline for a target of `format`, made on first use; null when the format cannot be drawn to.
-    rhi::Pipeline* PipelineFor(rhi::Format format) { return PipelineWith(format, false); }
+    rhi::Pipeline* PipelineFor(rhi::Format format) { return PipelineWith(format, 0); }
 
-    // The FSR 1.0 pipeline for `format`: null when FSR cannot be had (its shader did not compile: said once in the log).
-    rhi::Pipeline* FsrPipelineFor(rhi::Format format) {
+    // FSR 1.0's pipelines: null when FSR cannot be had (a shader did not compile: said once in the log).
+    // A marker file lives while FSR's pipelines are being made: some drivers (AMD's amdvlk on an integrated GPU) crash inside
+    // vkCreateGraphicsPipelines for these shaders, and a crash cannot be caught. If the marker of this GPU is still there on the next
+    // start, FSR stays off (MH4N_FSR_FORCE=1 tries again).
+    std::filesystem::path FsrMarker() const {
+        std::error_code ec;
+        return std::filesystem::temp_directory_path(ec) / "Caravan4URecomp_fsr_pipeline.marker";
+    }
+    std::string FsrGpu() const { return backend->Caps().device_name + " / " + backend->Caps().driver_name; }
+    bool FsrCrashedBefore() const {
+        const char* force = std::getenv("MH4N_FSR_FORCE");
+        if (force != nullptr && force[0] == '1') {
+            return false;
+        }
+        std::ifstream in(FsrMarker());
+        std::string text;
+        std::getline(in, text);
+        return in && text == FsrGpu();
+    }
+
+    bool FsrReady() {
         if (!fsr_tried) {
             fsr_tried = true;
             std::string error;
-            if (!CompileGlsl(GlslStage::Fragment, FsrFragmentSource(), fsr_spirv, error)) {
-                MH4N_LOG(Error, kLog, "the FSR shader does not compile, so FSR stays off: {}", error);
-                fsr_spirv.clear();
+            if (FsrCrashedBefore()) {
+                MH4N_LOG(Error, kLog, "FSR stays off: the driver of {} crashed while making its pipelines last time (MH4N_FSR_FORCE=1 tries again)",
+                         FsrGpu());
+            } else if (!CompileGlsl(GlslStage::Fragment, EasuFragmentSource(), easu_spirv, error) ||
+                !CompileGlsl(GlslStage::Fragment, RcasFragmentSource(), rcas_spirv, error)) {
+                MH4N_LOG(Error, kLog, "an FSR shader does not compile, so FSR stays off: {}", error);
+                easu_spirv.clear();
+                rcas_spirv.clear();
             } else {
-                MH4N_LOG(Info, kLog, "FSR 1.0 (EASU + RCAS) is ready");
+                MH4N_LOG(Info, kLog, "FSR 1.0 (EASU, then RCAS) is ready");
             }
         }
-        return fsr_spirv.empty() ? nullptr : PipelineWith(format, true);
+        return !easu_spirv.empty() && !rcas_spirv.empty();
     }
+    rhi::Pipeline* EasuPipelineFor() { return FsrReady() ? PipelineWith(rhi::Format::Rgba8Unorm, 1) : nullptr; }
+    rhi::Pipeline* RcasPipelineFor(rhi::Format format) { return FsrReady() ? PipelineWith(format, 2) : nullptr; }
 
-    rhi::Pipeline* PipelineWith(rhi::Format format, bool fsr) {
-        auto& cache = fsr ? fsr_pipelines : pipelines;
+    // kind: 0 the plain compositor, 1 FSR's EASU, 2 FSR's RCAS
+    rhi::Pipeline* PipelineWith(rhi::Format format, int kind) {
+        auto& cache = kind == 1 ? easu_pipelines : kind == 2 ? rcas_pipelines : pipelines;
         auto found = cache.find(format);
         if (found != cache.end()) {
             return found->second.get();
@@ -188,7 +240,7 @@ struct Compositor::State {
         if (backend->QueryFormat(format).attachment) {
             rhi::GraphicsPipelineDesc desc;
             desc.vertex.spirv = vertex_spirv;
-            desc.fragment.spirv = fsr ? fsr_spirv : fragment_spirv;
+            desc.fragment.spirv = kind == 1 ? easu_spirv : kind == 2 ? rcas_spirv : fragment_spirv;
             desc.vertex_layout.bindings = {{0, sizeof(Vertex), false}};
             desc.vertex_layout.attributes = {
                 {0, 0, rhi::Format::Rg32Float, offsetof(Vertex, pos)},
@@ -207,8 +259,15 @@ struct Compositor::State {
             desc.state.dst_alpha = rhi::BlendFactor::One;
             desc.state.alpha_op = rhi::BlendOp::Add;
             desc.sets = {kSetDesc};
-            desc.name = fsr ? "compositor (FSR)" : "compositor";
+            desc.name = kind == 1 ? "compositor (FSR EASU)" : kind == 2 ? "compositor (FSR RCAS)" : "compositor";
+            if (kind != 0) {
+                std::ofstream(FsrMarker(), std::ios::trunc) << FsrGpu() << "\n";
+            }
             rhi::Result<std::shared_ptr<rhi::Pipeline>> pipeline = backend->CreateGraphicsPipeline(desc);
+            if (kind != 0) {
+                std::error_code ec;
+                std::filesystem::remove(FsrMarker(), ec);
+            }
             if (pipeline.ok()) {
                 made = *pipeline;
             } else {
@@ -457,27 +516,36 @@ ComposeResult Compositor::Compose(rhi::Recorder& recorder, rhi::Image& target, c
     const Source top = prepare(frame.top, s.warned_invalid_top, "top");
     const Source bottom = prepare(frame.bottom, s.warned_invalid_bottom, "bottom");
 
-    // ---- the pass: clear to black, then the draws ----
-    const u32 target_w = target.Width();
-    const u32 target_h = target.Height();
-    rhi::TargetPassDesc pass;
-    pass.color = &target;
-    pass.color_load = rhi::LoadOp::Clear;
-    pass.clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
-    recorder.BeginTargetPass(pass);
-    result.drawn = true;
+    // ---- what is drawn, planned first so that FSR's first pass can run before the target's pass (MODIFIED) ----
+    struct Planned {
+        const Source* source;
+        screen_layout::Rect rect;
+        screen_layout::RectF crop;
+        float opacity;
+        ComposeResult::CpuTexture* fsr = nullptr;  // the screen as EASU drew it, at the size it is shown at
+    };
+    std::vector<Planned> plan;
+    if (layout.top_shown) {
+        plan.push_back({&top, layout.top, screen_layout::RectF{0.0f, 0.0f, 1.0f, 1.0f}, std::clamp(layout.top_opacity, 0.0f, 1.0f)});
+    }
+    if (layout.bottom_shown) {
+        // The further views are drawn at the bottom screen's opacity (platform.h: ScreenOverlay::View).
+        const float opacity = std::clamp(layout.bottom_opacity, 0.0f, 1.0f);
+        plan.push_back({&bottom, layout.bottom, layout.bottom_crop, opacity});
+        const u32 views = std::min<u32>(layout.view_count, static_cast<u32>(layout.views.size()));
+        for (u32 i = 0; i < views; ++i) {
+            plan.push_back({&bottom, layout.views[i].screen, layout.views[i].crop, opacity});
+        }
+    }
 
     const rhi::Sampler& sampler = options.linear_filter ? *s.linear : *s.nearest;
-    const auto draw = [&](const Source& source, const screen_layout::Rect& rect, const screen_layout::RectF& crop,
-                          float opacity) {
-        if (!source.ok) {
-            return;
-        }
+    // One quad of `rect` (of a target of w x h) showing `crop` of `src`, drawn with `pipeline`.
+    const auto emit = [&](const SourceImage& src, const screen_layout::Rect& rect, const screen_layout::RectF& crop, float opacity,
+                          rhi::Pipeline* pipeline_to_use, const rhi::Sampler& with_sampler, u32 target_w, u32 target_h) {
         const rhi::Rect scissor = ClipToTarget(rect, target_w, target_h);
         if (scissor.width == 0 || scissor.height == 0 || rect.right <= rect.left || rect.bottom <= rect.top) {
             return;
         }
-        const SourceImage& src = source.src;
         Vertex v[4];
         const double w = target_w;
         const double h = target_h;
@@ -512,22 +580,11 @@ ComposeResult Compositor::Compose(rhi::Recorder& recorder, rhi::Image& target, c
             return;
         }
         if (!(*set)->SetSampledImage(0, *src.image, rhi::ImageView::Sampled).ok() ||
-            !(*set)->SetSampler(1, sampler).ok()) {
+            !(*set)->SetSampler(1, with_sampler).ok()) {
             MH4N_LOG(Error, kLog, "binding a screen's image failed");
             return;
         }
-        // FSR when asked for and the screen is drawn larger than its picture (in both directions); else the plain pipeline
-        rhi::Pipeline* use = pipeline;
-        if (options.fsr && src.scaled_width > 0 && src.scaled_height > 0) {
-            const double out_w = rect.right - rect.left, out_h = rect.bottom - rect.top;
-            const double in_w = src.scaled_width * (crop.right - crop.left), in_h = src.scaled_height * (crop.bottom - crop.top);
-            if (out_w > in_w * 1.05 && out_h > in_h * 1.05) {
-                if (rhi::Pipeline* fsr = s.FsrPipelineFor(target.GetFormat())) {
-                    use = fsr;
-                }
-            }
-        }
-        recorder.SetPipeline(*use);
+        recorder.SetPipeline(*pipeline_to_use);
         recorder.Bind(**set, 0);
         const rhi::VertexBufferBinding binding{s.vertices->GetBuffer().get(), allocation->offset};
         recorder.SetVertexBuffers(0, std::span<const rhi::VertexBufferBinding>(&binding, 1));
@@ -539,16 +596,66 @@ ComposeResult Compositor::Compose(rhi::Recorder& recorder, rhi::Image& target, c
         recorder.Draw(4);
     };
 
-    if (layout.top_shown) {
-        draw(top, layout.top, screen_layout::RectF{0.0f, 0.0f, 1.0f, 1.0f}, std::clamp(layout.top_opacity, 0.0f, 1.0f));
+    // FSR's first pass: each screen drawn larger than its picture (in both directions) goes through EASU into an image of the size it
+    // is shown at (one pass of its own each: this is before the target's pass)
+    if (options.fsr) {
+        for (Planned& item : plan) {
+            const Source& source = *item.source;
+            const screen_layout::Rect& rect = item.rect;
+            if (!source.ok || source.src.scaled_width <= 0 || source.src.scaled_height <= 0 || rect.right <= rect.left ||
+                rect.bottom <= rect.top) {
+                continue;
+            }
+            const u32 out_w = rect.right - rect.left, out_h = rect.bottom - rect.top;
+            const double in_w = source.src.scaled_width * (item.crop.right - item.crop.left);
+            const double in_h = source.src.scaled_height * (item.crop.bottom - item.crop.top);
+            if (!(out_w > in_w * 1.05 && out_h > in_h * 1.05) || out_w > 8192 || out_h > 8192) {
+                continue;
+            }
+            rhi::Pipeline* easu = s.EasuPipelineFor();
+            if (easu == nullptr || s.RcasPipelineFor(target.GetFormat()) == nullptr) {
+                break;
+            }
+            ComposeResult::CpuTexture* texture = s.AcquireTexture(out_w, out_h);
+            if (texture == nullptr) {
+                continue;
+            }
+            rhi::TargetPassDesc easu_pass;
+            easu_pass.color = texture->image.get();
+            easu_pass.color_load = rhi::LoadOp::Clear;
+            easu_pass.clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
+            recorder.BeginTargetPass(easu_pass);
+            emit(source.src, screen_layout::Rect{0, 0, out_w, out_h}, item.crop, 1.0f, easu, sampler, out_w, out_h);
+            result.cpu_textures_.push_back(texture);
+            item.fsr = texture;
+        }
     }
-    if (layout.bottom_shown) {
-        // The further views are drawn at the bottom screen's opacity (platform.h: ScreenOverlay::View).
-        const float opacity = std::clamp(layout.bottom_opacity, 0.0f, 1.0f);
-        draw(bottom, layout.bottom, layout.bottom_crop, opacity);
-        const u32 views = std::min<u32>(layout.view_count, static_cast<u32>(layout.views.size()));
-        for (u32 i = 0; i < views; ++i) {
-            draw(bottom, layout.views[i].screen, layout.views[i].crop, opacity);
+
+    // ---- the pass: clear to black, then the draws ----
+    const u32 target_w = target.Width();
+    const u32 target_h = target.Height();
+    rhi::TargetPassDesc pass;
+    pass.color = &target;
+    pass.color_load = rhi::LoadOp::Clear;
+    pass.clear_color = {0.0f, 0.0f, 0.0f, 1.0f};
+    recorder.BeginTargetPass(pass);
+    result.drawn = true;
+
+    for (const Planned& item : plan) {
+        if (!item.source->ok) {
+            continue;
+        }
+        if (item.fsr != nullptr) {  // RCAS: the EASU image, 1:1
+            SourceImage eased;
+            eased.image = item.fsr->image.get();
+            eased.width = item.fsr->width;
+            eased.height = item.fsr->height;
+            eased.scaled_width = eased.width;
+            eased.scaled_height = eased.height;
+            emit(eased, item.rect, screen_layout::RectF{0.0f, 0.0f, 1.0f, 1.0f}, item.opacity, s.RcasPipelineFor(target.GetFormat()),
+                 *s.nearest, target_w, target_h);
+        } else {
+            emit(item.source->src, item.rect, item.crop, item.opacity, pipeline, sampler, target_w, target_h);
         }
     }
 
