@@ -58,6 +58,7 @@
 
 #include "audio/app_audio.h"
 #include "hooks.h"
+#include "monster_hp.h"
 #include "ingame_menu.h"
 #include "setup_ui.h"
 
@@ -299,6 +300,8 @@ public:
     std::atomic<float> y{150.0f};
     std::atomic<bool> show_fps{false};
     std::atomic<int> fps{-1};
+    std::atomic<bool> show_monster_hp{false};  // the life of the monster being fought (monster_hp in the ini)
+    std::atomic<bool> hud_spanish{false};
     std::atomic<sc::Presenter*> presenter{nullptr};
     const ingame::Overlay* menu = nullptr;  // the in-game settings menu, drawn last (ingame_menu.h)
 
@@ -308,10 +311,45 @@ public:
         VkCommandBuffer commands = rhi::CommandBuffer(*static_cast<rhi::Recorder*>(recorder));
         if (show_fps.load() && fps.load() >= 0) DrawFps(commands, width, height);
         if (visible.load()) DrawHand(commands, owner->CurrentLayout(), width, height);
+        if (menu != nullptr && show_monster_hp.load()) DrawMonsterHp(recorder, width, height);
         if (menu != nullptr) menu->Draw(commands, recorder, width, height);
     }
 
 private:
+    // the monster the hunter hurt last (monster_hp.h), as the menu's drawing wants it
+    void DrawMonsterHp(void* recorder, std::uint32_t width, std::uint32_t height) const {
+        if (std::getenv("MH4N_MONSTER_HP_DEMO")) {  // a check of the drawing without a hunt: a life that drops in steps and fills up again
+            static const auto start = std::chrono::steady_clock::now();
+            const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            const double cycle = std::fmod(t, 12.0);
+            ingame::HudView demo;
+            ingame::HudBar bar;
+            bar.id = 1;
+            bar.name = hud_spanish.load() ? "Monstruo 1" : "Monster 1";
+            bar.max = 24000;
+            const int step = static_cast<int>(cycle / 1.5);  // eight hits a cycle
+            bar.hp = std::max(0, bar.max - step * 3300);
+            bar.since_hit = static_cast<float>(cycle - step * 1.5);
+            demo.bars.push_back(bar);
+            menu->DrawHud(recorder, width, height, demo);
+            return;
+        }
+        const Port::MonsterHp::Snapshot snapshot = Port::MonsterHp::Take();
+        ingame::HudView view;
+        for (const Port::MonsterHp::Entry& e : snapshot.list) {
+            if (e.actor != snapshot.focus) continue;
+            ingame::HudBar bar;
+            bar.id = e.actor;
+            bar.name = std::string(hud_spanish.load() ? "Monstruo " : "Monster ") + std::to_string(e.order);
+            bar.hp = e.hp;
+            bar.max = e.max;
+            bar.since_hit = e.hit_at > 0.0 ? static_cast<float>(snapshot.now - e.hit_at) : 99.0f;
+            bar.dead = e.dead;
+            view.bars.push_back(std::move(bar));
+        }
+        menu->DrawHud(recorder, width, height, view);
+    }
+
     struct Square {
         int x, y, w, h;
     };
@@ -726,7 +764,7 @@ struct Ini {
         static const Group kGroups[] = {
             {"Game", {"game", "code", "user", "options"}},
             {"Video", {"scale", "fullscreen", "width", "height", "display", "vsync", "fps", "steady", "effects", "aspect", "mode",
-                       "touch_show", "popup_size", "popup_corner", "fps_counter", "pace", "gpu_thread", "hd_textures", "hd_texture_max", "upscaler", "fsr_quality"}},
+                       "touch_show", "popup_size", "popup_corner", "fps_counter", "monster_hp", "pace", "gpu_thread", "hd_textures", "hd_texture_max", "upscaler", "fsr_quality"}},
             {"Audio", {"volume"}},
             {"Controls", {"skip_key", "skip_pad", "circle_pad_pro", "mouse_camera", "hid_pads", "hidhide_ask"}},
             {"Online", {"nick", "join_address", "host_port", "lobby", "online_touch"}},
@@ -922,6 +960,13 @@ int main(int argc, char** argv) {
             } else {
                 const char* base = SDL_GetBasePath();
                 const std::string log = std::string(base ? base : "") + "Caravan4URecomp.log";
+                // the log of the run before is kept as Caravan4URecomp.previous.log (only these two exist)
+                {
+                    std::error_code rotate_ec;
+                    const std::filesystem::path previous = std::filesystem::path(log).replace_extension(".previous.log");
+                    if (std::filesystem::exists(log, rotate_ec)) std::filesystem::rename(log, previous, rotate_ec);
+                    if (rotate_ec) std::filesystem::remove(previous, rotate_ec), std::filesystem::rename(log, previous, rotate_ec);
+                }
                 std::freopen(log.c_str(), "w", stdout);
                 std::freopen(log.c_str(), "w", stderr);
             }
@@ -948,6 +993,7 @@ int main(int argc, char** argv) {
     std::string fsr_quality = ini.Get("fsr_quality", "quality");  // quality: ultra | quality | balanced | performance (the "auto" resolution with FSR on)
     g_fsr.store(ini.Get("upscaler") == "fsr");
     bool show_fps = on(ini.Get("fps_counter"), false);  // the counter over the game: off unless the settings say so
+    bool show_monster_hp = on(ini.Get("monster_hp"), false);  // the life of the monster being fought, over the game (read only)
     std::string volume_value = ini.Get("volume", "50");  // percent, 0 to 100
     int display_index = std::atoi(ini.Get("display", "-1").c_str());  // -1: the first display that is not the primary
     bool force_setup = false;
@@ -1210,6 +1256,17 @@ int main(int argc, char** argv) {
     g_cursor.presenter.store(presenter->get());
     (*presenter)->SetUiLayer(&g_cursor);
     g_cursor.show_fps.store(show_fps);
+    g_cursor.show_monster_hp.store(show_monster_hp);
+    Port::MonsterHp::Enabled().store(show_monster_hp);
+    {
+        std::string hud_lang = ini.Get("language", "auto");
+        if (hud_lang != "es" && hud_lang != "en") {
+            wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+            GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
+            hud_lang = name[0] == L'e' && name[1] == L's' ? "es" : "en";
+        }
+        g_cursor.hud_spanish.store(hud_lang == "es");
+    }
     if (std::getenv("MH4U_TEST_CURSOR")) g_cursor.visible.store(true);  // draws the selector without a game (a check)
     std::printf("mh4u-win: window %dx%d, vsync %s\n", pixel_w, pixel_h, vsync ? "on" : "off");
 
@@ -1313,6 +1370,7 @@ int main(int argc, char** argv) {
         return {};
     };
     const auto user_path = [&] { return std::filesystem::path(WideFromUtf8(user_folder())); };
+    if (!ini.Get("backup_dir").empty()) savemgr::g_backup_dir = std::filesystem::path(WideFromUtf8(ini.Get("backup_dir")));
     const auto start_game = [&] {
         if (!user_folder().empty()) {  // the saves: a restore that was asked for, then a backup of them as they are
             const std::string restored = savemgr::ApplyPendingRestore(user_path());
@@ -1472,6 +1530,7 @@ int main(int argc, char** argv) {
             return kCorners[std::clamp(g_popup_corner.load(), 0, 3)];
         }
         if (key == "fps_counter") return show_fps ? "on" : "off";
+        if (key == "monster_hp") return show_monster_hp ? "on" : "off";
         if (key == "scale") return scale_value == "auto" ? scale_value : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 8));  // (9 and 10 of an older settings file read as 8)
         if (key == "volume") return volume_value;
         if (key == "system_language") {  // the language of Windows: "es" or "en"
@@ -1573,6 +1632,10 @@ int main(int argc, char** argv) {
         } else if (key == "fps_counter") {
             show_fps = value == "on";
             g_cursor.show_fps.store(show_fps);
+        } else if (key == "monster_hp") {
+            show_monster_hp = value == "on";
+            g_cursor.show_monster_hp.store(show_monster_hp);
+            Port::MonsterHp::Enabled().store(show_monster_hp);
         } else if (key == "scale") {
             scale_value = value;  // read when the game starts
         } else if (key == "upscaler") {
@@ -1652,7 +1715,7 @@ int main(int argc, char** argv) {
         if (name == "open_saves" || name == "open_backups" || name == "open_mods") {
             if (user_folder().empty()) return "No user folder is set";
             std::filesystem::path dir = user_path();
-            dir /= name == "open_saves" ? "sdmc" : name == "open_backups" ? "backups" : "load\\mods";
+            if (name == "open_backups") dir = savemgr::BackupsFolder(dir); else dir /= name == "open_saves" ? "sdmc" : "load\\mods";
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             if (!std::getenv("MH4U_TEST_SCRIPT")) ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);

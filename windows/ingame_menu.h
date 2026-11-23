@@ -137,6 +137,19 @@ public:
         view_ = std::move(view);
     }
 
+    // The monster life panel over the game (never while the menu or the first-start screen is open: they draw their own frame).
+    void DrawHud(void* recorder, std::uint32_t width, std::uint32_t height, const HudView& hud) const {
+        {
+            std::lock_guard lock(mutex_);
+            if (open_ || setup_open_) return;
+        }
+        if (make_gui_ && !gui_failed_.load()) {
+            if (!gui_) gui_ = make_gui_();
+            if (!gui_) gui_failed_ = true;
+        }
+        if (gui_) gui_->DrawHud(recorder, hud, width, height);
+    }
+
     // The look of the menu (menu_gui.h): made on the present thread when the first frame needs it. If it can't be made,
     // the menu is drawn with plain rectangles and the 5 x 7 font below.
     void UseGui(std::function<std::unique_ptr<GuiRenderer>()> make) { make_gui_ = std::move(make); }
@@ -902,6 +915,7 @@ private:
             {"hd_texture_max", "A texture of an HD pack larger than this (on its longer side) is reduced before it is loaded: it takes less video memory and loads faster, with less detail. Off: no limit. Needs a restart."},
             {"scale", "How sharp the 3D scene, the HUD and the text are drawn: a multiple of the 3DS top screen's 400 x 240. Auto picks the one closest to your window."},
             {"fps_counter", "Shows the game's frame rate in the top-left corner."},
+            {"monster_hp", "Shows the life of the large monster you hurt last, top right, and how much it drops as you hit it. It only reads the game: nothing changes, so it is fine online."},
             {"Open the HD textures folder", "Opens the folder for HD texture packs (Azahar or Citra format). They are read when the game starts."},
             {"fps", "Caps the game's frame rate. Default is the game's own, Display matches your screen, Unlimited uses all the CPU."},
             {"steady", "Keeps the frame rate even instead of letting it vary. Default leaves the game's own setting."},
@@ -952,6 +966,7 @@ private:
             items.push_back(Choice("FSR quality", "fsr_quality", {"quality", "ultra", "balanced", "performance"}, true));
             items.push_back(Choice("HD texture size limit", "hd_texture_max", {"off", "4096", "2048", "1024", "512"}, true));
             items.push_back(Choice("FPS counter", "fps_counter", {"off", "on"}));
+            items.push_back(Choice("Monster life", "monster_hp", {"off", "on"}));
             items.push_back(Action("Open the HD textures folder", [this] {
                 const std::string said = host_.action ? host_.action("open_textures") : "Not available";
                 NeedRestart("HD textures");

@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <unordered_map>
 
 extern const unsigned char kCinzelTtf[];
 extern const unsigned int kCinzelTtfSize;
@@ -297,6 +298,9 @@ public:
     bool Draw(void* recorder, const View& view, std::uint32_t width, std::uint32_t height) override {
         return Frame(recorder, width, height, [&](float dt) { Build(view, static_cast<float>(width), static_cast<float>(height), dt); });
     }
+    bool DrawHud(void* recorder, const HudView& view, std::uint32_t width, std::uint32_t height) override {
+        return Frame(recorder, width, height, [&](float dt) { BuildHud(view, static_cast<float>(width), static_cast<float>(height), dt); });
+    }
     bool DrawSetup(void* recorder, const SetupView& view, std::uint32_t width, std::uint32_t height) override {
         return Frame(recorder, width, height, [&](float dt) { BuildSetup(view, static_cast<float>(width), static_cast<float>(height), dt); });
     }
@@ -346,6 +350,7 @@ private:
     ImGuiContext* context_ = nullptr;
     ImFont* font_ = nullptr;
     ImFont* text_ = nullptr;
+    std::unordered_map<std::uint32_t, float> trails_;  // the pale trail of each monster's bar (BuildHud)
     bool initialised_ = false;
     std::chrono::steady_clock::time_point last_;
     // animation state (this thread's)
@@ -460,6 +465,60 @@ private:
         if (!v.primary.empty()) Button(p, s.primary, v.primary, true, v.primary_enabled, v.focus == 2, v.hover == 2, u, fade);
         if (!v.secondary.empty()) Button(p, s.secondary, v.secondary, false, true, v.focus == 3, v.hover == 3, u, fade);
         if (moving && redraw_) redraw_();
+    }
+
+    // The life of the monster being fought, top right: a dark plate with the menu's gold edge; the name and the life in numbers, and
+    // the bar (a dark well, the life in green, amber or red by how much is left, a lighter top, a pale trail that catches up slowly
+    // with what was just lost, marks at a quarter, a half and three quarters, a gold edge).
+    void BuildHud(const HudView& view, float sw, float sh, float dt) {
+        std::unordered_map<std::uint32_t, float> trails;
+        for (const HudBar& bar : view.bars) {
+            const float frac = std::clamp(static_cast<float>(bar.hp) / static_cast<float>(std::max(1, bar.max)), 0.0f, 1.0f);
+            const auto old = trails_.find(bar.id);
+            float trail = old == trails_.end() ? frac : old->second;
+            if (frac >= trail) trail = frac;
+            else if (bar.since_hit > 0.35f) trail = frac + (trail - frac) * std::exp(-3.2f * dt);
+            if (trail - frac < 0.002f) trail = frac;
+            trails[bar.id] = trail;
+        }
+        trails_ = std::move(trails);
+        if (view.bars.empty()) return;
+        const float u = std::max(0.7f, sh / 720.0f);
+        Painter p;
+        p.dl = ImGui::GetForegroundDrawList();
+        p.font = font_;
+        p.text = text_;
+        const float pw = 340.0f * u, row_h = 64.0f * u;
+        float y = 16.0f * u;
+        for (const HudBar& bar : view.bars) {
+            const float frac = std::clamp(static_cast<float>(bar.hp) / static_cast<float>(std::max(1, bar.max)), 0.0f, 1.0f);
+            const float trail = trails_[bar.id];
+            const Rect plate = {sw - 16.0f * u - pw, y, sw - 16.0f * u, y + row_h};
+            p.GradV(plate, C(kPanelTop, 0.88f), C(kPanelBottom, 0.9f));
+            p.Frame(plate, 6.0f * u, C(kGold, 0.9f), 1.6f * u);
+            p.Frame(Shrink(plate, 4 * u, 4 * u), 4.0f * u, C(kBlueDeep, 0.8f), 1.0f);
+            const float cy = plate.y0 + 19.0f * u;
+            p.Write(font_, 19.0f * u, plate.x0 + 16 * u, cy, Align::Left, bar.dead ? C(kCream, 0.5f) : C(kCream), bar.name.c_str());
+            char life[48];
+            std::snprintf(life, sizeof life, "%d / %d", bar.hp, bar.max);
+            p.Write(font_, 18.0f * u, plate.x1 - 16 * u, cy, Align::Right, C(kGold), life);
+            const Rect well = {plate.x0 + 14 * u, plate.y0 + 36.0f * u, plate.x1 - 14 * u, plate.y0 + 54.0f * u};
+            p.Fill(well, 4.0f * u, C(kWell));
+            const auto part = [&](float f) { return Shrink({well.x0, well.y0, well.x0 + well.W() * f, well.y1}, 1.5f * u, 1.5f * u); };
+            if (trail > frac) p.Fill(part(trail), 3.0f * u, C(kCream));
+            if (frac > 0.0f) {
+                const Rect fill = part(frac);
+                const std::uint32_t colour = frac > 0.5f ? 0x7FE08A : frac > 0.25f ? kGold : 0xFF7B6B;
+                p.Fill(fill, 3.0f * u, C(colour));
+                p.Fill({fill.x0, fill.y0, fill.x1, fill.y0 + fill.H() * 0.42f}, 3.0f * u, IM_COL32(255, 255, 255, 46));
+            }
+            for (const float tick : {0.25f, 0.5f, 0.75f}) {
+                const float x = well.x0 + well.W() * tick;
+                p.dl->AddLine(ImVec2(x, well.y0 + 3 * u), ImVec2(x, well.y1 - 3 * u), IM_COL32(0, 0, 0, 110), 1.0f);
+            }
+            p.Frame(well, 4.0f * u, C(kGoldDim), 1.0f);
+            y += row_h + 8.0f * u;
+        }
     }
 
     void Build(const View& view, float sw, float sh, float dt) {

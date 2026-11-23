@@ -6,6 +6,7 @@
 #include "hooks.h"
 
 #include "game_addr.h"
+#include "monster_hp.h"
 #include "onescreen.h"
 #include "swkbd_bridge.h"
 
@@ -744,6 +745,7 @@ void WideTransfer(RCtx* ctx);
 void UpdateQuestOverlay(RCtx* ctx);
 void UpdateGameState(RCtx* ctx);
 void ItemBarStep(RCtx* ctx);
+void MonsterLifeStep(RCtx* ctx);
 void TraceFilters();
 void EffectsApply(RCtx* ctx);
 bool GameFunctionsKnown();  // (EffectsApply's check: the game's vtables hold the functions the port's addresses name)
@@ -797,6 +799,7 @@ void Frame(RCtx* ctx, RFunc original) {
     UpdateQuestOverlay(ctx);
     UpdateGameState(ctx);
     ItemBarStep(ctx);
+    MonsterLifeStep(ctx);
     if (options.trace_filters) {
         TraceFilters();
     }
@@ -2781,6 +2784,38 @@ bool LargeMonster(RCtx* ctx, u32 monster, u32* info_out) {
     }
     *info_out = info;
     return (rd32(ctx, row) & 1) != 0;
+}
+
+// ── Monster life (read only; the windows shell draws it: monster_hp.h). Each frame, when the shell asks for it, the large
+// monsters of sEnemy's list (the lock-on's own reading) give their life: [monster+0xe28] is the status block, with the life now
+// at +0x3e8 and the largest life at +0x3ec, both s32 (the debug menu's "em->mHpVital" is +0x3e8; every change of it goes through
+// 0x0093b9ec, "add a change to the life", clamped to 0..max). Nothing is written.
+constexpr u32 INFO_HP = 0x3e8, INFO_HP_MAX = 0x3ec;
+
+void MonsterLifeStep(RCtx* ctx) {
+    if (!MonsterHp::Enabled().load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::vector<MonsterHp::Sample> samples;
+    const u32 enemies = rd32(ctx, SENEMY);
+    if (HeapPointer(enemies)) {
+        for (u32 i = 0; i < ENEMY_SLOT_COUNT; ++i) {
+            const u32 monster = rd32(ctx, enemies + ENEMY_SLOTS + 4 * i);
+            u32 info = 0;
+            if (!LargeMonster(ctx, monster, &info)) {
+                continue;
+            }
+            const u8 state = rd8(ctx, info + INFO_STATE);
+            MonsterHp::Sample sample;
+            sample.actor = monster;
+            sample.kind = rd8(ctx, info + INFO_KIND);
+            sample.hp = static_cast<std::int32_t>(rd32(ctx, info + INFO_HP));
+            sample.max = static_cast<std::int32_t>(rd32(ctx, info + INFO_HP_MAX));
+            sample.dead = state == 0xb || state == 0xe || (state == 0xc && rd8(ctx, info + INFO_STATE + 1) == 0xff);
+            samples.push_back(sample);
+        }
+    }
+    MonsterHp::Poll(samples);
 }
 
 /// The monster to follow (see above), or 0. `hx`, `hz`: the hunter's place.

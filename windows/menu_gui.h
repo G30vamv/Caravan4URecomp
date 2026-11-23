@@ -66,6 +66,18 @@ Layout LayoutOf(float width, float height);
 // How many rows fit, and the first one shown so that the marked one is in view.
 void WindowOf(const Layout& layout, std::size_t total, int sel, int* first, int* fit, int scroll = -1);
 
+// The life of a large monster over the game (the panel of the ini's monster_hp): what the drawing needs of it.
+struct HudBar {
+    std::uint32_t id = 0;     // the monster (the trail of its bar is kept by it)
+    std::string name;         // "Monster 1"
+    int hp = 0, max = 1;
+    float since_hit = 99.0f;  // seconds since its life last went down
+    bool dead = false;
+};
+struct HudView {
+    std::vector<HudBar> bars; // the monster being fought, or none (nothing is drawn)
+};
+
 // The first start's screen: choosing the two files of the game, then the progress of building the code library for this PC.
 // Every text is already in the language.
 struct SetupView {
@@ -96,6 +108,8 @@ public:
     virtual bool DrawSetup(void* recorder, const SetupView& view, std::uint32_t width, std::uint32_t height) = 0;
     // Records the menu into the target's open pass. False when it can't (the caller falls back to plain rectangles).
     virtual bool Draw(void* recorder, const View& view, std::uint32_t width, std::uint32_t height) = 0;
+    // The monster life panel over the game, in the same look and palette.
+    virtual bool DrawHud(void*, const HudView&, std::uint32_t, std::uint32_t) { return false; }
 };
 // `format` is the swapchain's VkFormat (as an int, to keep Vulkan out of this header). Null when it can't be made.
 std::unique_ptr<GuiRenderer> MakeGuiRenderer(std::shared_ptr<mh4n::gpu::rhi::Backend> backend, int format,

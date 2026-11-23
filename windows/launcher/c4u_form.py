@@ -16,6 +16,14 @@ from qtglass import GlassPanel
 from qtshim import Button, Entry, Label, OptionMenu, Slider, Switch
 
 MUTED = "#c7b48f"
+
+# the section titles of c4u_options.py in Spanish
+SECTIONS_ES = {
+    "Window": "Ventana", "Screen layout": "Disposición de pantallas", "Rendering": "Dibujo", "Upscaling": "Escalado",
+    "Frame rate": "Fotogramas", "Effects": "Efectos", "Skip a cutscene": "Saltar cinemáticas", "Input devices": "Dispositivos de entrada",
+    "Game audio": "Audio del juego", "Rooms": "Salas", "Touch screen": "Pantalla táctil", "Backups": "Copias de seguridad",
+    "Menu": "Menú", "Integration": "Integración", "Diagnostics": "Diagnóstico", "Game files": "Archivos del juego",
+}
 CREAM = "#e3d8bd"
 GOLD_TEXT = "#eab84c"
 
@@ -144,10 +152,23 @@ class OptionsForm:
                 card_lay = QVBoxLayout(card)
                 card_lay.setContentsMargins(18, 14, 18, 14)
                 card_lay.setSpacing(10)
-                title = Label(section.upper(), GOLD_TEXT, 10, bold=True)
+                title = Label((SECTIONS_ES.get(section, section) if self.lang() == "es" else section).upper(), GOLD_TEXT, 10, bold=True)
                 card_lay.addWidget(title)
                 lay.addWidget(card)
-            card_lay.addWidget(self._row(opt))
+            row = self._row(opt)
+            help_text = self.help_of(opt)
+            if help_text:  # the explanation is written under the option, not only in its tooltip
+                holder = QWidget()
+                column = QVBoxLayout(holder)
+                column.setContentsMargins(0, 0, 0, 0)
+                column.setSpacing(2)
+                column.addWidget(row)
+                caption = Label(help_text, MUTED, 9)
+                caption.setWordWrap(True)
+                column.addWidget(caption)
+                self.rows[opt.key] = holder
+                row = holder
+            card_lay.addWidget(row)
         reset = Button(self.tr("Restore defaults of this page", "Restaurar los valores de esta página"), "default",
                        lambda t=tab: self.reset_tab(t), height=32, size=10)
         lay.addWidget(reset, 0, Qt.AlignmentFlag.AlignLeft)

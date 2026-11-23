@@ -85,7 +85,9 @@ inline Tree MeasureSaves(const fs::path& user) {
     return total;
 }
 
-inline fs::path BackupsFolder(const fs::path& user) { return user / kBackups; }
+// MODIFIED for the Windows port: `backup_dir` of the ini sends the backups to another folder (e.g. on another drive).
+inline fs::path g_backup_dir;
+inline fs::path BackupsFolder(const fs::path& user) { return g_backup_dir.empty() ? user / kBackups : g_backup_dir; }
 
 inline std::string NowName(const std::string& label) {
     const std::time_t t = std::time(nullptr);
