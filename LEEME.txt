@@ -61,6 +61,7 @@ reiniciar nada por si solo. Graficos > "Open the HD textures folder" abre la car
 Ajustes: Caravan4URecomp.ini (con comentarios; %EXEDIR% es la carpeta del programa). Por ejemplo:
   scale = 3        resolucion interna (1 es la de la 3DS; baja a 1 o 2 si va lento)
   fps_counter = on contador de fps sobre el juego
+  monster_hp = on vida del monstruo grande al que golpeas (arriba a la derecha; solo lee el juego, no cambia nada)
   volume = 50      volumen (0 a 100)
 
 Codigo fuente
