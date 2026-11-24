@@ -18,6 +18,7 @@ param(
     [string]$Sdl3Dir = "",
     [string]$Sdl3Version = "3.4.20",
     [switch]$Launcher,  # also build Caravan4URecomp-Launcher.exe (PyInstaller) into the dist folder
+    [switch]$NoFsr,     # a diagnostic build: FSR compiled out (the upscaler setting is ignored)
     [switch]$Release    # a build to give to other people: no path of this PC in the program (see below)
 )
 $ErrorActionPreference = "Stop"
@@ -65,12 +66,16 @@ if (-not (Test-Path (Join-Path $sdlPrefix "bin\SDL3.dll"))) { throw "SDL3 not fo
 # those paths would be this PC's (the user's name, the folders). -ffile-prefix-map rewrites them: the user's profile folder becomes
 # "<home>", the tree becomes "." (so a log line reads ./4u-native/mh4n/... ). The dist folder for testing keeps the real paths.
 $mapFlags = ""
+# FSR is out of every build (it did not help on AMD nor NVIDIA GPUs, and cost frames): the upscaler setting is ignored
+$mapFlags = " -DC4U_NO_FSR"
+# a test build (not -Release) reads the GPU time of each frame for the log; the release does not (C4U_GPU_TIME=1 turns it on there)
+if (-not $Release) { $mapFlags = $mapFlags + " -DC4U_GPU_TIME_LOG" }
 if ($Release) {
     $maps = @()
     $home1 = $env:USERPROFILE
     foreach ($p in @($home1, $home1.Replace('\', '/'))) { $maps += "-ffile-prefix-map=$p=HOME" }   # the general one first: the last match wins
     foreach ($p in @($parent, $parent.Replace('\', '/'))) { $maps += "-ffile-prefix-map=$p=." }
-    $mapFlags = " " + ($maps -join " ")
+    $mapFlags = $mapFlags + " " + ($maps -join " ")
     Write-Host "release build: source paths are rewritten"
 }
 & $cmake -S $source -B $BuildDir -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ `
@@ -137,7 +142,7 @@ fps_counter = off
 "@ | Set-Content $ini -Encoding ascii
 }
 if ($Launcher) {
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $source ("launcher" + [IO.Path]::DirectorySeparatorChar + "build_launcher.ps1")) -OutDir $DistDir
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $source ("launcher" + [IO.Path]::DirectorySeparatorChar + "build_launcher.ps1")) -OutDir $DistDir $(if ($NoFsr) { "-NoFsr" })
     if ($LASTEXITCODE -ne 0) { throw "build_launcher.ps1 failed" }
 }
 Write-Host "done: $DistDir\Caravan4URecomp.exe"

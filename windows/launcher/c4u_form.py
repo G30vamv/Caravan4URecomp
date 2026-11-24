@@ -34,8 +34,9 @@ PAD_CHOICES = [
     ("b1", "East (Xbox B / PlayStation Circle)", "Este (B de Xbox / Círculo de PlayStation)"),
     ("b2", "West (Xbox X / PlayStation Square)", "Oeste (X de Xbox / Cuadrado de PlayStation)"),
     ("b3", "North (Xbox Y / PlayStation Triangle)", "Norte (Y de Xbox / Triángulo de PlayStation)"),
-    ("b4", "Back / Select / Share", "Atrás / Select / Share"),
-    ("b6", "Start / Options", "Start / Options"),
+    ("b4", "Back (Xbox View / PlayStation Create or Share)", "Atrás (View de Xbox / Create o Share de PlayStation)"),
+    ("b6", "Start (Xbox Menu / PlayStation Options)", "Start (Menu de Xbox / Options de PlayStation)"),
+    ("b20", "PlayStation touchpad click", "Clic del panel táctil de PlayStation"),
     ("b7", "Left stick click (L3)", "Clic del stick izquierdo (L3)"),
     ("b8", "Right stick click (R3)", "Clic del stick derecho (R3)"),
     ("b9", "Left bumper (L1 / LB)", "Bumper izquierdo (L1 / LB)"),
@@ -368,7 +369,11 @@ class OptionsForm:
             if not dep or "=" not in dep:
                 continue
             other, wanted = dep.split("=", 1)
-            row.setEnabled(self.store.get(other) == wanted)
+            on = self.store.get(other) == wanted
+            if other == "hud_parts":  # (the per-part HUD sizes are hidden, not just greyed, while the switch is off)
+                row.setVisible(on)
+            else:
+                row.setEnabled(on)
 
     def reset_tab(self, tab):
         for opt in self.schema.by_tab(tab):

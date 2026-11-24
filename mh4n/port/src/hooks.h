@@ -81,6 +81,9 @@ void ClearCameraTurn();
 void SetHostTriggers(bool zl, bool zr);
 unsigned long long GameFrameCount();  // MODIFIED: frames the game's own loop has run (the limiter's count), for the fps counter
 void SetHostSkip(bool down);  // MODIFIED: the shell's skip key is down / up
+bool MapOpen();              // MODIFIED: the world map is open (the shell's map button taps its Back button)
+bool MapTapAvailable();       // MODIFIED: the village's touch screen shows its map icon (the shell's map button taps it)
+void ToggleProbeWindow();    // MODIFIED: F8 opens / closes the probe's window (probe_hunter: every change of the linked blocks is logged inside it)
 
 /// The lock-on (the app's long press on L, a controller's right stick click): while on, the quest
 /// camera turns toward the Target Cam's monster, else the nearest large one in the hunter's area,

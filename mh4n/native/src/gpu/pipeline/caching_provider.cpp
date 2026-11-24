@@ -509,6 +509,10 @@ void CachingProvider::Build(std::unique_lock<std::mutex>& lock, Entry& entry, bo
         }
     }();
     const auto duration = Clock::now() - start;
+    if (Milliseconds(duration) > 500.0) {  // (a draw waits for its pipeline: this is the black screen of a few seconds)
+        MH4N_LOG(Info, kLog, "slow pipeline: {:.0f} ms ({}, {}, {})", Milliseconds(duration), async ? "async" : "ON THE GAME'S THREAD",
+                 entry.key.IsFallback() ? "fallback" : "full", built && *built ? "built" : "failed");
+    }
     lock.lock();
 
     if (built && *built) {

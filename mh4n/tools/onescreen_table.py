@@ -43,7 +43,7 @@ ARCS = ["core_lobby", "core_common", "core_title", "core_dlc", "core_arena", "co
         "v00a00_map", "v00a01_map", "v03a01_map", "v04a00_map", "v05a00_map", "v05a01_map", "v05a02_map",
         "monnyan_core", "loading_5", "loading_6", "loading_7"] + [f"pl_wp{n:02d}_lyt" for n in range(17)]
 # Layouts left on the touch screen: they are driven by touch only (Heavenfall gives them the pad with code of its own)
-TOUCH_ONLY = {"ui430", "ui422", "ui800", "ui802", "ui700", "ui705"}
+TOUCH_ONLY = {"ui422", "ui800", "ui802", "ui700", "ui705"}
 
 # Place flags (port/src/onescreen.cpp)
 F_TOP, F_HIDDEN, F_KEEP, F_PRIORITY_SET, F_PRIORITY_ADD, F_COMPOSE, F_BOTTOM = 1, 2, 4, 8, 16, 32, 64

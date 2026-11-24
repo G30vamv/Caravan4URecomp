@@ -25,6 +25,7 @@
 #include <sstream>
 #include <string_view>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 #include <fmt/format.h>
 #if __has_include("mh4n/pacing_trace.h")
@@ -216,6 +217,16 @@ struct Options {
     // hud_<part> = dx dy: a part of the hunting HUD moved by this much (top-screen pixels, right and down: the app's
     // layout editor drags it; item_bar is hud_items as an earlier version wrote it)
     float hud_dx[HUD_PART_COUNT] = {}, hud_dy[HUD_PART_COUNT] = {};
+    // hud_scale = percent (40-100, 100 the game's own size): the hunting HUD smaller, every part kept to its corner of the
+    // picture (the edges, with a wider one); hud_scale_<part> = percent: that part's own, times the global one
+    // probe_hunter = 1: finds the hunter's fields for the mods (infinite sharpness, ammo, items): every 20 frames the local
+    // hunter's memory is compared with the last sample and the words that changed rarely are logged (HunterProbe)
+    bool probe_hunter = false;
+    // invincible / inf_items (cheats of this program, off unless set; they write the hunter's memory, so they can break
+    // an online hunt or a save: the user's risk, said in the menus): HunterMods below
+    bool invincible = false, inf_items = false;
+    float hud_scale = 100.0f;
+    float hud_part_scale[HUD_PART_COUNT] = {100, 100, 100, 100, 100, 100, 100};
 };
 
 // The screen filters an option can turn off (see SCREEN_FILTERS below), by option name.
@@ -292,6 +303,19 @@ bool IsOff(const std::string& value) {
 
 /// The HUD's parts the player can move (HUD_PARTS below), by their keys: hud_<key> in mh4u.ini.
 constexpr const char* HUD_KEYS[HUD_PART_COUNT] = {"clock", "bars", "sharpness", "party", "map", "target", "items"};
+
+/// "hud_scale_bars" -> the part's index, else -1.
+int HudScalePartIndex(const std::string& key) {
+    if (key.compare(0, 10, "hud_scale_") != 0) {
+        return -1;
+    }
+    for (int k = 0; k < HUD_PART_COUNT; ++k) {
+        if (key.compare(10, std::string::npos, HUD_KEYS[k]) == 0) {
+            return k;
+        }
+    }
+    return -1;
+}
 
 /// "hud_bars" -> the part's index, else -1.
 int HudPartIndex(const std::string& key) {
@@ -425,6 +449,18 @@ void Set(Options& o, const std::string& key, const std::string& value) {
     } else if (key == "trace_state") {
         o.trace_state = IsOn(value) || value == "actions";
         o.trace_state_actions = value == "actions";
+    } else if (key == "invincible") {
+        o.invincible = IsOn(value);
+    } else if (key == "inf_items") {
+        o.inf_items = IsOn(value);
+    } else if (key == "hide_help") {
+        OneScreen::SetHideHelp(IsOn(value));
+    } else if (key == "probe_hunter") {
+        o.probe_hunter = IsOn(value);
+    } else if (key == "hud_scale") {
+        o.hud_scale = std::clamp(std::strtof(value.c_str(), nullptr), 40.0f, 100.0f);
+    } else if (const int scaled = HudScalePartIndex(key); scaled >= 0) {
+        o.hud_part_scale[scaled] = std::clamp(std::strtof(value.c_str(), nullptr), 40.0f, 100.0f);
     } else if (key == "hud_probe") {
         o.hud_probe = static_cast<u32>(std::strtoul(value.c_str(), nullptr, 16));
     } else if (const int part = key == "item_bar" ? HUD_PART_COUNT - 1 : HudPartIndex(key); part >= 0) {
@@ -746,6 +782,9 @@ void UpdateQuestOverlay(RCtx* ctx);
 void UpdateGameState(RCtx* ctx);
 void ItemBarStep(RCtx* ctx);
 void MonsterLifeStep(RCtx* ctx);
+std::atomic<bool> probe_window{false};
+void HunterProbe(RCtx* ctx);
+void HunterMods(RCtx* ctx);
 void TraceFilters();
 void EffectsApply(RCtx* ctx);
 bool GameFunctionsKnown();  // (EffectsApply's check: the game's vtables hold the functions the port's addresses name)
@@ -800,6 +839,12 @@ void Frame(RCtx* ctx, RFunc original) {
     UpdateGameState(ctx);
     ItemBarStep(ctx);
     MonsterLifeStep(ctx);
+    if (options.probe_hunter) {
+        HunterProbe(ctx);
+    }
+    if (options.invincible || options.inf_items) {
+        HunterMods(ctx);
+    }
     if (options.trace_filters) {
         TraceFilters();
     }
@@ -1091,6 +1136,33 @@ constexpr HudObject HUD_OBJECTS[] = {
     {0x81F165C8, HUD_SHARPNESS, 0, 0, 0, 0},  // ui202_panel_bin
     {0xFFC7E011, HUD_SHARPNESS, 0, 0, 0, 0},  // ui202_panel_tama
     {0x68DBFF2A, HUD_ITEMS, 269, 179, 389, 192},  // ui205_bowgun_base (a bowgun's ammo above the item bar)
+    // (found with probe_hunter in a hunt: the map's other objects, drawn at the top screen's right)
+    {0x2F542638, HUD_MAP, 0, 0, 0, 0},
+    {0x30EF0159, HUD_MAP, 0, 0, 0, 0},
+    {0x364F1779, HUD_MAP, 0, 0, 0, 0},
+    {0x3C06D9A9, HUD_MAP, 0, 0, 0, 0},
+    {0x414827EF, HUD_MAP, 0, 0, 0, 0},
+    {0x585316AE, HUD_MAP, 0, 0, 0, 0},
+    {0x5FD6EC93, HUD_MAP, 0, 0, 0, 0},
+    {0xA19DCEF1, HUD_MAP, 0, 0, 0, 0},
+    {0xAB99C880, HUD_MAP, 0, 0, 0, 0},
+    {0xAF4646C3, HUD_MAP, 0, 0, 0, 0},
+    {0xB130B39B, HUD_MAP, 0, 0, 0, 0},
+    {0xB4A50FA3, HUD_MAP, 0, 0, 0, 0},
+    {0xB65D7782, HUD_MAP, 0, 0, 0, 0},
+    {0xC15A4714, HUD_MAP, 0, 0, 0, 0},
+    {0xC637830D, HUD_MAP, 0, 0, 0, 0},
+    {0xD69AFE67, HUD_MAP, 0, 0, 0, 0},
+    {0xD8417655, HUD_MAP, 0, 0, 0, 0},
+    {0xF68008DE, HUD_MAP, 0, 0, 0, 0},
+    {0xF9A1E727, HUD_MAP, 0, 0, 0, 0},
+    {0xFC4501C7, HUD_MAP, 0, 0, 0, 0},
+    {0x4625E3F6, HUD_MAP, 0, 0, 0, 0},
+    {0xA82B82DA, HUD_MAP, 0, 0, 0, 0},
+    {0xDF2CB24C, HUD_MAP, 0, 0, 0, 0},
+    {0x195A737A, HUD_MAP, 0, 0, 0, 0},
+    {0x3A2A0840, HUD_MAP, 0, 0, 0, 0},  // (the map's drawing layers, found in the 23:04 run: the marker was moved without them)
+    {0x9A71D21D, HUD_MAP, 0, 0, 0, 0},
 };
 constexpr int HUD_OBJECT_COUNT = static_cast<int>(std::size(HUD_OBJECTS));
 constexpr int HUD_MAP_AREA = 15;  // (HUD_OBJECTS' index of the area objects)
@@ -1138,6 +1210,7 @@ int HudObjectOf(u32 hash) {
 }
 
 bool WatchingQuestMap();                         // the quest's touch panels (below)
+u32 LocalHunter(RCtx* ctx, int* weapon);
 void NoteTouchScreenObject(float x, float y);
 void NoteHudObject(int object);                  // the game's state (below)
 
@@ -1154,7 +1227,29 @@ void LayoutObjectConstants(RCtx* ctx, RFunc original) {
     }
     const u32 screen = rd32(ctx, draw + CDRAW_SCREEN) >> 1 & 0x1f;
     const u32 hash = rd32(ctx, object);
-    OneScreen::ObjectConstants(ctx, object, draw, constants, screen);
+    // the hunting HUD's size: a part's objects drawn smaller about the picture's centre, then moved so the part's corner
+    // (the top-left for the clock, bars, sharpness and the party; the top-right for the map and the target camera; the
+    // bottom-right for the items) stays where it was: smaller parts end up at the edges (a wider picture's too)
+    float hud_move[3];
+    const float* hud_move_ptr = nullptr;
+    if (screen == 0) {
+        const int index = HudObjectOf(hash);
+        if (index >= 0) {
+            const int part = HUD_OBJECTS[index].part;
+            const float s = std::clamp(options.hud_scale * options.hud_part_scale[part] / 10000.0f, 0.4f, 1.0f);
+            if (s < 0.999f) {
+                const float width = rows != 0 ? static_cast<float>(rows) : static_cast<float>(TOP_ROWS);
+                const float half = (options.hud_edges ? width : static_cast<float>(TOP_ROWS)) / 2.0f;
+                const float ax = HUD_SIDE[part] != 0 ? HUD_SIDE[part] * half : 200.0f;  // (the map and the target: the 400's right)
+                const float ay = part == HUD_ITEMS ? 120.0f : -120.0f;
+                hud_move[0] = s;
+                hud_move[1] = (1.0f - s) * ax;
+                hud_move[2] = (1.0f - s) * ay;
+                hud_move_ptr = hud_move;
+            }
+        }
+    }
+    OneScreen::ObjectConstants(ctx, object, draw, constants, screen, hud_move_ptr);
     if (trace) {
         LogInfo("layout: frame {} object {:08X} hash {:08X} screen {} at {:.1f}, {:.1f}", frames, object,
                 hash, screen, ReadF32(ctx, constants), ReadF32(ctx, constants + 4));
@@ -1173,6 +1268,18 @@ void LayoutObjectConstants(RCtx* ctx, RFunc original) {
         WriteF32(ctx, constants + 4, ReadF32(ctx, constants + 4) + 2000.0f);
     }
     const int object_index = HudObjectOf(hash);
+    if (options.probe_hunter) {  // the top screen's objects of a hunt, once each: which ones the HUD parts miss (the map's)
+        static std::unordered_set<u32> seen_hashes;
+        int weapon = -1;
+        if (seen_hashes.size() < 400 && seen_hashes.count(hash) == 0 && LocalHunter(ctx, &weapon) != 0) {
+            seen_hashes.insert(hash);
+            LogInfo("probe: top-screen object {:08X} at {:.0f}, {:.0f} -> {}", hash, ReadF32(ctx, constants),
+                    ReadF32(ctx, constants + 4),
+                    object_index >= 0 ? fmt::format("part {} ({})", HUD_OBJECTS[object_index].part,
+                                                    HUD_KEYS[HUD_OBJECTS[object_index].part])
+                                      : std::string("no part"));
+        }
+    }
     if (object_index < 0) {
         return;
     }
@@ -1181,7 +1288,10 @@ void LayoutObjectConstants(RCtx* ctx, RFunc original) {
     const int part = HUD_OBJECTS[object_index].part;
     const float dx = HUD_SIDE[part] * (rows != 0 ? (static_cast<float>(rows) - TOP_ROWS) / 2.0f : 0.0f) +
                      options.hud_dx[part];
-    const float dy = options.hud_dy[part];
+    float dy = options.hud_dy[part];
+    if (part == HUD_MAP && MonsterHp::Enabled().load(std::memory_order_relaxed)) {
+        dy += 14.0f;  // (the monster's life plate sits over the map's top: the map goes down a little)
+    }
     if (dx != 0 || dy != 0) {
         WriteF32(ctx, constants, ReadF32(ctx, constants) - dx);
         WriteF32(ctx, constants + 4, ReadF32(ctx, constants + 4) - dy);
@@ -1287,7 +1397,13 @@ constexpr u32 QUEST_STATE_PHASE = 0x24;   // u8 in the state block: 0 playing, 1
 constexpr u8 QUEST_PHASE_WAITING = 1;
 std::atomic<bool> skip_offered{false};   // SkipOffered()
 // MODIFIED: the touch-screen button the skip press taps: the post-quest wait's (skip_panel) while it is offered, else the scene's
-u32 SkipPanel() { return skip_offered.load(std::memory_order_relaxed) ? options.skip_panel : options.skip_panel_scene; }
+u32 skip_scene_alt = 0;  // the scene's other Skip button (9, the opening cinematics') when the screen has it and not skip_panel_scene's (11, the monster's death)
+u32 SkipPanel() {
+    if (skip_offered.load(std::memory_order_relaxed)) {
+        return options.skip_panel;
+    }
+    return skip_scene_alt != 0 ? skip_scene_alt : options.skip_panel_scene;
+}
 bool skip_held = false;                  // the skip button, last frame
 int skip_tap = 0;                        // frames of the tap left: 3 pressed, 2 held, 1 released
 bool skip_tap_direct = false;            // the tap couldn't go through the hit test: write
@@ -1327,6 +1443,11 @@ void PanelTouchAllowed(RCtx* ctx, RFunc original) {
     original(ctx);
     if (!from_process_touch || skip_tap == 0) {
         return;
+    }
+    skip_scene_alt = 0;
+    if (!skip_offered.load(std::memory_order_relaxed) && options.skip_panel_scene != 9 &&
+        PanelIndex(ctx, options.skip_panel_scene) < 0 && PanelIndex(ctx, 9) >= 0) {
+        skip_scene_alt = 9;
     }
     const int index = PanelIndex(ctx, SkipPanel());
     if (index < 0) {
@@ -1479,10 +1600,24 @@ void MhPadUpdate(RCtx* ctx, RFunc original) {
     const u32 rest = combo & ~options.skip_button;
     const bool rest_held = rest && (held & rest) == rest;
     const bool skip_now = (options.skip_button && (held & options.skip_button)) || host_skip.load(std::memory_order_relaxed);
-    if (skip_now && !skip_held && (offered || options.skip_anywhere) && !rest_held) {
+    // (in the village, out of a quest, with its touch screen showing, the touch screen's button 9 is the game's menu, not a Skip: no tap)
+    const bool village_idle = !offered && OneScreen::MapTapAvailable() && PanelIndex(ctx, options.skip_panel_scene) < 0;  // (a scene's own Skip button, 11, is a real skip)
+    if (skip_now && !skip_held && (offered || options.skip_anywhere) && !rest_held) {  // (a trace: what the touch screen holds at each skip press, to tell a cutscene from the idle village)
+        const u32 mode = rd8(ctx, PANEL_MANAGER + PANEL_MODE);
+        static int traced = 0;
+        if (traced < 60) {
+            ++traced;
+            LogInfo("skip press: village_idle {} offered {} mode {} panels {} {} {} {}", village_idle, offered, mode,
+                    rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16) & 0xFF)),
+                    rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16 + 4) & 0xFF)),
+                    rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16 + 8) & 0xFF)),
+                    rd8(ctx, PANEL_MANAGER + PANEL_SLOT_IDS + (rd32(ctx, PANEL_ID_TABLES + mode * 16 + 12) & 0xFF)));
+        }
+    }
+    if (skip_now && !skip_held && (offered || options.skip_anywhere) && !rest_held && !village_idle) {
         skip_tap = 3;
         skip_tap_seen = false;
-        LogInfo("skip: {} pressed", PadName(options.skip_button));
+        LogInfo("skip pressed");
     }
     skip_held = skip_now;
 }
@@ -2800,6 +2935,166 @@ bool LargeMonster(RCtx* ctx, u32 monster, u32* info_out) {
 // 0x0093b9ec, "add a change to the life", clamped to 0..max). Nothing is written.
 constexpr u32 INFO_HP = 0x3e8, INFO_HP_MAX = 0x3ec;
 
+/// probe_hunter: where the hunter keeps what the mods need. The local hunter's unit (its first 0x2800 bytes), the block
+/// at +0xe30 (the pouch is there: 0x236 + 4 * slot the item, +2 its count) and the item info at +0xa29c are sampled every
+/// 20 frames; a word that changed is logged ("probe: <block> +offset old -> new") unless it has changed more than 4 times
+/// already (counters and positions change all the time; sharpness, ammo and counts change on a hit or a shot). A quest
+/// with a hit taken, an item used, a shot fired: the log shows the offsets.
+void HunterProbe(RCtx* ctx) {
+    static std::vector<u32> last[3];
+    static std::vector<u8> noisy[3];
+    static std::vector<std::pair<u32, std::vector<u32>>> linked;
+    static std::vector<u8> linked_noisy;
+    static u32 owner = 0;
+    int weapon = -1;
+    const u32 hunter = LocalHunter(ctx, &weapon);
+    if (hunter == 0) {
+        owner = 0;
+        return;
+    }
+    if (frames % 20 != 0) {
+        return;
+    }
+    const u32 blocks[3] = {hunter, rd32(ctx, hunter + 0xe30), rd32(ctx, hunter + HUNTER_ITEMS)};
+    const u32 sizes[3] = {0x2800, 0x800, 0x700};
+    static constexpr const char* names[3] = {"hunter", "e30", "items"};
+    if (owner != hunter) {
+        owner = hunter;
+        for (auto& v : last) v.clear();
+        linked.clear();
+        LogInfo("probe: hunter {:08X} weapon {} e30 {:08X} items {:08X}", hunter, weapon, blocks[1], blocks[2]);
+    }
+    for (int b = 0; b < 3; ++b) {
+        if (!HeapPointer(blocks[b])) {
+            continue;
+        }
+        const u32 words = sizes[b] / 4;
+        if (last[b].empty()) {
+            last[b].resize(words);
+            noisy[b].assign(words, 0);
+            for (u32 i = 0; i < words; ++i) last[b][i] = rd32(ctx, blocks[b] + 4 * i);
+            continue;
+        }
+        int lines = 0;
+        for (u32 i = 0; i < words; ++i) {
+            const u32 now = rd32(ctx, blocks[b] + 4 * i);
+            if (now == last[b][i]) continue;
+            if (noisy[b][i] < 255) ++noisy[b][i];
+            if (noisy[b][i] <= 4 && lines < 40) {
+                LogInfo("probe: frame {} {} +{:04X} {:08X} -> {:08X}", frames, names[b], 4 * i, last[b][i], now);
+                ++lines;
+            }
+            last[b][i] = now;
+        }
+    }
+    // The sharpness is not in those blocks (that was the health): it is probably in an object the hunter points to (the
+    // weapon). Every heap pointer in the hunter's first 0x400 bytes is followed (the first 16, 0x300 bytes each) and only a
+    // small number that went DOWN by a little is logged ("SHARP? ..."): hit a monster without being hit, and the lines
+    // that appear at each hit are the candidates (the sharpness wears 1 to a few points a hit, its colour bar follows it).
+    if (linked.empty()) {
+        for (u32 off = 0; off < 0x400 && linked.size() < 16; off += 4) {
+            const u32 target = rd32(ctx, hunter + off);
+            if (!HeapPointer(target) || !HeapPointer(target + 0x2fc) || target == blocks[1] || target == blocks[2] || target == hunter) continue;
+            if (std::any_of(linked.begin(), linked.end(), [&](const auto& e) { return e.first == target; })) continue;
+            std::vector<u32> v(0xc0);
+            for (u32 i = 0; i < v.size(); ++i) v[i] = rd32(ctx, target + 4 * i);
+            LogInfo("probe: linked block {} at hunter+{:04X} -> {:08X}", linked.size(), off, target);
+            linked.emplace_back(target, std::move(v));
+        }
+        linked_noisy.assign(16 * 0xc0, 0);
+        return;
+    }
+    static bool was_window = false;
+    const bool window = probe_window.load(std::memory_order_relaxed);
+    if (window != was_window) {
+        was_window = window;
+        LogInfo("probe: window {} at frame {}", window ? "ON (every change of the linked blocks is logged)" : "OFF", frames);
+        for (auto& [target, old_words] : linked) {
+            for (u32 i = 0; i < old_words.size(); ++i) old_words[i] = rd32(ctx, target + 4 * i);  // (no burst of what moved before)
+        }
+        std::fill(linked_noisy.begin(), linked_noisy.end(), u8{0});
+    }
+    int lines = 0;
+    for (u32 b = 0; b < linked.size(); ++b) {
+        auto& [target, old_words] = linked[b];
+        for (u32 i = 0; i < old_words.size(); ++i) {
+            const u32 now = rd32(ctx, target + 4 * i);
+            const u32 was = old_words[i];
+            if (now == was) continue;
+            old_words[i] = now;
+            u8& count = linked_noisy[b * 0xc0 + i];
+            if (window && count < 40 && lines < 150) {  // (sharpness may be an integer or a float: all of it is logged inside the window)
+                ++count;
+                ++lines;
+                LogInfo("probe: WIN frame {} linked {} +{:04X} {:08X} -> {:08X}", frames, b, 4 * i, was, now);
+            }
+        }
+    }
+}
+
+/// invincible and inf_items: found with probe_hunter on a real hunt (2026-11-23). The hunter's data block is the one at
+/// [hunter + 0xe30]: the hunter's HEALTH (it was taken for the sharpness at first) is the number at +0x35c (110, 107, 102... with each
+/// hit taken; +0x34c holds the maximum in its upper half) and the pouch's slot n (0-23 items) holds its item at +0x236 + 4n and the
+/// count at +0x238 + 4n (a potion used: 7 -> 6). Each is kept at the highest it has been in this hunt: a hit or a use
+/// takes it down, and it is put back; a whetstone, a pick-up or a new item raises the mark.
+void HunterMods(RCtx* ctx) {
+    static u32 owner = 0;
+    static u32 sharp_mark = 0;
+    static u32 sharp_low_mark = 0;
+    static u16 item_id[24] = {};
+    static s16 item_mark[24] = {};
+    int weapon = -1;
+    const u32 hunter = LocalHunter(ctx, &weapon);
+    if (hunter == 0) {
+        owner = 0;
+        return;
+    }
+    const u32 block = rd32(ctx, hunter + 0xe30);
+    if (!HeapPointer(block)) {
+        return;
+    }
+    if (owner != hunter) {
+        owner = hunter;
+        sharp_mark = 0;
+        sharp_low_mark = 0;
+        std::fill(std::begin(item_id), std::end(item_id), u16{0});
+        std::fill(std::begin(item_mark), std::end(item_mark), s16{0});
+    }
+    if (options.invincible) {
+        const u32 now = rd32(ctx, block + 0x35c);
+        const u32 level = rd32(ctx, block + 0x34c) >> 16;  // (its upper half: what the sharpness began at)
+        const u32 low = rd16(ctx, block + 0x34c);          // (its lower half: the sharpness that wears with each hit)
+        if (level >= 1 && level <= 0x400 && now <= 0x400 && low <= 0x400) {
+            if (low > sharp_low_mark) {
+                sharp_low_mark = low;
+            } else if (low < sharp_low_mark) {
+                wr16(ctx, block + 0x34c, static_cast<u16>(sharp_low_mark));
+            }
+            if (now > sharp_mark) {
+                sharp_mark = now;
+            } else if (now < sharp_mark) {
+                wr32(ctx, block + 0x35c, sharp_mark);
+            }
+        }
+    }
+    if (options.inf_items) {
+        for (u32 slot = 0; slot < 24; ++slot) {
+            const u32 at = block + 0x236 + 4 * slot;
+            const u16 id = rd16(ctx, at);
+            const s16 count = static_cast<s16>(rd16(ctx, at + 2));
+            if (id == 0 || id == 0x4d5) {  // (an empty slot)
+                item_id[slot] = 0;
+                item_mark[slot] = 0;
+            } else if (id != item_id[slot] || count > item_mark[slot]) {
+                item_id[slot] = id;
+                item_mark[slot] = count;
+            } else if (count < item_mark[slot]) {
+                wr16(ctx, at + 2, static_cast<u16>(item_mark[slot]));
+            }
+        }
+    }
+}
+
 void MonsterLifeStep(RCtx* ctx) {
     if (!MonsterHp::Enabled().load(std::memory_order_relaxed)) {
         return;
@@ -3352,8 +3647,20 @@ unsigned long long GameFrameCount() {
     return game_frame_total.load(std::memory_order_relaxed);
 }
 
+void ToggleProbeWindow() {
+    probe_window.store(!probe_window.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
 void SetHostSkip(bool down) {
     host_skip.store(down, std::memory_order_relaxed);
+}
+
+bool MapOpen() {
+    return OneScreen::MapOpen();
+}
+
+bool MapTapAvailable() {
+    return OneScreen::MapTapAvailable();
 }
 
 void SetHostTriggers(bool zl, bool zr) {
@@ -3468,10 +3775,11 @@ bool SetOption(const std::string& key, const std::string& value) {
         "target", "skip", "skip_panel", "skip_panel_scene", "skip_anywhere", "skip_hint", "skip_end", "skip_end_hold", "touch_overlay",
         "quest_overlay", "target_overlay",
         "hud_edges", "trace_frames", "trace_layout", "trace_panels", "bloom", "motion_blur",
-        "depth_of_field", "radial_blur", "haze", "trace_filters", "trace_state", "item_bar", "hud_probe",
+        "depth_of_field", "radial_blur", "haze", "trace_filters", "trace_state", "item_bar", "hud_probe", "hud_scale", "probe_hunter", "hide_help", "invincible", "inf_items",
         "qol_hold_gather", "qol_flex_cancel", "qol_sharpen_cancel", "qol_rewards_no_limit", "rewards_send_all",
         "single_screen", "effects"};
-    if (std::find(std::begin(live), std::end(live), key) == std::end(live) && HudPartIndex(key) < 0) {
+    if (std::find(std::begin(live), std::end(live), key) == std::end(live) && HudPartIndex(key) < 0 &&
+        HudScalePartIndex(key) < 0) {
         return false;
     }
     Set(options, key, value);

@@ -529,16 +529,19 @@ public:
             }
             break;
         case SDL_EVENT_MOUSE_WHEEL: {
-            // MODIFIED: the wheel scrolls the list (3 rows a notch) without moving the marked row; any key or pad move
-            // goes back to following the marked row.
-            if (e.wheel.integer_y == 0) return;
+            // MODIFIED: the wheel scrolls the list (one row a notch, the fractions of a smooth wheel or a touchpad added up) without
+            // moving the marked row; any key or pad move goes back to following the marked row.
+            wheel_rows_ += e.wheel.y;
+            const int wheel_step = static_cast<int>(wheel_rows_);
+            if (wheel_step == 0) return;
+            wheel_rows_ -= static_cast<float>(wheel_step);
             const int total = static_cast<int>(view_.rows.size());
             float density = 1.0f;
             const Layout l = CurrentLayout(window, &density);
             int first = 0, fit = 1;
             WindowOf(l, view_.rows.size(), view_.sel, &first, &fit, scroll_);
             if (total <= fit) return;
-            scroll_ = std::clamp(first - e.wheel.integer_y * 3, 0, total - fit);
+            scroll_ = std::clamp(first - wheel_step, 0, total - fit);
             hover_row_ = -1;
             dirty_ = true;
             return;
@@ -754,6 +757,7 @@ private:
     Uint32 pad_held_ = 0;            // pad buttons seen down (duplicate filter in OnEvent)
     Uint64 pad_last_down_[32] = {};  // SDL_GetTicks of each button's last accepted press
     int pad_dupes_logged_ = 0;
+    float wheel_rows_ = 0.0f;       // the wheel's turn not yet worth a row
     int scroll_ = -1;               // first row shown after a wheel scroll (-1: follow the marked row)
     int drag_ = -1;                 // the slider (an item's index) the mouse holds
     int hover_tab_ = -1, hover_row_ = -1;
@@ -845,7 +849,7 @@ private:
         item.value = found ? options[index] : (now.empty() ? options[0] : now);
         item.toggle = options.size() == 2 && ((options[0] == "on" && options[1] == "off") || (options[0] == "off" && options[1] == "on"));
         item.on = item.value == "on";
-        item.slider = key == "volume" || key == "popup_size";
+        item.slider = key == "volume" || key == "popup_size" || key == "skip_end_hold" || key.rfind("hud_scale", 0) == 0;
         item.frac = options.size() > 1 ? static_cast<float>(found ? index : 0) / static_cast<float>(options.size() - 1) : 0.0f;
         if (item.slider && options.size() > 1) {  // where the number is between the first and the last, even if it is between steps
             const float from = static_cast<float>(std::atof(options.front().c_str())), to = static_cast<float>(std::atof(options.back().c_str()));
@@ -913,6 +917,24 @@ private:
             {"vsync", "Shows each frame when your display refreshes. Off lets the game run above your display's rate, and the picture may tear."},
             {"mode", "Popup: the top screen fills the window and the touch screen pops up over it when the game needs it. The others show both screens all the time."},
             {"aspect", "Default keeps the 3DS's own 5:3 shape (black bars at the sides on a wide screen). Stretch fills the whole window. The ratios draw the picture in that shape."},
+            {"widescreen", "Draws the top screen wider (more of the scene at the sides, not stretched): Match fits your window, or pick a shape. Experimental: check hunts, cutscenes and menus. Needs a restart."},
+            {"qol_flex_cancel", "After a potion or a ration, moving, rolling or any other action ends the flex at once. What you drank still works; standing still, the flex plays whole."},
+            {"qol_sharpen_cancel", "B while sharpening rolls out of it, as in later Monster Hunter games."},
+            {"qol_rewards_no_limit", "The rewards screen after a quest no longer counts down: take your time choosing."},
+            {"rewards_send_all", "Choosing Send to Item Box on the rewards screen sends every reward that fits at once."},
+            {"antialiasing", "The game's own anti-aliasing, which smooths the edges. Off saves its pass; at a high internal resolution the edges stay fine."},
+            {"bloom", "The glow over the bright parts of the picture. Off: sharper, with more contrast, and a little faster."},
+            {"motion_blur", "The blending of earlier frames that some effects add."},
+            {"depth_of_field", "The focus blur of cutscenes. For now they stay sharp with it. Off skips its work, a little faster."},
+            {"radial_blur", "The zoom blur around a roaring monster, and in the cutscenes that use it."},
+            {"haze", "The heat shimmer of hot areas."},
+            {"dither", "The game's dither pattern, which hides banding on the 3DS's screens. Above 1x internal resolution it can show as a fine grid: turn it off."},
+            {"fov", "How much of the scene you see: higher shows more around the hunter, lower less. 1.0 is the 3DS's. It applies at once."},
+            {"kick", "A 3DS button for the kick, which on a 3DS only the touch screen's panel does. With the Circle Pad Pro bindings, ZR is the usual one. Off: only the touch panel."},
+            {"target", "A 3DS button for the target camera panel: a press puts the camera on the monster, or goes through the large monsters and then off. ZL is the usual one. Off: only the touch panel."},
+            {"skip_end", "Buttons held together to end the wait before the return (the carving time) as if it had run out. Online it ends once every player with the port has held them. ZL and ZR are the Circle Pad Pro's: they are the keys or buttons you set in Controls."},
+            {"skip_end_hold", "How many seconds those buttons are held, so nobody ends the quest by accident."},
+            {"hide_help", "Hides the game's help box (the black box with a line of text a menu shows for the selected row). It overlaps some menus and, on the title screen, made the touch screen pop up for a single line."},
             {"touch_show", "When the touch screen's popup appears: when the game needs it (auto), always, or never. F2 shows or hides it by hand."},
             {"popup_size", "The height of the touch screen's popup, as a percentage of the window's height."},
             {"popup_corner", "The corner of the window where the touch screen's popup sits."},
@@ -921,10 +943,14 @@ private:
             {"hd_texture_max", "A texture of an HD pack larger than this (on its longer side) is reduced before it is loaded: it takes less video memory and loads faster, with less detail. Off: no limit. Needs a restart."},
             {"scale", "How sharp the 3D scene, the HUD and the text are drawn: a multiple of the 3DS top screen's 400 x 240. Auto picks the one closest to your window."},
             {"fps_counter", "Shows the game's frame rate in the top-left corner."},
+            {"hud_parts", "Shows a size for each part of the hunting HUD (clock, bars, sharpness, party, map, target camera, item bar), on top of the general one. Press it again to hide them."},
+            {"hud_scale", "A mod of this program: draws the hunting HUD smaller, from 100% (the game's own size) down to 40%. Each part keeps to its corner, so the smaller it is the closer to the edges. It only changes how the HUD is drawn, so it is fine online."},
+            {"qol_hold_gather", "Hold A to carve, gather, mine and catch bugs again and again until you let go, instead of pressing it each time. It only changes the controls, so it is fine online."},
+            {"invincible", "A cheat: your hunter takes no damage (the health bar does not go down). It changes the game's memory: it can break an online hunt or a save. Use it at your own risk."},
+            {"inf_items", "A cheat: the items in your pouch are not used up in a hunt (a potion, a bomb, ammo that is an item). It changes the game's memory: it can break an online hunt or a save. Use it at your own risk."},
             {"monster_hp", "A mod of this program, not a graphics option: it shows the life of the large monster you hurt last, top right, with its name, and how much it drops as you hit it. It only reads the game memory and changes nothing, so it is fine online."},
             {"Open the HD textures folder", "Opens the folder for HD texture packs (Azahar or Citra format). They are read when the game starts."},
             {"fps", "Caps the game's frame rate. Default is the game's own, Display matches your screen, Unlimited uses all the CPU."},
-            {"steady", "Keeps the frame rate even instead of letting it vary. Default leaves the game's own setting."},
             {"effects", "Turns the game's particle effects on or off. Default leaves the game's own setting."},
             {"volume", "The volume of the game."},
             {"language", "The language of this menu. Auto follows Windows."},
@@ -966,11 +992,22 @@ private:
                 items.push_back(Choice("Touch popup size", "popup_size", Numbers(20, 70, 5)));
                 items.push_back(Choice("Touch popup corner", "popup_corner", {"bottom-right", "bottom-left", "top-right", "top-left"}));
             }
-            items.push_back(Choice("Picture shape", "aspect", {"default", "stretch", "16:9", "16:10", "21:9", "4:3"}));
+            items.push_back(Choice("Hide the help boxes", "hide_help", {"off", "on"}));
+            items.push_back(Choice("Widescreen", "widescreen", {"off", "match", "16:9", "16:10", "21:9"}, true));
             items.push_back(Choice("Internal resolution", "scale", {"auto", "1", "2", "3", "4", "5", "6", "7", "8"}, true));
+#ifndef C4U_NO_FSR  // (a diagnostic build has no FSR: not even the rows)
             items.push_back(Choice("Upscaler (AMD FSR 1.0)", "upscaler", {"off", "fsr"}));
             items.push_back(Choice("FSR quality", "fsr_quality", {"quality", "ultra", "balanced", "performance"}, true));
+#endif
             items.push_back(Choice("HD texture size limit", "hd_texture_max", {"off", "4096", "2048", "1024", "512"}, true));
+            items.push_back(Choice("Anti-aliasing", "antialiasing", {"on", "off"}));
+            items.push_back(Choice("Bloom", "bloom", {"on", "off"}));
+            items.push_back(Choice("Motion blur", "motion_blur", {"on", "off"}));
+            items.push_back(Choice("Depth of field", "depth_of_field", {"on", "off"}));
+            items.push_back(Choice("Radial blur", "radial_blur", {"on", "off"}));
+            items.push_back(Choice("Heat haze", "haze", {"on", "off"}));
+            items.push_back(Choice("Dither", "dither", {"on", "off"}));
+            items.push_back(Choice("Field of view", "fov", {"0.7", "0.8", "0.9", "1.0", "1.1", "1.2", "1.3", "1.4", "1.5"}));
             items.push_back(Choice("FPS counter", "fps_counter", {"off", "on"}));
             items.push_back(Action("Open the HD textures folder", [this] {
                 const std::string said = host_.action ? host_.action("open_textures") : "Not available";
@@ -980,7 +1017,6 @@ private:
             break;
         case Page::Game:
             items.push_back(Choice("Frame rate limit", "fps", {"default", "display", "30", "60", "120", "180", "240", "300", "360", "unlimited"}));
-            items.push_back(Choice("Steady frame rate", "steady", {"default", "on", "off"}, false, true));
             items.push_back(Choice("Particle effects", "effects", {"default", "on", "off"}, false, true));
             break;
         case Page::Controls:
@@ -1034,6 +1070,10 @@ private:
         items.push_back(Info(capture_ >= 0 ? "Now press a key or a controller button.  Esc or the right mouse button cancels, Backspace puts it back."
                                            : "Enter on a button, then press the key or the controller's button you want for it.",
                              capture_ >= 0 ? 1 : 2));
+        items.push_back(Choice("Kick button", "kick", {"off", "ZL", "ZR", "L", "R"}));
+        items.push_back(Choice("Target camera button", "target", {"off", "ZL", "ZR", "L", "R"}));
+        items.push_back(Choice("End the wait after a quest", "skip_end", {"ZL+ZR", "L+R", "L+R+X", "L+R+Y", "START+L+R", "off"}));
+        items.push_back(Choice("Hold time to end the wait", "skip_end_hold", {"0.5", "1.0", "1.5", "2.0", "3.0", "4.0", "5.0"}));
         {   // MODIFIED: the skip control for cutscenes: a key and a controller button that also keep their own job in the game
             Item item;
             item.kind = Item::Action;
@@ -1163,6 +1203,25 @@ private:
         // the mods of this program itself (they read or change the game; none is a graphics option)
         items.push_back(Info("Built-in mods: they live in the game while it runs.", 2));
         items.push_back(Choice("Monster life bar (mod)", "monster_hp", {"off", "on"}));
+        items.push_back(Info("Cheats: they change the game's memory. They can break an online hunt or your save: use them at your own risk.", 2));
+        items.push_back(Choice("Invincible (cheat)", "invincible", {"off", "on"}));
+        items.push_back(Choice("Infinite items (cheat)", "inf_items", {"off", "on"}));
+        items.push_back(Choice("Hold A to gather (comfort)", "qol_hold_gather", {"off", "on"}));
+        items.push_back(Choice("Cancel the flex after a drink (comfort)", "qol_flex_cancel", {"off", "on"}));
+        items.push_back(Choice("Cancel sharpening with B (comfort)", "qol_sharpen_cancel", {"off", "on"}));
+        items.push_back(Choice("No time limit on the rewards (comfort)", "qol_rewards_no_limit", {"off", "on"}));
+        items.push_back(Choice("Send all the rewards to the box (comfort)", "rewards_send_all", {"off", "on"}));
+        items.push_back(Choice("Hunting HUD size (mod)", "hud_scale", Numbers(40, 100, 5)));
+        items.push_back(Choice("Adjust each HUD part", "hud_parts", {"off", "on"}));
+        if (host_.value("hud_parts") == "on") {
+            items.push_back(Choice("   Clock", "hud_scale_clock", Numbers(40, 100, 5)));
+            items.push_back(Choice("   Health and stamina bars", "hud_scale_bars", Numbers(40, 100, 5)));
+            items.push_back(Choice("   Sharpness and weapon gauge", "hud_scale_sharpness", Numbers(40, 100, 5)));
+            items.push_back(Choice("   Party name plates", "hud_scale_party", Numbers(40, 100, 5)));
+            items.push_back(Choice("   Area map", "hud_scale_map", Numbers(40, 100, 5)));
+            items.push_back(Choice("   Target camera", "hud_scale_target", Numbers(40, 100, 5)));
+            items.push_back(Choice("   Item bar", "hud_scale_items", Numbers(40, 100, 5)));
+        }
         items.push_back(Info("Mods you add change the game's files. A change applies the next time the game starts.", 2));
         if (mods.empty()) {
             items.push_back(Info("No mods yet. Drop a mod's folder or .zip on this window, or open the folder and copy it there.", 1));
@@ -1567,7 +1626,7 @@ private:
                 } else if (item.slider) {
                     r.kind = ViewRow::Slider;
                     r.frac = item.frac;
-                    r.value = item.value + (item.id == "volume" || item.id == "popup_size" ? "%" : "");
+                    r.value = item.value + (item.id == "volume" || item.id == "popup_size" || item.id.rfind("hud_scale", 0) == 0 ? "%" : item.id == "skip_end_hold" ? " s" : "");
                 } else {
                     r.kind = ViewRow::Choice;
                     r.value = Shown(item, std::atoi(host_.value("scale_auto").c_str()));

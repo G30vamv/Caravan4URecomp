@@ -20,6 +20,17 @@ namespace {
 
 namespace sampling = fragment::sampling;
 
+// MODIFIED for the Windows port (a diagnostic): what the textures cost the thread that binds them, in a line every 10 s
+struct TextureTimes {
+    double bind_ms = 0, bind_max = 0, find_ms = 0, find_max = 0;
+    u64 binds = 0, over5 = 0, finds = 0, hd_uploads = 0, hd_bytes = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+};
+TextureTimes g_times;
+double MsSince(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+}
+
 std::optional<rhi::PicaFormat> SurfaceFormat(texture::Format format) {
     switch (format) {
     case texture::Format::RGBA8: return rhi::PicaFormat::Rgba8;
@@ -230,9 +241,14 @@ std::shared_ptr<rhi::Image> TextureBindings::GuestImage(std::span<const texture:
             const u8* memory = host_.PhysicalPointer(key.addresses[0], static_cast<u32>(bytes));
             if (pixels && memory) {
                 hd_.Dump(pixels->content_hash, memory, bytes, key.width, key.height, key.format, pixels->rgba8);
+                const auto find_start = std::chrono::steady_clock::now();
                 if (const auto* replacement = hd_.Find(pixels->content_hash, memory, bytes, key.width, key.height, key.format)) {
                     found = *replacement;
                 }
+                const double find_ms = MsSince(find_start);
+                g_times.find_ms += find_ms;
+                g_times.find_max = std::max(g_times.find_max, find_ms);
+                ++g_times.finds;
             }
         }
         if (found) {
@@ -267,6 +283,8 @@ std::shared_ptr<rhi::Image> TextureBindings::GuestImage(std::span<const texture:
             const u64 vram = hd_.UploadBytes(*hd);
             if (old != images_.end()) retired_.push_back(std::move(old->second.image));
             hd_upload_bytes_ += vram;
+            ++g_times.hd_uploads;
+            g_times.hd_bytes += vram;
             images_.insert_or_assign(key, Upload{*replacement, generations, cache_.frame(), vram, std::nullopt});
             cache_.ReleasePixels(guest_keys[0]);
             ++counters_["texture_uploads"];
@@ -346,7 +364,20 @@ bool TextureBindings::Bind(const pica::PicaState& state, DrawDesc& draw, Surface
             const auto end = std::find_if(first, refs_.end(), [unit](const auto& ref) { return ref.unit != unit; });
             const auto guest_start = std::chrono::steady_clock::now();
             const auto image = GuestImage(std::span{first, end}, recorder, staging, outside_pass);
-            if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - guest_start).count();
+            const double bind_ms = MsSince(guest_start);
+            g_times.bind_ms += bind_ms;
+            g_times.bind_max = std::max(g_times.bind_max, bind_ms);
+            ++g_times.binds;
+            g_times.over5 += bind_ms >= 5.0;
+            if (MsSince(g_times.since) >= 10000.0) {
+                MH4N_LOG(Info, "NativeGpu",
+                         "texture times, 10 s: {} binds {:.1f} ms in all (the longest {:.1f} ms, {} over 5 ms); pack lookups {} {:.1f} ms "
+                         "(the longest {:.1f} ms); {} pack textures uploaded, {:.1f} MB",
+                         g_times.binds, g_times.bind_ms, g_times.bind_max, g_times.over5, g_times.finds, g_times.find_ms,
+                         g_times.find_max, g_times.hd_uploads, g_times.hd_bytes / 1048576.0);
+                g_times = TextureTimes{};
+            }
+            if (const double ms = bind_ms;
                 ms >= 15.0 && slow_texture_logs_ < 100) {
                 ++slow_texture_logs_;
                 MH4N_LOG(Info, "NativeGpu", "slow texture: {}x{} format {} took {:.1f} ms on the game thread (decode, upload)",

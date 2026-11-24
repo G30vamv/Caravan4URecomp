@@ -19,11 +19,27 @@ derived from Azahar.
   <img src="images/launcher-graphics.png" alt="The launcher: Graphics tab" width="48%">
 </p>
 
+## What's new in 0.5.0
+
+This one collects everything I did since 0.4.3.
+
+- **One screen.** The touch screen's menus can be drawn on the top screen, so you can play with a single picture. The arrangement is based on Heavenfall's single-screen mod (see [Credits](#credits)); I adapted it to this port and fixed what flickered in it. The 16:9 option makes the top screen use the whole window instead of leaving black bars.
+- **The world map on the main screen.** In a village, **M** on the keyboard or **Start** on a controller opens the map (the PlayStation touchpad click works too if you pick it), and **M** or the same button closes it. With the map open, **Y** (the North button; the triangle on a PlayStation controller) or **N** presses *Solo / multiplayer*, which is drawn under the map with a small hint. The keys and buttons can be changed in the launcher (Controls); an `.ini` from an older version keeps working, it just uses these defaults.
+- **A smaller hunting HUD.** One size for all of it and one for each part (clock, bars, sharpness, party, map, target camera, item bar), in the in-game menu and the launcher.
+- **More graphics options:** antialiasing, bloom, motion blur, depth of field, radial blur, haze, dither and field of view.
+- **Comforts and cheats, all off by default.** Hold A to gather, cancel the pose after a drink, cancel sharpening, rewards without limit, send all rewards to the box; and, at your own risk, *Invincible* and *Infinite items*. The cheats write to the game's memory, so they can break an online hunt or a save. Some comforts follow the ideas of jM5557's MH4U QOL mods (see [Credits](#credits)).
+- **Controls:** a button for the kick, one for the target camera, and buttons held together to end the wait after a quest (ZL + ZR by default). The skip button can now be Start, Back or the PlayStation touchpad, and pressing it in the village no longer opens the game's menu.
+- **The monster life bar** has a smaller plate, and the in-game menu's list scrolls one row per notch of the mouse wheel.
+- **I removed FSR.** It was optional and off by default, but on the GPUs where people tried it (AMD and NVIDIA) it cost frames instead of giving them. The `upscaler` and `fsr_quality` lines of an old `.ini` are simply ignored.
+- **Online:** more detail in the log of rooms (times, statistics, why a connection dropped) to find why some players leave at the start of a quest.
+
+What I haven't tested: the vote to end the wait online (it needs two players with this version), controllers other than a DualSense and a GameSir, and Windows 10. One thing I already know: the launcher flickers when the game closes; I'll look into it.
+
 ## What's new in 0.4.1
 
 A small update on top of 0.4.0:
 
-- **AMD FSR 1.0 (optional, off by default).** The game is drawn at a lower internal resolution and brought up to your window's size with AMD's FidelityFX Super Resolution 1.0 (upscaling and sharpening). Turn it on in the in-game menu (Graphics) or in the launcher; the *FSR quality* option picks how much lower the internal resolution is when the resolution is on auto. I'm being honest about it: on my RTX 4070 it did not raise the frame rate (the game's CPU thread is the limit there), and in my own play it even cost a few frames, so it is for you to test. It is meant for weaker GPUs.
+- **AMD FSR 1.0 (optional, off by default; removed in 0.5.0).** The game is drawn at a lower internal resolution and brought up to your window's size with AMD's FidelityFX Super Resolution 1.0 (upscaling and sharpening). Turn it on in the in-game menu (Graphics) or in the launcher; the *FSR quality* option picks how much lower the internal resolution is when the resolution is on auto. I'm being honest about it: on my RTX 4070 it did not raise the frame rate (the game's CPU thread is the limit there), and in my own play it even cost a few frames, so it is for you to test. It is meant for weaker GPUs.
 - **HD texture size limit (optional).** A texture of an HD pack larger than the limit you choose (4096, 2048, 1024 or 512 pixels on its longer side) is reduced before it is loaded, so it takes less video memory and loads faster, with less detail. With my pack a limit of 1024 cut the textures from 440 to 277 MB. Off by default.
 - **A new header for the launcher**, with art made for the port.
 - Discord Rich Presence is confirmed to work on a real Discord.
@@ -59,7 +75,7 @@ I'd rather be upfront about what I have actually tested.
 - The **update system of the launcher** against a real release: 0.4.0 is the first one that has it, so there is nothing newer to update to yet. It has been tested with local files.
 - The launcher on other PCs and on Windows 10, and with other languages than English and Spanish.
 - The new controller reader with real controllers (a DualSense over Bluetooth works through the usual path), and the HidHide offer.
-- FSR on weaker GPUs, and what the game's CPU thread costs in the village: the game runs at about 100 to 115 fps there whatever the resolution, and I plan to look into it.
+- What the game's CPU thread costs in the village: the game runs at about 100 to 115 fps there whatever the resolution, and I plan to look into it.
 - The skip button in cutscenes other than the two above, and the mouse as the camera (**F3**, or `mouse_camera = on`).
 - Resolutions of 9x and 10x: the picture still comes out black there.
 - Other GPUs and drivers, building with MSVC (I build with clang from llvm-mingw), and Windows and Android crossplay.
@@ -67,7 +83,7 @@ I'd rather be upfront about what I have actually tested.
 
 ## Getting it
 
-The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.4.1**, tagged `windows-v0.4.1`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.5.0**, tagged `windows-v0.5.0`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
@@ -160,7 +176,7 @@ texture packs.
   is still black on my card, so the menu stops at 8x.
 - **Picture shape:** the 3DS's top screen is 5:3, so on a 16:9 screen there are black bars at the sides. **Graphics > Picture
   shape > stretch** fills the whole window (the picture is stretched a little); the fixed ratios are there too.
-- **FSR and the HD texture limit:** see [What's new in 0.4.1](#whats-new-in-041).
+- **The HD texture limit:** see [What's new in 0.4.1](#whats-new-in-041) (FSR, described there, was removed in 0.5.0).
 - **Sound:** the audio buffer is 60 ms by default; `options = --audio-latency 100` in the ini makes it larger if you hear cuts.
 
 ## Playing online
@@ -188,7 +204,7 @@ PowerShell window:
 
 ```
 powershell -ExecutionPolicy Bypass -File windows\build.ps1 [-Launcher]
-powershell -ExecutionPolicy Bypass -File windows\package.ps1 -Version 0.4.1
+powershell -ExecutionPolicy Bypass -File windows\package.ps1 -Version 0.5.0
 ```
 
 `build.ps1` downloads SDL3 and builds the program (with `-Launcher` it builds the launcher too); `package.ps1` makes the zip.
@@ -216,7 +232,9 @@ Every changed file says so in its header. The Android app is untouched.
   and its contributors.
 - 4u-native, the Android app this port is based on: [khorne-hub](https://github.com/khorne-hub/4u-native).
 - Parts of the runtime come from [Azahar](https://github.com/azahar-emu/azahar) and Citra.
-- The optional upscaler is AMD's [FidelityFX Super Resolution 1.0](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT license).
+- The single-screen arrangement of the touch screen's menus is based on [Heavenfall Beta](https://github.com/popzol/4u-heavenfall-mod-beta) by popzol and BlitzWOLF (GPL-3.0), taken at commit `7eebb7a`, without its gameplay changes.
+- Some of the comforts follow the ideas of [MH4U-QOL-Cheats](https://github.com/jM5557/MH4U-QOL-Cheats) by jM5557 (I wrote them again for this port).
+- The upscaler that was optional until 0.4.3 was AMD's [FidelityFX Super Resolution 1.0](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (MIT license); it is no longer used.
 - The libraries used, with their licenses, are listed in `THIRD_PARTY_NOTICES` and `windows/THIRD_PARTY_NOTICES_WINDOWS`.
 - The full credits of 4u-native are in its [README](../README.md), which is kept as it was.
 
@@ -246,7 +264,20 @@ alrededor de ese runtime, un launcher y código propio para buena parte de lo qu
 
 **No incluye el juego.** Necesitas tu propia copia descifrada de Monster Hunter 4 Ultimate (USA) y su update v1.3.0.
 
-**Novedades de la 0.4.1:** FSR 1.0 de AMD como opción (apagada por defecto; en mi RTX 4070 no subió los fps porque el límite es el hilo del juego, y en otra GPU costó fotogramas, así que es para probar), un límite de tamaño para las texturas HD (4096, 2048, 1024 o 512 px; con mi pack, 1024 bajó las texturas de 440 a 277 MB), una cabecera nueva en el launcher y Discord Rich Presence confirmado en un Discord real.
+**Novedades de la 0.5.0:** reúne todo lo que hice desde la 0.4.3.
+- **Una sola pantalla:** los menús de la pantalla táctil se pueden dibujar en la de arriba, para jugar con una sola imagen. La disposición se basa en el mod de pantalla única de Heavenfall (ver Créditos); la adapté a este port y arreglé lo que parpadeaba. La opción 16:9 hace que la pantalla de arriba ocupe toda la ventana, sin barras negras.
+- **El mapa del mundo en la pantalla principal:** en una aldea, **M** en el teclado o **Start** en el mando abre el mapa (también sirve el clic del panel táctil de PlayStation, si lo eliges), y el mismo botón lo cierra. Con el mapa abierto, **Y** (el botón norte; el triángulo en un mando de PlayStation) o **N** pulsa *Solo/multijugador*, que se dibuja bajo el mapa con una pequeña ayuda. Las teclas y botones se cambian en el launcher (Controles); un `.ini` de una versión anterior sigue funcionando y usa estos valores.
+- **HUD de caza más pequeño:** un tamaño general y uno por parte (reloj, barras, filo, grupo, mapa, cámara de objetivo, barra de objetos), en el menú del juego y en el launcher.
+- **Más opciones gráficas:** antialiasing, bloom, desenfoque de movimiento, profundidad de campo, desenfoque radial, neblina, dither y campo de visión.
+- **Comodidades y trucos, todo apagado por defecto:** mantener A para recoger, cancelar la pose al beber, cancelar el afilado, recompensas sin límite, enviar todas las recompensas al baúl; y, bajo tu responsabilidad, *Invencible* y *Objetos infinitos*. Los trucos escriben en la memoria del juego, así que pueden romper una caza en línea o una partida. Algunas comodidades siguen las ideas de los mods QOL de MH4U de jM5557 (ver Créditos).
+- **Controles:** un botón para la patada, otro para la cámara de objetivo y botones mantenidos juntos para terminar la espera tras una misión (ZL + ZR por defecto). El botón de saltar cinemáticas puede ser Start, Atrás o el panel táctil de PlayStation, y pulsarlo en la aldea ya no abre el menú del juego.
+- **La barra de vida del monstruo** tiene una placa más pequeña, y la lista del menú del juego baja una fila por muesca de la rueda del ratón.
+- **Quité FSR:** era opcional y estaba apagado por defecto, pero en las GPU donde la probaron (AMD y NVIDIA) costaba fotogramas en vez de darlos. Las líneas `upscaler` y `fsr_quality` de un `.ini` antiguo se ignoran.
+- **Online:** más detalle en el registro de las salas (horas, estadísticas, por qué se cae una conexión) para encontrar por qué algunos jugadores salen al empezar una misión.
+
+Lo que no he probado: el voto para terminar la espera en línea (necesita dos jugadores con esta versión), mandos que no sean un DualSense o un GameSir, y Windows 10. Algo que ya sé: el launcher parpadea al cerrarse el juego; lo investigaré.
+
+**Novedades de la 0.4.1:** FSR 1.0 de AMD como opción (quitada en la 0.5.0; estaba apagada por defecto; en mi RTX 4070 no subió los fps porque el límite es el hilo del juego, y en otra GPU costó fotogramas, así que es para probar), un límite de tamaño para las texturas HD (4096, 2048, 1024 o 512 px; con mi pack, 1024 bajó las texturas de 440 a 277 MB), una cabecera nueva en el launcher y Discord Rich Presence confirmado en un Discord real.
 
 **Novedades de la 0.4.0:**
 - **Un launcher** (`Caravan4URecomp-Launcher.exe`): cambia todas las opciones del menú del juego y también las que solo valen al abrirlo (escala de resolución, texturas HD, hilo de render...), gestiona tus mods, enseña tus partidas y el registro del juego, y **se actualiza solo** bajando únicamente los archivos que cambian, sin tener que descargar el zip completo.
@@ -259,7 +290,7 @@ alrededor de ese runtime, un launcher y código propio para buena parte de lo qu
 
 **Estado:** probado en Windows 11 con una RTX 4070: el juego corre, he completado misiones y cacerías, funciona con teclado, ratón y mando (también un DualSense por Bluetooth), entré a una sala pública real de Azahar y jugué Local Play con otra persona. En la aldea con texturas HD a 6x va a unos 90–115 fps. **Sin probar todavía:** el sistema de actualización del launcher contra una release real (la 0.4.0 es la primera que lo trae), el launcher en otros PC y en Windows 10, el lector de mandos nuevo con mandos reales, 9x y 10x (siguen en negro), el FSR en GPU más flojas, otras GPU y MSVC. Algunos momentos aún se entrecortan un poco (el rugido de algunos monstruos y los límites de fps muy altos).
 
-**Cómo se usa:** la última versión es la 0.4.1, en la página de Releases (con su suma SHA-256). Descomprime todo en una carpeta y abre `Caravan4URecomp-Launcher.exe` (o `Caravan4URecomp.exe` directamente). La primera vez que pulses Jugar te pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con **F1** o **L3 + R3**. Online usa las mismas salas que Azahar: menú → Online → **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
+**Cómo se usa:** la última versión es la 0.5.0, en la página de Releases (con su suma SHA-256). Descomprime todo en una carpeta y abre `Caravan4URecomp-Launcher.exe` (o `Caravan4URecomp.exe` directamente). La primera vez que pulses Jugar te pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con **F1** o **L3 + R3**. Online usa las mismas salas que Azahar: menú → Online → **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
 
 Para compilarlo: `windows\build.ps1 [-Launcher]` y `windows\package.ps1 -Version 0.4.1` (CMake, Ninja, llvm-mingw y Python). Los créditos y la licencia
 están arriba; los términos adicionales de khorne-hub siguen aplicando.

@@ -484,13 +484,13 @@ TEST_CASE("platform: network sync is local only and the end-skip vote is always 
     CHECK(log == std::vector<std::string>{"net sync off", "net sync with every port console in the room",
                                           "net sync slack 350 ms"});
 
-    CHECK(p.EndSkipAgreed());  // before any vote: no room, no peers
+    CHECK_FALSE(p.EndSkipAgreed());  // before this console's vote: no
     p.VoteEndSkip(true);
     CHECK(p.EndSkipVote());
-    CHECK(p.EndSkipAgreed());
+    CHECK(p.EndSkipAgreed());  // no room, no peers: this console's say-so is everyone's
     p.VoteEndSkip(false);
     CHECK_FALSE(p.EndSkipVote());
-    CHECK(p.EndSkipAgreed());
+    CHECK_FALSE(p.EndSkipAgreed());
 }
 
 TEST_CASE("platform: Log goes to the runtime's log, with the Azahar build's category") {

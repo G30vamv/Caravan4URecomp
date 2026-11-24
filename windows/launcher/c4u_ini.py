@@ -14,14 +14,17 @@ from c4u_options import OPTIONS
 _GROUPS = (
     ("Game", ("game", "code", "user", "options")),
     ("Video", ("scale", "fullscreen", "width", "height", "display", "vsync",
-               "fps", "steady", "effects", "aspect", "mode", "touch_show",
-               "popup_size", "popup_corner", "fps_counter", "pace", "gpu_thread",
-               "hd_textures", "hd_texture_max", "upscaler", "fsr_quality")),
+               "fps", "steady", "effects", "aspect", "widescreen", "mode", "touch_show",
+               "popup_size", "popup_corner", "hide_help", "antialiasing", "bloom", "motion_blur", "depth_of_field",
+               "radial_blur", "haze", "dither", "fov", "fps_counter", "pace", "gpu_thread",
+               "hd_textures", "hd_texture_max")),
     ("Audio", ("volume",)),
-    ("Controls", ("skip_key", "skip_pad", "circle_pad_pro", "mouse_camera",
+    ("Controls", ("kick", "target", "skip_end", "skip_end_hold", "skip_key", "skip_pad", "map_key", "map_pad", "circle_pad_pro", "mouse_camera",
                   "hid_pads", "hidhide_ask")),
     ("Online", ("nick", "join_address", "host_port", "lobby", "online_touch")),
-    ("Mods", ("monster_hp",)),
+    ("Mods", ("monster_hp", "qol_hold_gather", "qol_flex_cancel", "qol_sharpen_cancel",
+              "qol_rewards_no_limit", "rewards_send_all", "invincible", "inf_items", "hud_scale", "hud_parts", "hud_scale_clock", "hud_scale_bars", "hud_scale_sharpness",
+              "hud_scale_party", "hud_scale_map", "hud_scale_target", "hud_scale_items")),
     ("Other", ("language", "discord_presence", "auto_backup", "trace_panels")),
 )
 _DEFAULTS = {option.key: option.default for option in OPTIONS}

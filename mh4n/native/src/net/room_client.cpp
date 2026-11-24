@@ -22,6 +22,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <list>
 #include <map>
@@ -42,6 +43,29 @@ namespace mh4n::rooms {
 namespace {
 
 constexpr const char* kLog = "Network";
+
+// Wall-clock time of day, to line the guest's and the host's logs up by hour.
+std::string NetClock() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+    return fmt::format("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
+}
+
+std::string PeerStats(const ENetPeer* peer) {
+    return fmt::format("rtt {} ms (var {}), lowest {} ms, loss {}%, lost {}/{} pkts, in flight {} B, state {}, "
+                       "timeout {}/{}/{} ms, mtu {}",
+                       peer->roundTripTime, peer->roundTripTimeVariance, peer->lowestRoundTripTime,
+                       peer->packetLoss * 100 / ENET_PEER_PACKET_LOSS_SCALE, peer->packetsLost, peer->packetsSent,
+                       peer->reliableDataInTransit, static_cast<int>(peer->state), peer->timeoutLimit,
+                       peer->timeoutMinimum, peer->timeoutMaximum, peer->mtu);
+}
 constexpr u32 kConnectionTimeoutMs = 5000;  // ConnectionTimeoutMs
 constexpr std::size_t kMaxEvents = 256;
 constexpr std::size_t kNumChannels = 1;     // NumChannels
@@ -362,7 +386,7 @@ void Client::Impl::Dispatch(const std::shared_ptr<Session>& s, const ENetPacket*
     if (ends) {
         SetState(State::Idle);
         ClearRoom();
-        MH4N_LOG(Info, kLog, "room {}:{}: {}", host, port, ErrorName(what));
+        MH4N_LOG(Info, kLog, "[{}] room {}:{}: {}", NetClock(), host, port, ErrorName(what));
     }
     Fail(what);
 }
@@ -372,7 +396,13 @@ void Client::Impl::Loop(const std::shared_ptr<Session>& s, ENetHost* host, ENetP
         std::lock_guard lock(mutex);
         return Current(*s) && state != State::Idle;
     };
+    auto last_stats = std::chrono::steady_clock::now();
     while (!s->stop.load() && connected()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_stats >= std::chrono::seconds(10)) {
+            last_stats = now;
+            MH4N_LOG(Info, kLog, "[{}] net stats {}:{}: {}", NetClock(), this->host, port, PeerStats(peer));
+        }
         ENetEvent event;
         const int got = enet_host_service(host, &event, 5);
         if (got > 0) {
@@ -387,7 +417,8 @@ void Client::Impl::Loop(const std::shared_ptr<Session>& s, ENetHost* host, ENetP
                     SetState(State::Idle);
                     ClearRoom();
                     Fail(Error::LostConnection);
-                    MH4N_LOG(Info, kLog, "room {}:{}: the connection was lost", this->host, port);
+                    MH4N_LOG(Info, kLog, "[{}] room {}:{}: the connection was lost (enet data {}); {}", NetClock(),
+                             this->host, port, event.data, PeerStats(peer));
                 }
                 return;  // the peer is gone: nothing to say goodbye to
             }
@@ -411,6 +442,8 @@ void Client::Impl::Loop(const std::shared_ptr<Session>& s, ENetHost* host, ENetP
             enet_host_flush(host);
         }
     }
+    MH4N_LOG(Info, kLog, "[{}] room {}:{}: leaving on our side (stop {}); {}", NetClock(), this->host, port,
+             s->stop.load(), PeerStats(peer));
     // Flush what was queued last (a chat line sent just before leaving), then say goodbye.
     std::list<Packet> packets;
     {

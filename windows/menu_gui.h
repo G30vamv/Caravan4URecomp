@@ -76,6 +76,13 @@ struct HudBar {
 };
 struct HudView {
     std::vector<HudBar> bars; // the monster being fought, or none (nothing is drawn)
+    // the hold of the buttons that end the wait after a quest (the ini's skip_end): how much is done, 0..1 (0: not held), the
+    // player has asked (the hold is done; the others may not have), and the words
+    float end_wait = 0.0f;
+    bool end_asked = false;
+    std::string end_text;
+    // the world map is open: the words drawn over the touch button below it (Solo / multiplayer) that say how to press it ("" = none)
+    std::string map_hint;
 };
 
 // The first start's screen: choosing the two files of the game, then the progress of building the code library for this PC.

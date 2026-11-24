@@ -5,13 +5,16 @@
 // GameSeconds is Timing::GetGlobalTicks() over BASE_CLOCK_RATE_ARM11 (core_timing.cpp: the ticks the
 // emulated CPU has run, so it stops with the emulation), which here is the game clock's reading over
 // the same rate; IsRunning is System::IsPoweredOn().
+#include "mh4n/rooms.h"
 #include "platform/platform_native.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 #include "../common/utf8.h"
@@ -199,11 +202,37 @@ NativePlatform::NativePlatform(Runtime& runtime, std::string user_dir,
             MH4N_LOG(Warning, kLog, "{}", warning);
         }
     }
-    std::lock_guard lock(g_registry_mutex);
-    Registry()[&runtime_] = this;
+    {
+        std::lock_guard lock(g_registry_mutex);
+        Registry()[&runtime_] = this;
+    }
+    wifi_listener_ = rooms::Default().AddWifiListener([this](const rooms::WifiPacket& packet) {
+        // "ESKP", version 1, flags (1: asks to end the wait)
+        if (static_cast<std::uint8_t>(packet.type) != 0x4d || packet.data.size() < 9 ||
+            std::memcmp(packet.data.data(), "ESKP", 4) != 0 || packet.data[4] != 1) {
+            return;
+        }
+        std::lock_guard lock(mutex_);
+        Peer& peer = peers_[packet.transmitter];
+        peer.heard = std::chrono::steady_clock::now();
+        peer.vote = (packet.data[8] & 1) != 0;
+    });
+    presence_ = std::thread([this] {
+        while (!stop_presence_.load()) {
+            SendEndSkipPresence();
+            for (int i = 0; i < 5 && !stop_presence_.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+    });
 }
 
 NativePlatform::~NativePlatform() {
+    stop_presence_.store(true);
+    if (presence_.joinable()) {
+        presence_.join();
+    }
+    rooms::Default().RemoveWifiListener(wifi_listener_);
     {
         std::lock_guard lock(g_registry_mutex);
         auto& registry = Registry();
@@ -312,14 +341,43 @@ void NativePlatform::InstallNetSync(Port::NetSyncMode mode, double slack_ms, std
     }
 }
 
+void NativePlatform::SendEndSkipPresence() {
+    bool vote;
+    {
+        std::lock_guard lock(mutex_);
+        vote = end_skip_vote_ || std::chrono::steady_clock::now() < vote_linger_;
+    }
+    rooms::WifiPacket packet;
+    packet.type = static_cast<rooms::WifiPacket::Type>(0x4d);
+    packet.destination = rooms::kBroadcastMac;
+    packet.data = {'E', 'S', 'K', 'P', 1, 0, 0, 0, static_cast<std::uint8_t>(vote ? 1 : 0)};
+    rooms::Default().SendWifi(std::move(packet));  // (false out of a room: nothing to tell)
+}
+
 void NativePlatform::VoteEndSkip(bool vote) {
-    std::lock_guard lock(mutex_);
-    end_skip_vote_ = vote;
+    {
+        std::lock_guard lock(mutex_);
+        if (end_skip_vote_ && !vote) {  // (the wait ends the moment the last console asks: the others must still hear)
+            vote_linger_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        }
+        end_skip_vote_ = vote;
+    }
+    SendEndSkipPresence();  // (at once: the presence thread only tells it a few times a second)
 }
 
 bool NativePlatform::EndSkipAgreed() {
-    // No room, no peers: this console's say-so is everyone's (the hooks ask only after their own
-    // vote; with peers they would wait for the others).
+    // This console's say-so is everyone's when no other port console is heard; otherwise every one heard in the
+    // last 3 s (a console that is gone is not waited for) must ask too.
+    std::lock_guard lock(mutex_);
+    if (!end_skip_vote_) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& [mac, peer] : peers_) {
+        if (now - peer.heard < std::chrono::seconds(3) && !peer.vote) {
+            return false;
+        }
+    }
     return true;
 }
 

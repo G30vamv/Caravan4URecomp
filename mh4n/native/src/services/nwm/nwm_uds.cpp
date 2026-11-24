@@ -80,6 +80,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <list>
@@ -114,6 +116,20 @@ using nwm::NodeInfo;
 namespace {
 
 constexpr const char* kLog = "Service.NWM";
+
+// Wall-clock time of day, to line the guest's and the host's logs up by hour.
+std::string UdsClock() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+    return fmt::format("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
+}
 
 // Azahar's ErrorModule::UDS and the ErrorDescription / ErrorSummary / ErrorLevel values the commands use
 // (src/core/hle/result.h).
@@ -486,7 +502,7 @@ void HandleEapolPacket(const std::shared_ptr<UdsState>& state, const rooms::Wifi
                 return;
             }
             node.network_node_id = node_id;
-            MH4N_LOG(Info, kLog, "handshake: EAPoL-Start accepted, node {} given", node_id);
+            MH4N_LOG(Info, kLog, "[{}] handshake: EAPoL-Start accepted, node {} given", UdsClock(), node_id);
             s.connection_status.node_bitmask |= static_cast<u16>(1 << (node_id - 1));
             s.connection_status.changed_nodes |= static_cast<u16>(1 << (node_id - 1));
             s.connection_status.nodes[node_id - 1] = node.network_node_id;
@@ -1038,7 +1054,7 @@ private:
         auth_request.destination = s.network_info.HostMac();
         auth_request.type = rooms::WifiPacket::Type::Authentication;
         SendPacket(auth_request);
-        MH4N_LOG(Debug, kLog, "ConnectToNetwork");
+        MH4N_LOG(Info, kLog, "[{}] ConnectToNetwork: status {}", UdsClock(), s.connection_status.status);
 
         // Originally 300 ms, Azahar made it 5 s to accommodate high ping. The host's EAPoL-Logoff
         // completes the connection (FinishConnect); without it the sleep times out with the error.
@@ -1069,8 +1085,8 @@ private:
                 if (pending == nullptr || pending->Finished() || pending->Cancelled()) {
                     return;
                 }
-                MH4N_LOG(Error, kLog, "timed out when trying to connect to UDS server (status {})",
-                         locked->connection_status.status);
+                MH4N_LOG(Error, kLog, "[{}] timed out when trying to connect to UDS server (status {})",
+                         UdsClock(), locked->connection_status.status);
                 Reply reply(pending->CommandId(), 1, 0);
                 reply.Push(kErrConnectTimeout);
                 pending->Deliver(std::move(reply));
@@ -1177,7 +1193,7 @@ private:
             MH4N_LOG(Error, kLog, "BeginHostingNetwork network structure of {} bytes, not {}",
                      bytes.size(), sizeof(NetworkInfo));
         }
-        MH4N_LOG(Debug, kLog, "BeginHostingNetwork");
+        MH4N_LOG(Info, kLog, "[{}] BeginHostingNetwork", UdsClock());
         const Result result = DoBeginHosting(bytes);
         request.MakeReply(1, 0).Push(result);
     }
@@ -1188,7 +1204,7 @@ private:
         const auto network = request.PopRaw<std::array<u8, 0x3C>>();
         request.Pop<u32>();  // passphrase size
         request.PopStaticBuffer();
-        MH4N_LOG(Debug, kLog, "BeginHostingNetwork (deprecated)");
+        MH4N_LOG(Info, kLog, "[{}] BeginHostingNetwork (deprecated)", UdsClock());
         const Result result = DoBeginHosting(std::vector<u8>(network.begin(), network.end()));
         request.MakeReply(1, 0).Push(result);
     }
@@ -1219,13 +1235,13 @@ private:
         }
         s.channel_data.clear();
         request.MakeReply(1, 0).Push(kResultSuccess);
-        MH4N_LOG(Debug, kLog, "DestroyNetwork");
+        MH4N_LOG(Info, kLog, "[{}] DestroyNetwork: the hosted network is gone", UdsClock());
     }
 
     // Outputs: 1: result
     void DisconnectNetwork(Request& request) {
         UdsState& s = S();
-        MH4N_LOG(Debug, kLog, "disconnecting from network");
+        MH4N_LOG(Info, kLog, "[{}] DisconnectNetwork: status {}, node {}", UdsClock(), S().connection_status.status, S().connection_status.network_node_id);
         if (Is(s, NetworkStatus::ConnectedAsHost)) {
             // A real 3DS makes strange things here. We do the same.
             const u16 node_id = s.connection_status.network_node_id;
@@ -1260,7 +1276,7 @@ private:
     // Inputs:  1: node id
     void EjectClient(Request& request) {
         const u16 network_node_id = request.Pop<u16>();
-        MH4N_LOG(Warning, kLog, "(stubbed) EjectClient called");
+        MH4N_LOG(Warning, kLog, "[{}] (stubbed) EjectClient called for node {}", UdsClock(), network_node_id);
         UdsState& s = S();
         Result result = kResultSuccess;
         if (network_node_id == 1) {
@@ -1769,8 +1785,8 @@ void StartNwm(Runtime& rt) {
                 }
             }
             for (const MacAddress& mac : gone) {
-                MH4N_LOG(Info, kLog, "handshake: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} left the room: dropping its node",
-                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                MH4N_LOG(Info, kLog, "[{}] handshake: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} left the room: dropping its node",
+                         UdsClock(), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
                 rooms::WifiPacket deauth;
                 deauth.transmitter = mac;
                 deauth.type = rooms::WifiPacket::Type::Deauthentication;

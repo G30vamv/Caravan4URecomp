@@ -24,10 +24,14 @@
 // mutex all the same, since the renderer reads it from its own thread.
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
+#include <thread>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -128,6 +132,21 @@ private:
     std::uint64_t layout_refreshes_ = 0;
     double refresh_hz_ = 0.0;
     bool end_skip_vote_ = false;
+    std::chrono::steady_clock::time_point vote_linger_{};  // a withdrawn vote is still told until then
+
+    // The vote to end the wait after a quest, shared with the other port consoles of the room: each tells the room,
+    // several times a second and in a frame no 3DS uses (type 0x4d, magic "ESKP"), that it is a port console and
+    // whether its player asks. The wait ends when this console and every port console heard in the last
+    // few seconds ask; consoles that are not this port cannot vote and are not counted.
+    struct Peer {
+        std::chrono::steady_clock::time_point heard{};
+        bool vote = false;
+    };
+    void SendEndSkipPresence();
+    std::map<std::array<std::uint8_t, 6>, Peer> peers_;
+    std::uint64_t wifi_listener_ = 0;
+    std::atomic<bool> stop_presence_{false};
+    std::thread presence_;
 };
 
 // The `started` step, in three parts (the tests call them one by one):

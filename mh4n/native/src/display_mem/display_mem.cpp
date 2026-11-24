@@ -389,6 +389,23 @@ void DisplayMemGpu::PublishVBlank(u32 screen, const FrameInfo* frame_info) {
             // Pacing of the vblanks themselves: how even the game's own beat is (the log shows it every 600)
             static double sum = 0, worst = 0;
             static u32 n = 0, over_1_5x = 0, over_2x = 0, over_12 = 0;
+            static double gpu_sum = 0, gpu_worst = 0;  // the device's time a frame (timestamps), when the backend has them
+            static u32 gpu_n = 0;
+            // (read only in a diagnostic run, C4U_GPU_TIME=1 in the environment: the normal program does not ask the device for it)
+#ifdef C4U_GPU_TIME_LOG  // (a test build, not -Release: always read)
+            static const bool gpu_time_log = true;
+#else
+            static const bool gpu_time_log = std::getenv("C4U_GPU_TIME") != nullptr;
+#endif
+            if (!gpu_time_log) {
+            } else if (auto* debug = dynamic_cast<gpu::GpuDebug*>(&Inner())) {
+                if (const auto ns = debug->TakeFrameGpuTimeNs()) {
+                    const double ms = static_cast<double>(*ns) / 1e6;
+                    gpu_sum += ms;
+                    gpu_worst = std::max(gpu_worst, ms);
+                    ++gpu_n;
+                }
+            }
             static double prev = 0;
             sum += gap;
             worst = std::max(worst, gap);
@@ -401,6 +418,12 @@ void DisplayMemGpu::PublishVBlank(u32 screen, const FrameInfo* frame_info) {
                 const double avg = sum / n;
                 MH4N_LOG(Info, kLog, "vblank pacing: avg {:.2f} ms ({:.0f}/s), worst {:.1f} ms; {} jumps >1.5x the previous, {} >2x, {} over 12 ms (of 600)",
                          avg, 1000.0 / avg, worst, over_1_5x, over_2x, over_12);
+                if (gpu_time_log) {
+                    MH4N_LOG(Info, kLog, "GPU time a frame: avg {:.2f} ms, worst {:.2f} ms (of {} frames measured)",
+                             gpu_n ? gpu_sum / gpu_n : 0.0, gpu_worst, gpu_n);
+                }
+                gpu_sum = gpu_worst = 0;
+                gpu_n = 0;
                 sum = worst = 0;
                 n = over_1_5x = over_2x = over_12 = 0;
             }

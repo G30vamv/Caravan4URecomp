@@ -21,6 +21,7 @@
 #include "game_addr.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -161,6 +162,27 @@ struct Swap {
 } swap;
 
 bool was_on = false;
+std::atomic<bool> hide_help{false};
+std::atomic<bool> map_tap_ok{false};  // MapTapAvailable()
+std::atomic<bool> map_open{false};    // MapOpen()
+/// A layout name's hash: the CRC-32 of the name without its final inversion (as hooks.cpp's LayoutNameHash).
+constexpr u32 NameHash(const char* name) {
+    u32 crc = 0xFFFFFFFF;
+    for (; *name; ++name) {
+        crc ^= static_cast<u8>(*name);
+        for (int b = 0; b < 8; ++b) crc = crc & 1 ? (crc >> 1) ^ 0xEDB88320 : crc >> 1;
+    }
+    return crc;
+}
+constexpr u32 HELP_GROUPS[2] = {NameHash("ui006_help00"), NameHash("ui006_help01")};
+int no_room_logged = 0;
+int rooms_made = 0;
+constexpr u32 MOVED_CACHE = 16;
+u32 moved_cache[MOVED_CACHE] = {};
+u32 moved_cache_end[MOVED_CACHE] = {};  // the room's end each copy was made in: copies are only reused inside the same room
+constexpr u32 FN_MAKE_ROOM = 0x005deb68;  // the game's own: cDraw (r0) takes a new page-sized room for r1 bytes when the room is full
+u32 moved_next = 0;
+std::string pending_log;  // a line for the log, said by the next Frame
 u32 frames_on = 0;
 std::string last_screens;
 
@@ -315,6 +337,18 @@ void GiveAllBack(RCtx* ctx) {
 
 }  // namespace
 
+bool MapOpen() {
+    return map_open.load(std::memory_order_relaxed);
+}
+
+bool MapTapAvailable() {
+    return map_tap_ok.load(std::memory_order_relaxed);
+}
+
+void SetHideHelp(bool hide) {
+    hide_help.store(hide);
+}
+
 std::string Frame(RCtx* ctx, bool on) {
     if (!on) {
         if (was_on) {
@@ -330,7 +364,8 @@ std::string Frame(RCtx* ctx, bool on) {
     const u32 count = main ? rd32(ctx, main + ULAYOUT_GROUP_COUNT) : 0;
     moves.clear();
     if (list == 0 || count == 0 || count > 0x2000) return {};
-    std::string line;
+    std::string line = std::move(pending_log);
+    pending_log.clear();
     if (!was_on) {
         was_on = true;
         line = fmt::format("one screen: on ({} groups placed by {} rules)", Table::kBlockCount, std::size(Table::kScreens));
@@ -341,11 +376,17 @@ std::string Frame(RCtx* ctx, bool on) {
     std::vector<bool> shown(Table::kNameCount, false);
     std::vector<std::pair<u32, int>> placed;  // (group, block)
     placed.reserve(256);
+    std::vector<u32> shown_names;  // (the hash of every group shown, known to the table or not)
+    std::vector<u32> unknown_shown;  // (shown groups the table does not know: logged on the fallback screen, to tell a menu apart)
     for (u32 i = 0; i < count; ++i) {
         const u32 group = rd32(ctx, list + 4 * i);
         if (group == 0) continue;
         const int n = NameIndex(rd32(ctx, group));
-        if (n < 0) continue;
+        if (rd32(ctx, group + GROUP_FLAGS) & GROUP_SHOWN) shown_names.push_back(rd32(ctx, group));
+        if (n < 0) {
+            if (rd32(ctx, group + GROUP_FLAGS) & GROUP_SHOWN) unknown_shown.push_back(rd32(ctx, group));
+            continue;
+        }
         if (rd32(ctx, group + GROUP_FLAGS) & GROUP_SHOWN) shown[n] = true;
         if (Table::kNames[n].block != 0xFFFF) placed.emplace_back(group, Table::kNames[n].block);
     }
@@ -359,6 +400,11 @@ std::string Frame(RCtx* ctx, bool on) {
         shown[n] = mode == 1 || mode == 5;
     }
 
+    // the village menu (Bag, Combine, Recipes...): its four groups, which the table does not know (seen in the log of 2026-11-24)
+    auto shown_unknown = [&](u32 hash) { return std::find(shown_names.begin(), shown_names.end(), hash) != shown_names.end(); };
+    const bool village_menu = shown_unknown(0x688A1837u) && shown_unknown(0x285C518Du) && shown_unknown(0x5FDCF4A2u) &&
+                              shown_unknown(0x44C3F6EBu);
+
     // the screen in force on each channel: the first whose rule holds
     int chosen[kChannels] = {-1, -1, -1};
     for (int s = 0; s < static_cast<int>(std::size(Table::kScreens)); ++s) {
@@ -370,6 +416,26 @@ std::string Frame(RCtx* ctx, bool on) {
             chosen[sc.channel] = s;
         }
     }
+    // the village's plain screen (no touch menu in force, so the right strip rules) with the touch screen's four groups, out of a quest:
+    // the map icon is there to tap (the log of 2026-11-24: a tap at 286, 165 opens the world map)
+    const bool on_right_strip = chosen[2] == static_cast<int>(std::size(Table::kScreens)) - 2;
+    const int quest_name = NameIndex(PSEUDO_QUEST);
+    // (open: the world map screen holds and the map itself is shown: the search settings of the same screen are not the map)
+    map_open.store(chosen[2] == static_cast<int>(std::size(Table::kScreens)) - 16 && shown_unknown(0x0A4A3626u), std::memory_order_relaxed);
+    map_tap_ok.store(on_right_strip && village_menu && !(quest_name >= 0 && shown[quest_name]), std::memory_order_relaxed);
+    // the world map open: every 3 s of frames (6 times) the groups shown, as the buttons below the map appear after the screen changes
+    if (chosen[2] == static_cast<int>(std::size(Table::kScreens)) - 16) {
+        static int map_frames = 0, map_lines = 0;
+        if (++map_frames % 180 == 90 && map_lines < 6 && line.empty()) {
+            ++map_lines;
+            line = "one screen: world map shown:";
+            for (const auto& [group, block] : placed) {
+                if (rd32(ctx, group + GROUP_FLAGS) & GROUP_SHOWN) line += fmt::format(" {:08X}/{}", rd32(ctx, group), block);
+            }
+            line += " | other:";
+            for (const u32 name : unknown_shown) line += fmt::format(" {:08X}", name);
+        }
+    }
     // (the log says which screens are in force when they change: the first 200 times, so a menu that goes back and forth
     // can't fill it)
     const std::string screens = fmt::format("{} {} {}", chosen[0], chosen[1], chosen[2]);
@@ -378,6 +444,26 @@ std::string Frame(RCtx* ctx, bool on) {
         static int logged = 0;
         if (line.empty() && logged < 200) {
             line = "one screen: screens " + screens + (++logged == 200 ? " (no more of these)" : "");
+            if (chosen[2] == static_cast<int>(std::size(Table::kScreens)) - 16) {  // (the world map: which groups are shown, to place its buttons)
+                static int map_logged = 0;
+                if (map_logged < 6) {
+                    ++map_logged;
+                    line += " | shown:";
+                    for (const auto& [group, block] : placed) {
+                        if (rd32(ctx, group + GROUP_FLAGS) & GROUP_SHOWN) line += fmt::format(" {:08X}/{}", rd32(ctx, group), block);
+                    }
+                    line += " | other:";
+                    for (const u32 name : unknown_shown) line += fmt::format(" {:08X}", name);
+                }
+            }
+            if (chosen[2] == static_cast<int>(std::size(Table::kScreens)) - 2) {
+                static int groups_logged = 0;
+                if (groups_logged < 40) {
+                    ++groups_logged;
+                    line += " | other groups shown:";
+                    for (const u32 name : unknown_shown) line += fmt::format(" {:08X}", name);
+                }
+            }
         }
     }
 
@@ -392,6 +478,31 @@ std::string Frame(RCtx* ctx, bool on) {
                                               [](const Table::Entry& e, int b) { return e.block < b; });
             if (it != last && it->block == block) {
                 place = it->place.flags & F_COMPOSE ? Compose(it->place, place) : it->place;
+            }
+        }
+        // The description panel (ui006_help) of the village menu and of the world map is drawn at half its size, its bottom edge in the
+        // middle kept where it was. A group's pixels go to centre + scale * (p - centre) + (tx, ty), the centre being the top screen's
+        // (200, 120), p the group's own (the panel's bottom middle is at 160, 189 on the touch screen's 320 x 240, and its left edge at
+        // 41.5: measured on the game, it fits the places seen). The village menu's goes to the left edge as well (5 px), so it does not
+        // cover the menu's last rows.
+        if (const u32 name = rd32(ctx, group); name == HELP_GROUPS[0] || name == HELP_GROUPS[1]) {
+            const bool world_map = chosen[2] == static_cast<int>(std::size(Table::kScreens)) - 16;
+            if ((village_menu && on_right_strip) || world_map) {
+                const float smaller = place.scale * 0.5f, d = place.scale - smaller;
+                for (float& x : place.tx) x += d * (160.0f - 200.0f);
+                place.ty += d * (189.0f - 120.0f);
+                place.scale = smaller;
+                if (world_map) {
+                    place.ty += 16.0f;  // (below the bar of buttons, which sits right under the map)
+                } else {
+                    for (float& x : place.tx) x = 5.0f - (200.0f + smaller * (41.5f - 200.0f));
+                }
+            }
+        }
+        if (hide_help.load(std::memory_order_relaxed)) {
+            const u32 name = rd32(ctx, group);
+            if (name == HELP_GROUPS[0] || name == HELP_GROUPS[1]) {
+                place.flags = static_cast<u8>((place.flags & ~(F_TOP | F_BOTTOM)) | F_HIDDEN);
             }
         }
         Note& note = notes[group];
@@ -457,11 +568,16 @@ std::string Frame(RCtx* ctx, bool on) {
     return line;
 }
 
-void ObjectConstants(RCtx* ctx, u32 object, u32 draw, u32 constants, u32 screen) {
+void ObjectConstants(RCtx* ctx, u32 object, u32 draw, u32 constants, u32 screen, const float* hud) {
     (void)constants;
     const u32 block = rd32(ctx, draw + CDRAW_VIEWPORT);
-    const auto it = screen == 0 ? moves.find(object) : moves.end();
-    if (it == moves.end()) {
+    auto it = screen == 0 ? moves.find(object) : moves.end();
+    Move hud_move{1.0f, 0.0f, 0.0f};
+    if (it == moves.end() && hud != nullptr && screen == 0) {
+        hud_move = Move{hud[0], hud[1], hud[2]};
+    }
+    const bool own_hud = it == moves.end() && hud != nullptr && screen == 0;
+    if (it == moves.end() && !own_hud) {
         if (swap.ours != 0 && swap.draw == draw && block == swap.ours) {  // the pass's own constants again
             wr32(ctx, draw + CDRAW_VIEWPORT, swap.game);
             wr32(ctx, draw + CDRAW_DIRTY, rd32(ctx, draw + CDRAW_DIRTY) | 1);
@@ -473,26 +589,69 @@ void ObjectConstants(RCtx* ctx, u32 object, u32 draw, u32 constants, u32 screen)
     const u32 layout = shader ? rd32(ctx, shader + SHADER_VIEWPORT_LAYOUT) : 0;
     const u32 size = layout ? ((rd32(ctx, layout + 0x14) & 0xFFFF) * 4 + 15) & ~15u : 0;
     const u32 at = rd32(ctx, draw + CDRAW_ROOM);
-    if (game == 0 || size < (PROJ + 16) * 4 || size > 0x400 || at + size > rd32(ctx, draw + CDRAW_ROOM_END)) {
-        return;  // (no room: drawn where the game puts it this frame)
+    if (game == 0 || size < (PROJ + 16) * 4 || size > 0x400) {
+        return;
     }
-    wr32(ctx, draw + CDRAW_ROOM, at + size);
-    for (u32 i = 0; i < size; i += 4) wr32(ctx, at + i, rd32(ctx, game + i));
     // pixels p of the top screen go to scale * (p - centre) + centre + (tx, ty): the projection's two rows scaled,
     // then moved (its x row is the screen's height, up; its y row the screen's width, to the left)
-    const Move& m = it->second;
-    const float m00 = F(ctx, game + 4 * (PROJ + 0)), m11 = F(ctx, game + 4 * (PROJ + 5));
+    const Move& m = own_hud ? hud_move : it->second;
+    u32 words[0x100];
+    const u32 count = size / 4;
+    for (u32 i = 0; i < count; ++i) words[i] = rd32(ctx, game + 4 * i);
+    auto fl = [&](u32 i) { float f; std::memcpy(&f, &words[i], 4); return f; };
+    auto setf = [&](u32 i, float f) { std::memcpy(&words[i], &f, 4); };
+    const float m00 = fl(PROJ + 0), m11 = fl(PROJ + 5);
     for (u32 column = 0; column < 4; ++column) {
         for (u32 row = 0; row < 2; ++row) {
-            const u32 a = at + 4 * (PROJ + 4 * column + row);
-            WF(ctx, a, F(ctx, a) * m.scale);
+            const u32 i = PROJ + 4 * column + row;
+            setf(i, fl(i) * m.scale);
         }
     }
-    WF(ctx, at + 4 * (PROJ + 12), F(ctx, at + 4 * (PROJ + 12)) - m.ty * m00);
-    WF(ctx, at + 4 * (PROJ + 13), F(ctx, at + 4 * (PROJ + 13)) - m.tx * m11);
-    wr32(ctx, draw + CDRAW_VIEWPORT, at);
+    setf(PROJ + 12, fl(PROJ + 12) - m.ty * m00);
+    setf(PROJ + 13, fl(PROJ + 13) - m.tx * m11);
+    // the same moved block serves every object of the pass that moves alike (the room is small: a copy per object ran out
+    // and the rest were drawn unmoved for a frame): a copy already in the room, still holding exactly these words
+    u32 where = 0;
+    for (u32 c = 0; c < MOVED_CACHE && where == 0; ++c) {
+        const u32 old = moved_cache[(moved_next + c) % MOVED_CACHE];
+        if (old == 0 || old >= rd32(ctx, draw + CDRAW_ROOM) ||
+            moved_cache_end[(moved_next + c) % MOVED_CACHE] != rd32(ctx, draw + CDRAW_ROOM_END)) continue;
+        bool same = true;
+        for (u32 i = 0; i < count && same; ++i) same = rd32(ctx, old + 4 * i) == words[i];
+        if (same) where = old;
+    }
+    if (where == 0) {
+        u32 room = at;
+        if (room + size > rd32(ctx, draw + CDRAW_ROOM_END)) {
+            // the room is full (the game sizes it for what it draws): ask the game for a new one, as its own code does
+            // (0x00ae65a4 calls this same function when its object constants do not fit)
+            CallGame(ctx, FN_MAKE_ROOM, draw, size);
+            room = rd32(ctx, draw + CDRAW_ROOM);
+            if (room == 0 || room + size > rd32(ctx, draw + CDRAW_ROOM_END)) {
+                if (no_room_logged < 20) {  // (the layout of a busy menu going back and forth is this: it shows in the log)
+                    ++no_room_logged;
+                    pending_log = fmt::format("one screen: no room for a moved object's constants (block {:08X}, size {:#x}, room {:08X} of {:08X})",
+                                              game, size, room, rd32(ctx, draw + CDRAW_ROOM_END));
+                }
+                return;  // (no room: drawn where the game puts it this frame)
+            }
+            if (rooms_made < 5) {
+                ++rooms_made;
+                pending_log = fmt::format("one screen: the room for object constants was full: a new one taken from the game ({:08X} of {:08X})",
+                                          room, rd32(ctx, draw + CDRAW_ROOM_END));
+            }
+        }
+        wr32(ctx, draw + CDRAW_ROOM, room + size);
+        for (u32 i = 0; i < count; ++i) wr32(ctx, room + 4 * i, words[i]);
+        where = room;
+        moved_cache[moved_next] = room;
+        moved_cache_end[moved_next] = rd32(ctx, draw + CDRAW_ROOM_END);
+        moved_next = (moved_next + 1) % MOVED_CACHE;
+    }
+    wr32(ctx, draw + CDRAW_VIEWPORT, where);
     wr32(ctx, draw + CDRAW_DIRTY, rd32(ctx, draw + CDRAW_DIRTY) | 1);
-    swap = Swap{draw, game, at};
+    const u32 at_used = where;
+    swap = Swap{draw, game, at_used};
 }
 
 }  // namespace Port::OneScreen

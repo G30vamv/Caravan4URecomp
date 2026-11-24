@@ -482,42 +482,93 @@ private:
             trails[bar.id] = trail;
         }
         trails_ = std::move(trails);
-        if (view.bars.empty()) return;
+        if (view.bars.empty() && view.end_wait <= 0.0f && !view.end_asked && view.map_hint.empty()) return;
         const float u = std::max(0.7f, sh / 720.0f);
         Painter p;
         p.dl = ImGui::GetForegroundDrawList();
         p.font = font_;
         p.text = text_;
-        const float pw = 340.0f * u, row_h = 64.0f * u;
+        const float bu = u * 0.6f;  // the monster's life plate is drawn at 60% of its first size
+        const float pw = 340.0f * bu, row_h = 64.0f * bu;
         float y = 16.0f * u;
         for (const HudBar& bar : view.bars) {
             const float frac = std::clamp(static_cast<float>(bar.hp) / static_cast<float>(std::max(1, bar.max)), 0.0f, 1.0f);
             const float trail = trails_[bar.id];
             const Rect plate = {sw - 16.0f * u - pw, y, sw - 16.0f * u, y + row_h};
             p.GradV(plate, C(kPanelTop, 0.88f), C(kPanelBottom, 0.9f));
-            p.Frame(plate, 6.0f * u, C(kGold, 0.9f), 1.6f * u);
-            p.Frame(Shrink(plate, 4 * u, 4 * u), 4.0f * u, C(kBlueDeep, 0.8f), 1.0f);
-            const float cy = plate.y0 + 19.0f * u;
-            p.Write(font_, 19.0f * u, plate.x0 + 16 * u, cy, Align::Left, bar.dead ? C(kCream, 0.5f) : C(kCream), bar.name.c_str());
+            p.Frame(plate, 6.0f * bu, C(kGold, 0.9f), 1.6f * bu);
+            p.Frame(Shrink(plate, 4 * bu, 4 * bu), 4.0f * bu, C(kBlueDeep, 0.8f), 1.0f);
+            const float cy = plate.y0 + 19.0f * bu;
+            p.Write(font_, 19.0f * bu, plate.x0 + 16 * bu, cy, Align::Left, bar.dead ? C(kCream, 0.5f) : C(kCream), bar.name.c_str());
             char life[48];
             std::snprintf(life, sizeof life, "%d / %d", bar.hp, bar.max);
-            p.Write(font_, 18.0f * u, plate.x1 - 16 * u, cy, Align::Right, C(kGold), life);
-            const Rect well = {plate.x0 + 14 * u, plate.y0 + 36.0f * u, plate.x1 - 14 * u, plate.y0 + 54.0f * u};
-            p.Fill(well, 4.0f * u, C(kWell));
-            const auto part = [&](float f) { return Shrink({well.x0, well.y0, well.x0 + well.W() * f, well.y1}, 1.5f * u, 1.5f * u); };
-            if (trail > frac) p.Fill(part(trail), 3.0f * u, C(kCream));
+            p.Write(font_, 18.0f * bu, plate.x1 - 16 * bu, cy, Align::Right, C(kGold), life);
+            const Rect well = {plate.x0 + 14 * bu, plate.y0 + 36.0f * bu, plate.x1 - 14 * bu, plate.y0 + 54.0f * bu};
+            p.Fill(well, 4.0f * bu, C(kWell));
+            const auto part = [&](float f) { return Shrink({well.x0, well.y0, well.x0 + well.W() * f, well.y1}, 1.5f * bu, 1.5f * bu); };
+            if (trail > frac) p.Fill(part(trail), 3.0f * bu, C(kCream));
             if (frac > 0.0f) {
                 const Rect fill = part(frac);
                 const std::uint32_t colour = frac > 0.5f ? 0x7FE08A : frac > 0.25f ? kGold : 0xFF7B6B;
-                p.Fill(fill, 3.0f * u, C(colour));
-                p.Fill({fill.x0, fill.y0, fill.x1, fill.y0 + fill.H() * 0.42f}, 3.0f * u, IM_COL32(255, 255, 255, 46));
+                p.Fill(fill, 3.0f * bu, C(colour));
+                p.Fill({fill.x0, fill.y0, fill.x1, fill.y0 + fill.H() * 0.42f}, 3.0f * bu, IM_COL32(255, 255, 255, 46));
             }
             for (const float tick : {0.25f, 0.5f, 0.75f}) {
                 const float x = well.x0 + well.W() * tick;
-                p.dl->AddLine(ImVec2(x, well.y0 + 3 * u), ImVec2(x, well.y1 - 3 * u), IM_COL32(0, 0, 0, 110), 1.0f);
+                p.dl->AddLine(ImVec2(x, well.y0 + 3 * bu), ImVec2(x, well.y1 - 3 * bu), IM_COL32(0, 0, 0, 110), 1.0f);
+            }
+            p.Frame(well, 4.0f * bu, C(kGoldDim), 1.0f);
+            y += row_h + 8.0f * bu;
+        }
+        if (!view.map_hint.empty()) {  // over the world map's Solo / multiplayer button (the bar below the map: its middle is at 200, 220.7 of the 400 x 240 top screen)
+            const float unit = sh / 240.0f;
+            // two lines ("Open with" / "Y or N"), the plate as wide as the longer one, at the button's right end so its words still read
+            const std::size_t cut = view.map_hint.find('\n');
+            const std::string line1 = view.map_hint.substr(0, cut), line2 = cut == std::string::npos ? "" : view.map_hint.substr(cut + 1);
+            const float fs = 5.6f * unit;
+            // (a marker, character 1, in the second line stands for a triangle, drawn as a shape: the font has none)
+            const std::size_t mark = line2.find(char(1));
+            const std::string after = mark == std::string::npos ? "" : line2.substr(mark + 1);
+            const float tri = fs * 0.7f, gap = fs * 0.28f;
+            const auto width_of = [&](const std::string& t) { return font_->CalcTextSizeA(fs, FLT_MAX, 0.0f, t.c_str()).x; };
+            const float l2w = mark == std::string::npos ? width_of(line2) : tri + gap + width_of(after);
+            const float tw = std::max(width_of(line1), l2w);
+            const float w = tw + 5.0f * unit, h = (line2.empty() ? 9.0f : 15.5f) * unit;
+            const float cy = 173.8f * unit, x1 = sw / 2 + 54.5f * unit;
+            const Rect plate = {x1 - w, cy - h / 2, x1, cy + h / 2};
+            const float cx = (plate.x0 + plate.x1) / 2;
+            p.GradV(plate, C(kPanelTop, 0.92f), C(kPanelBottom, 0.94f));
+            p.Frame(plate, 2.5f * unit, C(kGold, 0.95f), 1.2f);
+            if (line2.empty()) {
+                p.Write(font_, fs, cx, cy, Align::Center, C(kCream), line1.c_str());
+            } else {
+                p.Write(font_, fs, cx, cy - 3.6f * unit, Align::Center, C(kCream), line1.c_str());
+                if (mark == std::string::npos) {
+                    p.Write(font_, fs, cx, cy + 3.6f * unit, Align::Center, C(kGold), line2.c_str());
+                } else {
+                    const float x0 = cx - l2w / 2, ty = cy + 3.6f * unit;
+                    p.dl->AddTriangle(ImVec2(x0 + tri / 2, ty - tri * 0.5f), ImVec2(x0, ty + tri * 0.42f), ImVec2(x0 + tri, ty + tri * 0.42f),
+                                      C(kGold), std::max(1.0f, fs * 0.14f));
+                    p.Write(font_, fs, x0 + tri + gap, ty, Align::Left, C(kGold), after.c_str());
+                }
+            }
+        }
+        if (view.end_wait > 0.0f || view.end_asked) {  // the hold that ends the wait after a quest: a bar in the top middle
+            const float frac = view.end_asked ? 1.0f : std::clamp(view.end_wait, 0.0f, 1.0f);
+            const float w = 380.0f * u, h = 58.0f * u;
+            const Rect plate = {(sw - w) / 2, 16.0f * u, (sw + w) / 2, 16.0f * u + h};
+            p.GradV(plate, C(kPanelTop, 0.88f), C(kPanelBottom, 0.9f));
+            p.Frame(plate, 6.0f * u, C(kGold, 0.9f), 1.6f * u);
+            p.Frame(Shrink(plate, 4 * u, 4 * u), 4.0f * u, C(kBlueDeep, 0.8f), 1.0f);
+            p.Write(font_, 18.0f * u, (plate.x0 + plate.x1) / 2, plate.y0 + 18.0f * u, Align::Center, C(kCream), view.end_text.c_str());
+            const Rect well = {plate.x0 + 14 * u, plate.y0 + 33.0f * u, plate.x1 - 14 * u, plate.y0 + 48.0f * u};
+            p.Fill(well, 4.0f * u, C(kWell));
+            if (frac > 0.0f) {
+                const Rect fill = Shrink({well.x0, well.y0, well.x0 + well.W() * frac, well.y1}, 1.5f * u, 1.5f * u);
+                p.Fill(fill, 3.0f * u, C(view.end_asked ? 0x7FE08A : kGold));
+                p.Fill({fill.x0, fill.y0, fill.x1, fill.y0 + fill.H() * 0.42f}, 3.0f * u, IM_COL32(255, 255, 255, 46));
             }
             p.Frame(well, 4.0f * u, C(kGoldDim), 1.0f);
-            y += row_h + 8.0f * u;
         }
     }
 
