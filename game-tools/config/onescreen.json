@@ -139,7 +139,7 @@
    ],
    "offset": [
     0,
-    9
+    40
    ],
    "nudge": {
     "ui419_l_fukidashi": [
@@ -318,7 +318,7 @@
    "priority": 56,
    "offset": [
     0,
-    -23
+    -10
    ],
    "hide": [
     "ui430_bg_002",
@@ -503,7 +503,8 @@
    "ui242": "bottom",
    "ui243": "bottom",
    "ui001": "top",
-   "ui108": "bottom"
+   "ui108": "bottom",
+   "ui002": "bottom"
   },
   "blocks": [
    {
@@ -1499,6 +1500,14 @@
      "scale": 0.7,
      "screen": "top"
     }
+   },
+   {
+    "id": "ui002.bar",
+    "layout": "ui002",
+    "groups": [
+     "ui002_down_bar00"
+    ],
+    "default": {}
    }
   ],
   "backdrops": {
@@ -1596,6 +1605,25 @@
       "scale": 0.4,
       "screen": "top",
       "hidden": false
+     }
+    },
+    "file": "town.json"
+   },
+   {
+    "id": "world_map_bar",
+    "number": "10b",
+    "when": {
+     "all": [
+      "ui430_l_worldmap"
+     ]
+    },
+    "blocks": {
+     "ui002.bar": {
+      "x": 104.0,
+      "y": 163.0,
+      "scale": 0.6,
+      "screen": "top",
+      "priority": 57
      }
     },
     "file": "town.json"
@@ -2826,7 +2854,7 @@
     "unless": [],
     "shift": [
      -104.75,
-     2
+     14
     ],
     "groups": {
      "ui006_button00": [
@@ -2879,7 +2907,7 @@
     "unless": [],
     "shift": [
      -182,
-     6
+     26
     ],
     "groups": {
      "ui006_button02": [

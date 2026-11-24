@@ -81,3 +81,13 @@ Files of the upstream project changed for the Windows port (each carries a notic
   mh4n/native/src/applets/CMakeLists.txt           extrapad.cpp is built
 New files: mh4n/native/src/applets/extrapad.h and extrapad.cpp (derived from the Mint applet, itself derived from
 Azahar), and everything under windows/.
+
+The single-screen arrangement and the comforts
+----------------------------------------------
+
+mh4n/config/onescreen.json holds the arrangement of the touch screen's menus on the top screen of Heavenfall Beta by popzol and
+BlitzWOLF (https://github.com/popzol/4u-heavenfall-mod-beta, GPL-3.0, commit 7eebb7a3363881eb73c583a8af3903cc6f221dd7), kept in its
+own words and units and without its gameplay changes; mh4n/port/src/onescreen.cpp and mh4n/tools/onescreen_table.py read it and
+measure the layouts of the player's own game. Some of the comforts (hold A to gather, cancelling the pose, the rewards) follow the
+ideas of the MH4U QOL mods of jM5557 (https://github.com/jM5557/MH4U-QOL-Cheats); the code is my own.
+AMD FidelityFX Super Resolution 1.0 (MIT, windows/licenses/LICENSE-FidelityFX-FSR.txt) is still in the source but no longer used.
