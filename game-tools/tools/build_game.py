@@ -203,7 +203,8 @@ def fetch_zig(toolchain_dir: str, index_url: str = ZIG_INDEX, system: str | None
 
 def fetched_compilers(toolchain_dir: str) -> list[str]:
     exe = ".exe" if sys.platform.startswith("win") else ""
-    return sorted(glob.glob(os.path.join(toolchain_dir, "*", "bin", MINGW_CLANG + exe)))
+    # (escaped: [ ] in the program's folder are not a pattern)
+    return sorted(glob.glob(os.path.join(glob.escape(toolchain_dir), "*", "bin", MINGW_CLANG + exe)))
 
 
 def fetch_compiler(toolchain_dir: str, source: str = LLVM_MINGW_URL, sha256: str | None = None) -> str:
@@ -247,7 +248,7 @@ def fetch_compiler(toolchain_dir: str, source: str = LLVM_MINGW_URL, sha256: str
     found = fetched_compilers(toolchain_dir)
     if not found:
         raise SystemExit(f"{archive} doesn't contain bin/{MINGW_CLANG}")
-    for path in glob.glob(os.path.join(os.path.dirname(found[0]), "*")):
+    for path in glob.glob(os.path.join(glob.escape(os.path.dirname(found[0])), "*")):
         os.chmod(path, os.stat(path).st_mode | 0o111)   # zip files don't keep the x bit
     return found[0]
 

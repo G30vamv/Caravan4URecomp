@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 G30vamv and the Caravan4URecomp contributors. Part of a MODIFIED version of 4u-native by khorne-hub.
-"""Write the monster names of the user's own game to <game folder>/monster_names.txt (read by the Windows shell to
-label the life bar). Nothing of the game is shipped: the names are read, on the user's machine, from the game's own
-message files (msg/emName_<lang> inside <lang>/data/core_common.arc of the RomFS).
+"""Write the monster and item names of the user's own game to <game folder>/monster_names.txt and item_names.txt (read by
+the Windows shell to label the life bar and the list of the give-items cheat). Nothing of the game is shipped: the names
+are read, on the user's machine, from the game's own message files (msg/emName_<lang> and msg/itemName_<lang> inside
+<lang>/data/core_common.arc of the RomFS).
 
     python3 tools/monster_names.py GAME_FOLDER [--out FILE]
 
 GAME_FOLDER is the prepared game folder (it has source.txt with base= and update= paths, or romfs.bin). The output has one
 line a name: `<lang><TAB><id><TAB><name>`, lang being eng, fre, ger, ita or spa; id is the row of the game's monster
-table (the em number: 1 Rathian, 2 Rathalos...).
+table (the em number: 1 Rathian, 2 Rathalos...). item_names.txt (beside FILE) is the same, id being the item's row of the
+game's item table (8 Potion...).
 """
 from __future__ import annotations
 
@@ -56,7 +58,7 @@ def parse_lmd(data: bytes) -> list[str]:
     # header words: [8] count, [0x14] hash count-ish; the 12-byte records start 12 bytes before the first record with a
     # valid offset, so scan for the longest run of valid records
     best = (0, None)
-    for start in range(0x20, min(len(data) - 12, 0x4000), 4):
+    for start in range(0x20, len(data) - 12, 4):
         n = 0
         o = start
         while n < count + 2 and o + 12 <= len(data):
@@ -68,6 +70,8 @@ def parse_lmd(data: bytes) -> list[str]:
             o += 12
         if n > best[0]:
             best = (n, start)
+        if best[0] >= count > 0:  # (the whole table: the items' starts far into the file)
+            break
     n, table = best
     if table is None or n < 8:
         raise ValueError("no string table found")
@@ -101,30 +105,41 @@ def main(argv: list[str]) -> int:
     if not images:
         print("no game source found in", game, file=sys.stderr)
         return 1
-    lines = []
+    monsters, items = [], []
     for lang in LANGS:
         arc = romfs_image.read_file(images, f"/{lang}/data/core_common.arc")
         if arc is None:
             continue
-        msg = read_msg(arc, f"{lang}\\msg\\emName_{lang}")
-        if msg is None:
-            continue
-        strings = parse_lmd(msg)
-        # the table starts with an empty record, then id 0 ("No enemy"), id 1...
-        names = strings[1:] if strings and strings[0] == "" else strings
-        for i, s in enumerate(names):
-            if s and "\t" not in s and "\n" not in s:
-                lines.append(f"{lang}\t{i}\t{s}")
-    if not lines:
+        monsters += names_of(arc, lang, "emName")
+        # (item 0 is "no item", and a row the game has no item for is named with dashes)
+        items += [line for line in names_of(arc, lang, "itemName")
+                  if line.split("\t")[1] != "0" and line.split("\t")[2].strip("-()\u2013\u2014 ")]
+    if not monsters:
         print("no monster names found", file=sys.stderr)
         return 1
-    tmp = out_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines) + "\n")
-    os.replace(tmp, out_path)
-    print(f"{out_path}: {len(lines)} names")
+    write_lines(out_path, monsters)
+    if items:
+        write_lines(os.path.join(os.path.dirname(os.path.abspath(out_path)), "item_names.txt"), items)
     return 0
 
+
+def names_of(arc: bytes, lang: str, table: str) -> list[str]:
+    """`<lang><TAB><id><TAB><name>` lines of the game's message file msg/<table>_<lang>."""
+    msg = read_msg(arc, f"{lang}\\msg\\{table}_{lang}")
+    if msg is None:
+        return []
+    strings = parse_lmd(msg)
+    # the table starts with an empty record, then id 0, id 1...
+    names = strings[1:] if strings and strings[0] == "" else strings
+    return [f"{lang}\t{i}\t{s}" for i, s in enumerate(names) if s and "\t" not in s and "\n" not in s]
+
+
+def write_lines(path: str, lines: list[str]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+    print(f"{path}: {len(lines)} names")
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
