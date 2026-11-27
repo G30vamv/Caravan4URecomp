@@ -28,9 +28,10 @@ derived from Azahar.
 
 - **Native on Windows, no emulator.** The game's code is recompiled for your PC and drawn with Vulkan, with an internal resolution from 1x to 8x and a frame rate limit of up to 360 fps.
 - **A launcher** with every option, a mod manager, your saves and their backups, and updates that download only the files that changed.
+- **Your saves, looked after:** automatic backups, a protection for a save cut short while the game writes it, and importing saves from another folder.
 - **Play on one screen.** The touch screen's menus can go to the top screen, 16:9 fills the window with no black bars, and the world map opens on the main screen with a key or a button.
 - **Keyboard, mouse and controllers.** The mouse is the stylus; DualSense and Xbox-style controllers work, and every button can be changed (the PlayStation touchpad click too). Skipping a cutscene has its own key and button.
-- **A better hunt.** A smaller hunting HUD (one size for all and one per part), the life bar of the monster, and optional comforts and cheats, all off by default.
+- **A better hunt.** A smaller hunting HUD (one size for all and one per part), the life bar of the monster, and optional comforts and cheats (including giving yourself items), all off by default.
 - **More graphics options:** antialiasing, bloom, motion blur, depth of field, radial blur, haze, dither and field of view.
 - **HD textures** from packs made for Azahar and Citra, with an optional size limit to save video memory.
 - **Online** in the same rooms as Azahar and 4u-native for Android.
@@ -51,26 +52,37 @@ I'd rather be upfront about what I have actually tested.
 - The in-game menu and the launcher: I checked each page, changed options and saw them applied.
 - Network rooms that speak the same protocol as Azahar's: I joined a real public room from the menu while the game was running, and I played Local Play in a Gathering Hall with another player.
 - Saves backups, mods listed, turned on and off and ordered from the launcher, and Discord Rich Presence on a real Discord.
+- Starting with no previous save: I created a hunter and a Palico, saved, reopened the game and loaded it. (Up to 0.5.0 the game closed at start in that case.)
+- A save cut short: I stopped the real game right after it emptied the save file, and the next start put the last finished save back.
+- Importing saves from a folder through the in-game menu, and the offer to use a save that is in the wrong place.
+- Infinite items in real hunts, and giving items to the item box and to the pouch.
 
 **Not tested yet:**
-- The **update button of the launcher** in its window. The update itself (checking, downloading, checking each file and applying) was tested against a real release, from 0.4.2 to 0.4.3, without the button and the automatic restart.
+- The **update button of the launcher** in its window. The update itself (checking, downloading, checking each file and applying) was tested against real releases, without the button and the automatic restart.
 - The vote to end the wait after a quest online: it needs two players with this version.
+- Importing saves exported by Azahar, Citra, JKSM or Checkpoint themselves, and the Windows folder dialog used to choose them (I tested the import with copies of my own save files).
+- A real power cut while saving (I tested it by stopping the program).
+- In a hunt: the damage meter, the damage multiplier, the latest changes to invincibility, the size and position of the monster's life bar, and ammunition given to yourself going straight to the gunner's pouch.
+- The launcher flickering when the game closes is fixed in the code, but I haven't checked it on screen.
 - The launcher on other PCs and on Windows 10, and with other languages than English and Spanish.
 - My own controller reader with real controllers (a DualSense and a GameSir work through the usual path), and the HidHide offer.
 - What the game's CPU thread costs in the village: the game runs at about 100 to 115 fps there whatever the resolution, and I plan to look into it.
 - The skip button in cutscenes other than the two above, and the mouse as the camera (**F3**, or `mouse_camera = on`).
 - Resolutions of 9x and 10x: the picture still comes out black there.
 - Other GPUs and drivers, building with MSVC (I build with clang from llvm-mingw), and Windows and Android crossplay.
-- A few moments still stutter a little (the roar of some monsters, and very high frame-rate limits); I'm looking into them.
-- Known: the launcher flickers when the game closes; I'll look into it.
+- A few moments still stutter a little (the roar of some monsters, and very high frame-rate limits); there is an optional, experimental setting for the stutters while shaders are prepared.
 
 ## Getting it
 
-The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.5.0**, tagged `windows-v0.5.0`. This port has its
+The releases are on the [Releases](https://github.com/G30vamv/Caravan4URecomp/releases) page; the latest is **0.6.0**, tagged `windows-v0.6.0`. This port has its
 own version numbers, following [semantic versioning](https://semver.org) (while the number starts with 0, anything can still
 change), and they are tagged `windows-vX.Y.Z` so they don't mix with the older tags in this repository (`v0.1.0` to `v1.0`),
 which are 4u-native's own. Each download has its SHA-256 next to it. The program is not code-signed, so Windows may show a
 SmartScreen warning: "More info", then "Run anyway". You can also build it yourself (see [Building](#building)).
+
+**Updating from 0.5.0:** close every copy of the game first. You can use the launcher's update, or unzip the new version over
+your folder: the download has no settings file, so yours is kept, and your `game` folder is not touched. You don't need to
+build the game's code library again.
 
 ## What you need
 
@@ -97,7 +109,7 @@ Everything is saved as soon as you change it.
   its explanation.
 - **Mods:** add a mod as a `.zip` or a folder, turn mods on and off, change their order and remove them. A mod that changes the
   game's files works; a mod that changes its code is installed turned off, because the game's library is built without it.
-- **Saves:** opens your saves, your guild cards and quests, and the automatic backups.
+- **Saves:** opens your saves, your guild cards and quests, and the automatic backups (importing saves is in the in-game menu).
 - **Updates:** it looks for a new version when it opens (you can turn that off in the gear menu) and, if you accept, downloads
   only the files that changed, checks each one against its SHA-256, replaces them and opens again. Your settings, your saves
   and your game folder are never touched, and the files it replaces are kept in a backup folder next to the program.
@@ -126,13 +138,12 @@ design comes from the menu of my MH3U port, with this game's colours, in the Cin
   <img src="images/menu-controls.png" alt="The in-game menu: Controls" width="48%">
 </p>
 
-- **Graphics:** fullscreen, VSync, screen layout, picture shape (the 3DS's own 5:3 with bars on a wide screen, stretched to fill the window, or a fixed ratio), internal resolution (auto, or 1x to 8x the 3DS's; needs a restart), FPS counter.
-- **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 120, 180, 240, 300, 360 or unlimited), steady
-  frame rate, particle effects.
+- **Graphics:** fullscreen, VSync, screen layout, widescreen, internal resolution (auto, or 1x to 8x the 3DS's; needs a restart), the game's own graphics effects, field of view, HD texture limit, FPS counter.
+- **Game:** frame rate limit (the game's own, your display's rate, 30, 60, 120, 180, 240, 300, 360 or unlimited) and particle effects.
 - **Audio:** volume.
 - **Controls:** the key and the controller's button that skip a cutscene, and every 3DS button with its key and its controller button. Press Enter on one, then the key or the controller's button or trigger you want (Backspace puts it back). The sticks and F1, F2, F3 and F11 stay as they are.
-- **Saves:** backups of your saves. One is made by hand, or automatically each time the game starts if the saves changed (the newest 5 automatic ones are kept). Enter twice on a backup puts it back the next time the game starts, after a backup of what was there.
-- **Mods:** drop a mod's folder or .zip on the window to install it, turn mods on and off and set their order (they apply the next time the game starts). Mods that change the game's files work; mods that change its code are installed turned off, because the game's library is built without them.
+- **Saves:** backups of your saves, made by hand or automatically each time the game starts if the saves changed (the newest 5 automatic ones are kept). Enter twice on a backup puts it back the next time the game starts, after a backup of what was there. You can also import saves from a folder and open your saves' folders (see [Your saves](#your-saves)).
+- **Mods:** the built-in mods, comforts and cheats, and your own mods: drop a mod's folder or .zip on the window to install it, turn mods on and off and set their order (they apply the next time the game starts). Mods that change the game's files work; mods that change its code are installed turned off, because the game's library is built without them.
 - **System:** the language of the menu (English or Spanish; "auto" follows Windows), resume and quit.
 - **Online:** nickname, host a room, join with the copied address, public rooms, join by address, leave.
 
@@ -144,6 +155,31 @@ hidden), its size and its corner. The other layouts are **stacked**, **overlay**
 back to "default" in the game options) only apply the next time the game starts: the menu saves them, says so, and lists them
 until you close the game; it never restarts anything by itself. **Graphics > Open the HD textures folder** opens the folder for
 texture packs.
+
+## Your saves
+
+Your saves are in `game\user\sdmc\Nintendo 3DS\000...\000...\` (the zeros stand for the console and the SD card; it is
+the same layout Azahar and Citra use). The buttons in the launcher and in the menu open the right folder, so you don't have to
+walk through it.
+
+- Hunter saves: `title\00040000\00126300\data\00000001` (`user1`, `user2`, `user3` and `system`).
+- Guild cards, quests and Palicoes: `extdata\00000000\00001263\user`.
+
+**Importing:** in the menu, **Saves > Import saves from a folder**. It looks for the game's save files anywhere inside the folder
+you choose and shows what it found. Nothing changes until the next time the game starts, and your current saves are backed up
+first. A hunter save needs its `system` file next to it, and it replaces your hunter saves; guild card and quest files replace
+the ones with the same name. Only saves of the USA version are accepted. Encrypted files copied straight from a 3DS's SD card
+won't work. If you have no hunter save in its place but one is elsewhere inside your `user` folder, the game asks whether to use it.
+
+**Protection:** if the game is cut off while saving, the next start puts back the last save the game finished and keeps what it
+took out in `user\.save-discarded`. This covers the hunter save, not the guild cards and quests. Only one game can use a saves
+folder at a time.
+
+## Giving yourself items (a cheat)
+
+**Mods > Give items**: search by name or number and choose how many. The **item box** can be filled in a village or the
+Gathering Hall, and your **pouch** during a quest. The names are read from your own copy of the game. Your save keeps what you
+add, so back it up first.
 
 ## Frame rate, resolution and sound
 
@@ -157,8 +193,8 @@ texture packs.
   resolution, so edges get sharper but not more detailed. HD texture packs made for Azahar and Citra (PNG, their folder
   layout and hashes) are supported by the runtime: put them under `game\user\load\textures`. At 9x and 10x the picture
   is still black on my card, so the menu stops at 8x.
-- **Picture shape:** the 3DS's top screen is 5:3, so on a 16:9 screen there are black bars at the sides. **Graphics > Picture
-  shape > stretch** fills the whole window (the picture is stretched a little); the fixed ratios are there too.
+- **Widescreen:** the 3DS's top screen is 5:3, so on a 16:9 screen there are black bars at the sides. **Graphics > Widescreen**
+  draws more of the scene at the sides (it is not stretched): match your window, or 16:9, 16:10 or 21:9. It needs a restart.
 - **The HD texture limit (optional):** a texture of an HD pack larger than the limit you choose (4096, 2048, 1024 or 512 pixels on its longer side) is reduced before it is loaded, so it takes less video memory and loads faster, with less detail. With my pack a limit of 1024 cut the textures from 440 to 277 MB. It is off by default.
 - **Sound:** the audio buffer is 60 ms by default; `options = --audio-latency 100` in the ini makes it larger if you hear cuts.
 
@@ -187,7 +223,7 @@ PowerShell window:
 
 ```
 powershell -ExecutionPolicy Bypass -File windows\build.ps1 [-Launcher]
-powershell -ExecutionPolicy Bypass -File windows\package.ps1 -Version 0.5.0
+powershell -ExecutionPolicy Bypass -File windows\package.ps1 -Version 0.6.0
 ```
 
 `build.ps1` downloads SDL3 and builds the program (with `-Launcher` it builds the launcher too); `package.ps1` makes the zip.
@@ -250,9 +286,10 @@ alrededor de ese runtime, un launcher y código propio para buena parte de lo qu
 **Características:**
 - **Nativo en Windows, sin emulador:** el código del juego se recompila para tu PC y se dibuja con Vulkan, con resolución interna de 1x a 8x y límite de fotogramas de hasta 360.
 - **Un launcher** con todas las opciones, gestor de mods, tus partidas y sus copias de seguridad, y actualizaciones que bajan solo los archivos que cambian.
+- **Tus partidas, más protegidas:** copias automáticas, protección si el guardado se corta a la mitad e importación de partidas desde otra carpeta.
 - **Jugar con una sola pantalla:** los menús de la táctil pueden ir a la pantalla de arriba, el 16:9 ocupa toda la ventana sin barras negras, y el mapa del mundo se abre en la pantalla principal con una tecla o un botón.
 - **Teclado, ratón y mandos:** el ratón es el lápiz; funcionan DualSense y mandos tipo Xbox, y cada botón se puede cambiar (también el clic del panel táctil de PlayStation). Saltar una cinemática tiene su propia tecla y botón.
-- **Una caza mejor:** un HUD de caza más pequeño (un tamaño general y uno por parte), la barra de vida del monstruo y comodidades y trucos opcionales, todo apagado por defecto.
+- **Una caza mejor:** un HUD de caza más pequeño (un tamaño general y uno por parte), la barra de vida del monstruo y comodidades y trucos opcionales (incluido darte objetos), todo apagado por defecto.
 - **Más opciones gráficas:** antialiasing, bloom, desenfoque de movimiento, profundidad de campo, desenfoque radial, neblina, dither y campo de visión.
 - **Texturas HD** de packs hechos para Azahar y Citra, con un límite de tamaño opcional para ahorrar memoria de vídeo.
 - **Online** en las mismas salas que Azahar y 4u-native para Android.
@@ -260,9 +297,13 @@ alrededor de ese runtime, un launcher y código propio para buena parte de lo qu
 
 El historial de cada versión está en la página de [Releases](https://github.com/G30vamv/Caravan4URecomp/releases).
 
-**Estado:** probado en Windows 11 con una RTX 4070: el juego corre, he completado misiones y cacerías, funciona con teclado, ratón y mando (también un DualSense por Bluetooth), entré a una sala pública real de Azahar y jugué Local Play con otra persona. En la aldea con texturas HD a 6x va a unos 90–115 fps. **Sin probar todavía:** el botón de actualizar del launcher en su ventana (la actualización en sí sí la probé contra una release real, de la 0.4.2 a la 0.4.3), el voto para terminar la espera en línea, el launcher en otros PC y en Windows 10, 9x y 10x (siguen en negro), otras GPU y MSVC. Algunos momentos aún se entrecortan un poco (el rugido de algunos monstruos y los límites de fps muy altos). Conocido: el launcher parpadea al cerrarse el juego; lo investigaré.
+**Estado:** probado en Windows 11 con una RTX 4070: el juego corre, he completado misiones y cacerías, funciona con teclado, ratón y mando (también un DualSense por Bluetooth), entré a una sala pública real de Azahar y jugué Local Play con otra persona. En la aldea con texturas HD a 6x va a unos 90–115 fps. En la 0.6.0 probé además: empezar sin ninguna partida (crear cazador y camarada, guardar y volver a cargar; hasta la 0.5.0 el juego se cerraba al abrir en ese caso), recuperar un guardado cortado, importar partidas desde una carpeta y, en cacerías reales, los objetos infinitos y darse objetos. **Sin probar todavía:** el botón de actualizar del launcher en su ventana (la actualización en sí sí la probé contra releases reales), importar partidas exportadas por Azahar, Citra, JKSM o Checkpoint y el diálogo de carpeta de Windows, un apagón real mientras guarda, en caza el contador y el multiplicador de daño, los últimos cambios de invencible, el tamaño y la posición de la barra del monstruo y que la munición dada vaya directa a la bolsa de artillero, el voto para terminar la espera en línea, el launcher en otros PC y en Windows 10, 9x y 10x (siguen en negro), otras GPU y MSVC. Algunos momentos aún se entrecortan un poco (el rugido de algunos monstruos y los límites de fps muy altos). El parpadeo del launcher al cerrarse el juego está corregido en el código, pero no lo he comprobado en pantalla.
 
-**Cómo se usa:** la última versión es la 0.5.0, en la página de Releases (con su suma SHA-256). Descomprime todo en una carpeta y abre `Caravan4URecomp-Launcher.exe` (o `Caravan4URecomp.exe` directamente). La primera vez que pulses Jugar te pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con **F1** o **L3 + R3**. Online usa las mismas salas que Azahar: menú → Online → **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
+**Tus partidas:** en el menú del juego, **Partidas → Importar partidas de una carpeta** busca los archivos de guardado en la carpeta que elijas, te muestra lo que encuentra y lo aplica al volver a abrir el juego, tras una copia de las tuyas. Una partida de cazador necesita su archivo `system` al lado y reemplaza tus cazadores; las tarjetas y misiones reemplazan las del mismo nombre. Solo se aceptan partidas de la versión USA. Los botones del menú y del launcher abren directamente la carpeta de tus partidas y la de tarjetas y misiones. Si el juego se corta mientras guarda, al volver a abrir se recupera el último guardado terminado. **Mods → Dar objetos** (truco) te pone objetos en el baúl (en una aldea) o en la bolsa (en una misión).
 
-Para compilarlo: `windows\build.ps1 [-Launcher]` y `windows\package.ps1 -Version 0.5.0` (CMake, Ninja, llvm-mingw y Python). Los créditos y la licencia
+**Para actualizar desde la 0.5.0:** cierra antes todas las copias del juego. Sirve el botón del launcher o descomprimir la versión nueva encima de tu carpeta: la descarga no trae archivo de ajustes, así que conservas el tuyo, y tu carpeta `game` no se toca. No hace falta volver a construir la librería del juego.
+
+**Cómo se usa:** la última versión es la 0.6.0, en la página de Releases (con su suma SHA-256). Descomprime todo en una carpeta y abre `Caravan4URecomp-Launcher.exe` (o `Caravan4URecomp.exe` directamente). La primera vez que pulses Jugar te pide los dos archivos del juego y construye la librería de código para tu PC. El menú del juego se abre con **F1** o **L3 + R3**. Online usa las mismas salas que Azahar: menú → Online → **Alojar una sala** (copia al portapapeles la dirección con puerto de tu Radmin VPN, Hamachi, ZeroTier o Tailscale, o de tu red local, para mandarla a tus amigos) o **Unirse con la dirección copiada**, salas públicas (el * marca las de MH4U) o una dirección `HOST:PORT`; y luego, en el juego, Gathering Hall → Local Play.
+
+Para compilarlo: `windows\build.ps1 [-Launcher]` y `windows\package.ps1 -Version 0.6.0` (CMake, Ninja, llvm-mingw y Python). Los créditos y la licencia
 están arriba; los términos adicionales de khorne-hub siguen aplicando.
