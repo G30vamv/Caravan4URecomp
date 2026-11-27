@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "mods/mod_list.h"
+#include "utf8_path.h"
 
 namespace modmgr {
 
@@ -51,13 +52,13 @@ inline fs::path FindModRoot(const fs::path& dir, int depth = 3) {
     // Emulator-style packages hold one folder per title id (0004000000126300 = the game, 0004000E00126300 = its update):
     // the update's files are the ones that apply on top of the game as this program runs it, so take that one.
     auto is_title_id = [](const fs::path& p) {
-        const std::string n = p.filename().string();
+        const std::string n = u8p::Utf8(p.filename());
         return n.size() == 16 && std::all_of(n.begin(), n.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
     };
     fs::path game_folder;
     for (const fs::path& sub : subs) {
         if (!is_title_id(sub) || !LooksLikeMod(sub)) continue;
-        std::string n = sub.filename().string();
+        std::string n = u8p::Utf8(sub.filename());
         for (char& c : n) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         if (n.rfind("0004000E", 0) == 0) return sub;
         game_folder = sub;
@@ -140,15 +141,15 @@ inline std::vector<std::string> DisableCodeMods(const std::string& user_utf8) {
 // Installs a dropped folder or .zip. The answer is the line the menu shows ("" never: a failure says why).
 inline std::string Install(const std::string& user_utf8, const fs::path& dropped) {
     std::error_code ec;
-    const fs::path mods_dir = fs::path(mh4n::mods::Folder(user_utf8));
+    const fs::path mods_dir = u8p::PathOf(mh4n::mods::Folder(user_utf8));
     fs::create_directories(mods_dir, ec);
     fs::path source = dropped;
     fs::path temp;
-    std::string name = dropped.stem().string();
+    std::string name = u8p::Utf8(dropped.stem());
     if (fs::is_regular_file(dropped, ec)) {
-        std::string ext = dropped.extension().string();
+        std::string ext = u8p::Utf8(dropped.extension());
         std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (ext != ".zip") return "A mod is a folder or a .zip: " + dropped.filename().string() + " is neither.";
+        if (ext != ".zip") return "A mod is a folder or a .zip: " + u8p::Utf8(dropped.filename()) + " is neither.";
         temp = mods_dir / ".installing";
         fs::remove_all(temp, ec);
         if (!Unzip(dropped, temp)) {
@@ -157,7 +158,7 @@ inline std::string Install(const std::string& user_utf8, const fs::path& dropped
         }
         source = temp;
     } else if (fs::is_directory(dropped, ec)) {
-        name = dropped.filename().string();
+        name = u8p::Utf8(dropped.filename());
     } else {
         return "That is not a folder or a .zip.";
     }
@@ -169,10 +170,20 @@ inline std::string Install(const std::string& user_utf8, const fs::path& dropped
     name = SafeName(name);
     if (name.empty()) name = "mod";
     std::string unique = name;
-    for (int n = 2; fs::exists(mods_dir / unique, ec) && n < 100; ++n) unique = name + " (" + std::to_string(n) + ")";
-    fs::copy(root, mods_dir / unique, fs::copy_options::recursive, ec);
+    for (int n = 2; fs::exists(mods_dir / u8p::PathOf(unique), ec) && n < 100; ++n) unique = name + " (" + std::to_string(n) + ")";
+    // copied under a name the game skips (it starts with a dot) and renamed when whole: a copy that fails or is cut short must
+    // not stay behind as a mod that is on, with some of its files
+    const fs::path copying = mods_dir / ".copying";
+    fs::remove_all(copying, ec);
+    fs::copy(root, copying, fs::copy_options::recursive, ec);
+    std::string failed = ec ? ec.message() : std::string();
+    if (failed.empty()) {
+        fs::rename(copying, mods_dir / u8p::PathOf(unique), ec);
+        if (ec) failed = ec.message();
+    }
+    fs::remove_all(copying, ec);
     if (!temp.empty()) fs::remove_all(temp, ec);
-    if (ec) return "The mod could not be copied: " + ec.message();
+    if (!failed.empty()) return "The mod could not be copied: " + failed;
     for (const auto& m : List(user_utf8)) {
         if (m.name == unique && m.code) {
             SetOn(user_utf8, unique, false);

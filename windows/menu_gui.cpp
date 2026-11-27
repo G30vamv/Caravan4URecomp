@@ -482,19 +482,20 @@ private:
             trails[bar.id] = trail;
         }
         trails_ = std::move(trails);
-        if (view.bars.empty() && view.end_wait <= 0.0f && !view.end_asked && view.map_hint.empty()) return;
+        if (view.bars.empty() && view.end_wait <= 0.0f && !view.end_asked && view.map_hint.empty() && !view.meter.show) return;
         const float u = std::max(0.7f, sh / 720.0f);
         Painter p;
         p.dl = ImGui::GetForegroundDrawList();
         p.font = font_;
         p.text = text_;
-        const float bu = u * 0.6f;  // the monster's life plate is drawn at 60% of its first size
+        const float bu = u * 0.6f * std::clamp(view.bar_scale, 0.4f, 2.0f);  // the monster's life plate is drawn at 60% of its first size (and the ini's size on top)
         const float pw = 340.0f * bu, row_h = 64.0f * bu;
+        const float px0 = view.bar_pos == 1 ? 16.0f * u : view.bar_pos == 2 ? (sw - pw) / 2 : sw - 16.0f * u - pw;
         float y = 16.0f * u;
         for (const HudBar& bar : view.bars) {
             const float frac = std::clamp(static_cast<float>(bar.hp) / static_cast<float>(std::max(1, bar.max)), 0.0f, 1.0f);
             const float trail = trails_[bar.id];
-            const Rect plate = {sw - 16.0f * u - pw, y, sw - 16.0f * u, y + row_h};
+            const Rect plate = {px0, y, px0 + pw, y + row_h};
             p.GradV(plate, C(kPanelTop, 0.88f), C(kPanelBottom, 0.9f));
             p.Frame(plate, 6.0f * bu, C(kGold, 0.9f), 1.6f * bu);
             p.Frame(Shrink(plate, 4 * bu, 4 * bu), 4.0f * bu, C(kBlueDeep, 0.8f), 1.0f);
@@ -518,7 +519,27 @@ private:
                 p.dl->AddLine(ImVec2(x, well.y0 + 3 * bu), ImVec2(x, well.y1 - 3 * bu), IM_COL32(0, 0, 0, 110), 1.0f);
             }
             p.Frame(well, 4.0f * bu, C(kGoldDim), 1.0f);
+            if (view.bar_percent) {
+                char pc[16];
+                std::snprintf(pc, sizeof pc, "%d%%", static_cast<int>(frac * 100.0f + 0.5f));
+                p.Write(font_, 12.0f * bu, (well.x0 + well.x1) / 2, (well.y0 + well.y1) / 2, Align::Center, C(kCream), pc);
+            }
             y += row_h + 8.0f * bu;
+        }
+        if (view.meter.show) {  // the damage meter: three columns under the life plate (or at the top when only the meter is on)
+            const float mh = 44.0f * bu;
+            const Rect mp = {px0, y, px0 + pw, y + mh};
+            p.GradV(mp, C(kPanelTop, 0.88f), C(kPanelBottom, 0.9f));
+            p.Frame(mp, 6.0f * bu, C(kGold, 0.9f), 1.6f * bu);
+            p.Frame(Shrink(mp, 4 * bu, 4 * bu), 4.0f * bu, C(kBlueDeep, 0.8f), 1.0f);
+            const char* labels[3] = {view.spanish ? "DAÑO" : "DAMAGE", "DPS", view.spanish ? "ÚLTIMO" : "LAST"};
+            const std::string* values[3] = {&view.meter.total, &view.meter.dps, &view.meter.last};
+            for (int i = 0; i < 3; ++i) {
+                const float cx = mp.x0 + pw * static_cast<float>(2 * i + 1) / 6.0f;
+                p.Write(font_, 12.0f * bu, cx, mp.y0 + 13.0f * bu, Align::Center, C(kGoldDim), labels[i]);
+                p.Write(font_, 17.0f * bu, cx, mp.y0 + 31.0f * bu, Align::Center, C(kCream), values[i]->c_str());
+            }
+            y += mh + 8.0f * bu;
         }
         if (!view.map_hint.empty()) {  // over the world map's Solo / multiplayer button (the bar below the map: its middle is at 200, 220.7 of the 400 x 240 top screen)
             const float unit = sh / 240.0f;

@@ -34,6 +34,12 @@ struct Entry {
     double hit_at = 0.0;      // when its life last went down (seconds, steady clock; 0: never)
     double dead_at = 0.0;     // when it was first seen dead
     int order = 0;            // 1, 2, ... in the order the monsters were first seen
+    // what the damage meter shows: every drop of its life since it was first seen is counted (whoever dealt it)
+    std::int64_t total_damage = 0;
+    int hits = 0;
+    std::int32_t last_hit = 0;
+    double first_hit_at = 0.0;                          // when its life first went down (0: never)
+    std::vector<std::pair<double, std::int32_t>> recent;  // the hits of the last 10 seconds: (time, damage)
 };
 
 struct Snapshot {
@@ -77,9 +83,16 @@ inline void Poll(const std::vector<Sample>& samples) {
         if (old != s.entries.end()) {
             e = *old;
             if (sample.hp < old->hp) {
+                const std::int32_t dealt = old->hp - sample.hp;
                 e.hit_at = now;
                 s.focus = sample.actor;
+                e.total_damage += dealt;
+                ++e.hits;
+                e.last_hit = dealt;
+                if (e.first_hit_at == 0.0) e.first_hit_at = now;
+                e.recent.emplace_back(now, dealt);
             }
+            e.recent.erase(e.recent.begin(), std::find_if(e.recent.begin(), e.recent.end(), [&](const auto& h) { return now - h.first <= 10.0; }));
         } else {
             e.actor = sample.actor;
             e.order = s.next_order++;

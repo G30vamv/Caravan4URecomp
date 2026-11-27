@@ -465,19 +465,41 @@ inline void Start() {
 
 // A start guard. A crash cannot be caught, and the HID code opens every gamepad-like device of the PC, so a marker file lives from
 // the moment the HID reading starts until it has run for a while (or the program ends normally). If the marker is still there at the
-// next start, the program died inside it: the HID pads stay off and the game opens as usual (SDL still serves the pads it can).
-// MH4U_HID_FORCE=1 tries again.
+// next start, that run ended inside it: the HID pads stay off in this one and the game opens as usual (SDL still serves the pads it
+// can). Such an end is not always the HID code's fault (a forced close, a power cut), so the start after that one tries again; only
+// two in a row leave the HID pads off for good. A run that lasts, or ends normally, removes the marker. MH4U_HID_FORCE=1 tries again.
+// The marker is one line, "<state> <ends in a row>", state = armed | retry | off (older versions wrote "hid": read as armed 0).
 inline std::filesystem::path GuardPath() {
     std::error_code ec;
     return std::filesystem::temp_directory_path(ec) / "Caravan4URecomp_hid_start.marker";
 }
+namespace detail {
+inline int g_guard_ends = 0;  // the ends inside the HID reading that came right before this run
+inline void WriteGuard(const char* state, int ends) { std::ofstream(GuardPath(), std::ios::trunc) << state << ' ' << ends << '\n'; }
+}  // namespace detail
+/// Asked once at a start, before ArmGuard. True: the HID pads stay off in this run.
 inline bool GuardTripped() {
+    detail::g_guard_ends = 0;
     const char* force = std::getenv("MH4U_HID_FORCE");
     if (force && std::string(force) == "1") return false;
-    std::error_code ec;
-    return std::filesystem::exists(GuardPath(), ec);
+    std::string state;
+    int ends = 0;
+    {
+        std::ifstream marker(GuardPath());
+        if (!marker) return false;
+        marker >> state;
+        if (!(marker >> ends)) ends = 0;
+    }
+    if (state == "off") return true;
+    if (state == "retry") {
+        detail::g_guard_ends = ends;
+        return false;
+    }
+    ++ends;
+    detail::WriteGuard(ends >= 2 ? "off" : "retry", ends);
+    return true;
 }
-inline void ArmGuard() { std::ofstream(GuardPath(), std::ios::trunc) << "hid\n"; }
+inline void ArmGuard() { detail::WriteGuard("armed", detail::g_guard_ends); }
 inline void DisarmGuard() {
     std::error_code ec;
     std::filesystem::remove(GuardPath(), ec);

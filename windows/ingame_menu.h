@@ -286,9 +286,12 @@ struct Host {
 };
 
 // The pages: five tabs, and two that belong to the Online tab (the public rooms and a room's password).
-enum class Page { Graphics, Game, Controls, Audio, Online, Saves, Mods, System, Rooms, Password, Count };
+enum class Page { Graphics, Game, Controls, Audio, Online, Saves, Mods, System, Rooms, Password, Items, Count };
 constexpr int kTabCount = 8;
-inline int TabOf(Page page) { return page == Page::Rooms || page == Page::Password ? static_cast<int>(Page::Online) : static_cast<int>(page); }
+inline int TabOf(Page page) {
+    if (page == Page::Items) return static_cast<int>(Page::Mods);
+    return page == Page::Rooms || page == Page::Password ? static_cast<int>(Page::Online) : static_cast<int>(page);
+}
 inline const char* const kTabNames[kTabCount] = {"Graphics", "Game", "Controls", "Audio", "Online", "Saves", "Mods", "System"};
 
 // The 3DS buttons the controls page lists, in the order of the page (the shell's settings are key_<lower case name> and
@@ -360,6 +363,28 @@ public:
 
     // The shell tells the menu something (a mod that was dropped on the window): shown on the menu's message line.
     void Notify(const std::string& text) { Say(text); }
+
+    // The answer to a request of the give-items page (Port::Hooks::GiveResult's fields; why: its Why).
+    void ItemResult(int why, int item, int asked, int added, bool box) {
+        RefreshLanguage();
+        std::string name = "#" + std::to_string(item);
+        for (const auto& [id, text] : item_names_) {
+            if (id == item) name = text;
+        }
+        if (why == 0) {
+            const std::string where = Tr(box ? "to the item box" : "to the pouch");
+            Say(std::string(Tr("Added")) + " " + std::to_string(added) + " x " + name + " " + where +
+                (added < asked ? std::string(" (") + Tr("there was no room for more") + ")" : std::string()));
+        } else if (why == 1) {
+            Say("The item box can only be filled in a village or the Gathering Hall.");
+        } else if (why == 2) {
+            Say("The pouch can only be filled during a quest, with no menu or box of the game open.");
+        } else if (why == 3) {
+            Say("That item can't be given there (quest supplies only go to the pouch; things to appraise nowhere).");
+        } else {
+            Say(box ? "There is no room for it in the item box." : "There is no room for it in the pouch.");
+        }
+    }
 
     // Opens the menu on the Mods page with a line (a mod was dropped on the window).
     void ShowMods(SDL_Window* window, const std::string& text) {
@@ -742,7 +767,9 @@ private:
             }
         }
         if (a.back) {
-            if (page_ == Page::Rooms || page_ == Page::Password) {
+            if (page_ == Page::Items) {
+                SetPage(Page::Mods);
+            } else if (page_ == Page::Rooms || page_ == Page::Password) {
                 SetPage(Page::Online);
             } else {
                 open = false;
@@ -773,6 +800,11 @@ private:
     bool shown_open_ = false;
     std::vector<Line> shown_;
     View shown_view_;
+
+    // the give-items page
+    std::string item_search_, item_names_lang_;
+    std::vector<std::pair<int, std::string>> item_names_;
+    int item_count_ = 0, item_to_ = 0;
 
     // online
     std::string nick_, addr_, password_, host_port_, host_password_, join_password_;
@@ -947,7 +979,12 @@ private:
             {"hud_scale", "A mod of this program: draws the hunting HUD smaller, from 100% (the game's own size) down to 40%. Each part keeps to its corner, so the smaller it is the closer to the edges. It only changes how the HUD is drawn, so it is fine online."},
             {"qol_hold_gather", "Hold A to carve, gather, mine and catch bugs again and again until you let go, instead of pressing it each time. It only changes the controls, so it is fine online."},
             {"invincible", "A cheat: your hunter takes no damage (the health bar does not go down). It changes the game's memory: it can break an online hunt or a save. Use it at your own risk."},
-            {"inf_items", "A cheat: the items in your pouch are not used up in a hunt (a potion, a bomb, ammo that is an item). It changes the game's memory: it can break an online hunt or a save. Use it at your own risk."},
+            {"monster_hp_size", "The size of the monster's life plate, in percent of its normal size (50 to 200)."},
+            {"monster_hp_pos", "Where the monster's life plate (and the damage meter under it) goes: top right, top left or top middle."},
+            {"monster_hp_percent", "Writes the percent of life left over the bar of the monster's plate."},
+            {"damage_meter", "A mod of this program: under the monster's life plate it shows the damage the monster has taken (total, damage a second over the last 10 seconds, and the last hit). It counts every drop of the monster's life, whoever dealt it, so online it also counts the other hunters. It only reads the game memory, so it is fine online."},
+            {"damage_mult", "A cheat: every drop of a large monster's life is multiplied (1x is off). It changes the game's memory: it can break an online hunt or a save. Use it at your own risk. A monster is never killed by the multiplier itself: it is left with 1 life and your next hit kills it."},
+            {"inf_items", "A cheat: what you use one at a time in a hunt is not used up (a potion, a bomb, ammo). Combining, moving or selling items counts as usual. It changes the game's memory: it can break an online hunt or a save. Use it at your own risk."},
             {"monster_hp", "A mod of this program, not a graphics option: it shows the life of the large monster you hurt last, top right, with its name, and how much it drops as you hit it. It only reads the game memory and changes nothing, so it is fine online."},
             {"Open the HD textures folder", "Opens the folder for HD texture packs (Azahar or Citra format). They are read when the game starts."},
             {"fps", "Caps the game's frame rate. Default is the game's own, Display matches your screen, Unlimited uses all the CPU."},
@@ -1033,6 +1070,9 @@ private:
             break;
         case Page::Online:
             BuildOnline(items);
+            break;
+        case Page::Items:
+            BuildItems(items);
             break;
         case Page::System:
             items.push_back(Choice("Language", "language", {"auto", "en", "es"}));
@@ -1197,15 +1237,120 @@ private:
         }
     }
 
+    // ---- the give-items page (a cheat): a name or a number typed, how many, where to --------------------------------------
+    // Lower case, the accents of the Latin letters off (the field types plain ASCII; the names have accents).
+    static std::string Fold(const std::string& in) {
+        std::string out;
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            const unsigned char c = static_cast<unsigned char>(in[i]);
+            if (c < 0x80) {
+                out.push_back(static_cast<char>(std::tolower(c)));
+            } else if (c == 0xC3 && i + 1 < in.size()) {
+                const unsigned char d = static_cast<unsigned char>(in[++i]) | 0x20;  // (the small letter of the pair)
+                if (d >= 0xA0 && d <= 0xA5) out.push_back('a');
+                else if (d == 0xA7) out.push_back('c');
+                else if (d >= 0xA8 && d <= 0xAB) out.push_back('e');
+                else if (d >= 0xAC && d <= 0xAF) out.push_back('i');
+                else if (d == 0xB1) out.push_back('n');
+                else if (d >= 0xB2 && d <= 0xB6) out.push_back('o');
+                else if (d >= 0xB9 && d <= 0xBC) out.push_back('u');
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+        return out;
+    }
+
+    void LoadItemNames() {
+        const std::string lang = g_spanish ? "spa" : "eng";
+        if (item_names_lang_ == lang || !host_.action) return;
+        item_names_lang_ = lang;
+        item_names_.clear();
+        for (const std::string& line : SplitLines(host_.action("item_names:" + lang))) {  // "number|name"
+            const std::size_t bar = line.find('|');
+            if (bar != std::string::npos) item_names_.emplace_back(std::atoi(line.c_str()), line.substr(bar + 1));
+        }
+    }
+
+    // A row that steps through a few values kept by the menu (not a setting of the file).
+    Item Stepper(const std::string& label, int* index, std::vector<std::string> options) {
+        Item item;
+        item.kind = Item::Choice;
+        item.id = label;
+        item.label = label;
+        const int n = static_cast<int>(options.size());
+        *index = std::clamp(*index, 0, n - 1);
+        item.value = options[static_cast<std::size_t>(*index)];
+        item.change = [this, index, n](int dir) {
+            *index = (*index + dir + n) % n;
+            dirty_ = true;
+        };
+        item.act = [change = item.change] { change(1); };
+        return item;
+    }
+
+    void BuildItems(std::vector<Item>& items) {
+        constexpr std::size_t kShown = 12;
+        static const int kCounts[] = {1, 2, 3, 5, 10, 20, 50, 99};
+        LoadItemNames();
+        items.push_back(Info("Cheat: your save keeps it. Back up first.", 2));
+        items.push_back(TextField("Search item", &item_search_, 24));
+        items.push_back(Stepper("How many", &item_count_, {"1", "2", "3", "5", "10", "20", "50", "99"}));
+        items.push_back(Stepper("Put them in", &item_to_, {"Item box (village)", "Pouch (in a quest)"}));
+        if (item_names_.empty()) {
+            items.push_back(Info("No item names: type an item's number.", 1));
+        }
+        const std::string wanted = Fold(item_search_);
+        if (wanted.empty()) {
+            items.push_back(Info("Search for a name or a number.", 1));
+            return;
+        }
+        const bool number = wanted.find_first_not_of("0123456789") == std::string::npos;
+        const int typed = number ? std::atoi(wanted.c_str()) : 0;
+        std::vector<std::pair<int, std::string>> found, inside;  // names that begin with it first
+        for (const auto& [id, name] : item_names_) {
+            const std::size_t at = Fold(name).find(wanted);
+            if (number && id == typed) found.insert(found.begin(), {id, name});
+            else if (at == 0) found.emplace_back(id, name);
+            else if (at != std::string::npos) inside.emplace_back(id, name);
+        }
+        found.insert(found.end(), inside.begin(), inside.end());
+        if (item_names_.empty() && typed > 0) found.emplace_back(typed, "item");
+        if (found.empty()) items.push_back(Info("No item has that name.", 1));
+        for (std::size_t i = 0; i < found.size() && i < kShown; ++i) {
+            const int id = found[i].first;
+            Item row = Action(found[i].second + "  #" + std::to_string(id), [this, id] {
+                if (!host_.action) return;
+                const std::string said = host_.action("give:" + std::to_string(id) + ":" + std::to_string(kCounts[item_count_]) +
+                                                      (item_to_ == 0 ? ":box" : ":pouch"));
+                if (!said.empty()) Say(said);
+            }, "Add");
+            row.id = "give_" + std::to_string(id);
+            row.help = Tr("Enter or A adds it, as many as chosen above, where chosen above.");
+            items.push_back(std::move(row));
+        }
+        if (found.size() > kShown) items.push_back(Info("There are more: type more of the name.", 1));
+    }
+
     // ---- the mods page: the folders of <user>\load\mods, on or off, in the order they are applied ----
     void BuildMods(std::vector<Item>& items) {
         const std::vector<std::string> mods = SplitLines(host_.action ? host_.action("mods_list") : "");  // name|flags|on
         // the mods of this program itself (they read or change the game; none is a graphics option)
         items.push_back(Info("Built-in mods: they live in the game while it runs.", 2));
         items.push_back(Choice("Monster life bar (mod)", "monster_hp", {"off", "on"}));
+        items.push_back(Choice("   Life bar size", "monster_hp_size", Numbers(50, 200, 10)));
+        items.push_back(Choice("   Life bar position", "monster_hp_pos", {"right", "left", "middle"}));
+        items.push_back(Choice("   Percent of life on the bar", "monster_hp_percent", {"off", "on"}));
+        items.push_back(Choice("Damage meter (mod)", "damage_meter", {"off", "on"}));
         items.push_back(Info("Cheats: they change the game's memory. They can break an online hunt or your save: use them at your own risk.", 2));
         items.push_back(Choice("Invincible (cheat)", "invincible", {"off", "on"}));
         items.push_back(Choice("Infinite items (cheat)", "inf_items", {"off", "on"}));
+        items.push_back(Choice("Damage multiplier (cheat)", "damage_mult", {"1", "1.5", "2", "3", "5", "10"}));
+        {
+            Item give = Action("Give items (cheat) >", [this] { SetPage(Page::Items); }, "Open");
+            give.help = Tr("A cheat: puts the item you choose in the item box (in a village) or in your pouch (in a quest). It changes the game's memory and your save keeps it: back up your saves first.");
+            items.push_back(std::move(give));
+        }
         items.push_back(Choice("Hold A to gather (comfort)", "qol_hold_gather", {"off", "on"}));
         items.push_back(Choice("Cancel the flex after a drink (comfort)", "qol_flex_cancel", {"off", "on"}));
         items.push_back(Choice("Cancel sharpening with B (comfort)", "qol_sharpen_cancel", {"off", "on"}));
@@ -1590,7 +1735,7 @@ private:
     // ---- the picture -----------------------------------------------------------------------------------------------------
     // The page as the look draws it (a View) and, for when that can't be drawn, as plain lines of text.
     void Render(std::vector<Line>* out_lines, View* out_view) {
-        static const char* const kTitles[] = {"Graphics", "Game", "Controls", "Audio", "Online", "Saves", "Mods", "System", "Public rooms", "Room password"};
+        static const char* const kTitles[] = {"Graphics", "Game", "Controls", "Audio", "Online", "Saves", "Mods", "System", "Public rooms", "Room password", "Give items (cheat)"};
         RefreshLanguage();
         std::vector<Item> items = Build();
         SyncSelection(items);

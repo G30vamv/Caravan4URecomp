@@ -152,6 +152,26 @@ struct GameState {
 };
 GameState CurrentGameState();
 
+/// MODIFIED for the Windows port: the give-items cheat. A request and, once the game's loop has taken it, its answer.
+struct GiveResult {
+    enum Why {
+        DONE,         // `added` of `asked` went in (fewer: the pile or the box had no room for more)
+        NOT_IN_TOWN,  // the item box can only be filled in a village or the Gathering Hall
+        NOT_IN_HUNT,  // the pouch can only be filled during a quest, with no menu or box open
+        NOT_ALLOWED,  // not an item that can be given there (a supply to the box, something to appraise, no such item)
+        NO_ROOM,      // nothing went in: the pile or the box is full
+    };
+    Why why = DONE;
+    int item = 0;      // the item's number (its place in the game's item table)
+    int asked = 0;     // how many were asked for
+    int added = 0;     // how many went in
+    bool to_box = true;  // the item box, or the hunter's pouch
+};
+/// Asks for `count` (1..99) of an item. Taken at the game's next frame. Safe from any thread.
+void GiveItem(int item, int count, bool to_box);
+/// The answer to a request, once each. Safe from any thread.
+bool TakeGiveResult(GiveResult* out);
+
 /// MODIFIED for the Windows port: how many layout objects the game drew on the touch screen in its last frame (0: the touch
 /// screen shows nothing, as at the title). Safe from any thread.
 int TouchScreenObjects();

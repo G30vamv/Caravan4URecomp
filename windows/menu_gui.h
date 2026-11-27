@@ -74,8 +74,18 @@ struct HudBar {
     float since_hit = 99.0f;  // seconds since its life last went down
     bool dead = false;
 };
+// The damage meter (the ini's damage_meter): what the monster being fought has taken, drawn under its life plate.
+struct HudMeter {
+    bool show = false;
+    std::string total, dps, last;  // already formatted ("12 345", "210", "456")
+};
 struct HudView {
     std::vector<HudBar> bars; // the monster being fought, or none (nothing is drawn)
+    float bar_scale = 1.0f;   // the size of the plate (monster_hp_size / 100)
+    int bar_pos = 0;          // 0 top right, 1 top left, 2 top middle (monster_hp_pos)
+    bool bar_percent = false; // the percent of life left over the bar (monster_hp_percent)
+    bool spanish = false;
+    HudMeter meter;
     // the hold of the buttons that end the wait after a quest (the ini's skip_end): how much is done, 0..1 (0: not held), the
     // player has asked (the hold is done; the others may not have), and the words
     float end_wait = 0.0f;

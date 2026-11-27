@@ -16,6 +16,8 @@
 #include <filesystem>
 #include <string>
 
+#include "utf8_path.h"
+
 namespace hidhide {
 
 inline std::filesystem::path FindCli() {
@@ -65,12 +67,12 @@ inline std::string Lower(std::string s) {
 
 /// Whether `exe` is on HidHide's application list.
 inline bool OnList(const std::string& app_list, const std::filesystem::path& exe) {
-    const std::string want = Lower(exe.lexically_normal().string());
+    const std::string want = Lower(u8p::Utf8(exe.lexically_normal()));
     std::size_t at = 0;
     while ((at = app_list.find("--app-reg", at)) != std::string::npos) {
         const std::size_t a = app_list.find('"', at), b = a == std::string::npos ? a : app_list.find('"', a + 1);
         if (b == std::string::npos) break;
-        if (Lower(std::filesystem::path(app_list.substr(a + 1, b - a - 1)).lexically_normal().string()) == want) return true;
+        if (Lower(u8p::Utf8(u8p::PathOf(app_list.substr(a + 1, b - a - 1)).lexically_normal())) == want) return true;
         at = b;
     }
     return false;

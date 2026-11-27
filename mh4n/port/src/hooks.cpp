@@ -6,11 +6,13 @@
 #include "hooks.h"
 
 #include "game_addr.h"
+#include "inf_items.h"
 #include "monster_hp.h"
 #include "onescreen.h"
 #include "swkbd_bridge.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <atomic>
 #include <chrono>
 #include <cctype>
@@ -21,6 +23,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <deque>
 #include <mutex>
 #include <sstream>
 #include <string_view>
@@ -225,6 +228,8 @@ struct Options {
     // invincible / inf_items (cheats of this program, off unless set; they write the hunter's memory, so they can break
     // an online hunt or a save: the user's risk, said in the menus): HunterMods below
     bool invincible = false, inf_items = false;
+    // damage_mult: every drop of a large monster's life is multiplied (a cheat: it writes the monster's life, so it can break an online hunt)
+    float damage_mult = 1.0f;
     float hud_scale = 100.0f;
     float hud_part_scale[HUD_PART_COUNT] = {100, 100, 100, 100, 100, 100, 100};
 };
@@ -449,6 +454,8 @@ void Set(Options& o, const std::string& key, const std::string& value) {
     } else if (key == "trace_state") {
         o.trace_state = IsOn(value) || value == "actions";
         o.trace_state_actions = value == "actions";
+    } else if (key == "damage_mult") {
+        o.damage_mult = std::clamp(static_cast<float>(std::strtod(value.c_str(), nullptr)), 1.0f, 20.0f);
     } else if (key == "invincible") {
         o.invincible = IsOn(value);
     } else if (key == "inf_items") {
@@ -785,6 +792,7 @@ void MonsterLifeStep(RCtx* ctx);
 std::atomic<bool> probe_window{false};
 void HunterProbe(RCtx* ctx);
 void HunterMods(RCtx* ctx);
+void GiveStep(RCtx* ctx);
 void TraceFilters();
 void EffectsApply(RCtx* ctx);
 bool GameFunctionsKnown();  // (EffectsApply's check: the game's vtables hold the functions the port's addresses name)
@@ -834,6 +842,7 @@ void Frame(RCtx* ctx, RFunc original) {
         QolRewardsKeep(ctx, rewards, rewards_left, rewards_part);
     }
     QolRewardsSendAll(ctx);
+    GiveStep(ctx);
     ++frames;
     UpdateQuestOverlay(ctx);
     UpdateGameState(ctx);
@@ -3032,21 +3041,40 @@ void HunterProbe(RCtx* ctx) {
     }
 }
 
+/// inf_items: why a drop in the pouch now cannot be the hunter using an item (nullptr when it can). It can only in a quest
+/// that is still on (not complete, failed or abandoned: the quest takes its supplies back a few seconds after, with the hunt's
+/// own screen still up), with that screen up (not the supply or item box, nor the screens between areas) and no menu.
+const char* PouchNotHunting(RCtx* ctx, u32* status, u8* hud) {
+    const u32 holder = rd32(ctx, QUEST_HOLDER);
+    *status = holder ? rd8(ctx, holder + QUEST_STATUS) : 0;
+    *hud = rd8(ctx, QUEST_HUD + HUD_STATE);
+    const u32 areas = rd32(ctx, SAREA_INSTANCE);
+    const u32 count = HeapPointer(areas) ? rd32(ctx, areas + AREA_COUNT) : 0;
+    const u32 top = count >= 1 && count <= 8 ? rd32(ctx, areas + AREA_TABLE + 4 * (count - 1)) : 0;
+    if (!HeapPointer(top) || UsaAddress(rd32(ctx, top)) != VT_AQUEST) return "not in a quest";
+    if (holder == 0 || (*status >= 3 && *status <= 7)) return "the quest is over";
+    if (*hud != HUD_HUNTING) return "not on the hunt's screen";
+    if (GameMenuOpen(ctx)) return "a menu is open";
+    return nullptr;
+}
+
 /// invincible and inf_items: found with probe_hunter on a real hunt (2026-11-23). The hunter's data block is the one at
 /// [hunter + 0xe30]: the hunter's HEALTH (it was taken for the sharpness at first) is the number at +0x35c (110, 107, 102... with each
 /// hit taken; +0x34c holds the maximum in its upper half) and the pouch's slot n (0-23 items) holds its item at +0x236 + 4n and the
-/// count at +0x238 + 4n (a potion used: 7 -> 6). Each is kept at the highest it has been in this hunt: a hit or a use
-/// takes it down, and it is put back; a whetstone, a pick-up or a new item raises the mark.
+/// count at +0x238 + 4n (a potion used: 7 -> 6; the quest taking its supplies back writes 0 in both). The health is kept at the
+/// highest it has been in this hunt. For the pouch, only what looks like a use is put back (inf_items.h says which: anything
+/// else put back could copy items into the save), and each change of it is logged with what was done.
 void HunterMods(RCtx* ctx) {
     static u32 owner = 0;
     static u32 sharp_mark = 0;
     static u32 sharp_low_mark = 0;
-    static u16 item_id[24] = {};
-    static s16 item_mark[24] = {};
+    static InfItems::Keeper pouch_keeper;
+    static int pouch_lines = 0;
     int weapon = -1;
     const u32 hunter = LocalHunter(ctx, &weapon);
     if (hunter == 0) {
         owner = 0;
+        pouch_keeper.Forget();
         return;
     }
     const u32 block = rd32(ctx, hunter + 0xe30);
@@ -3057,8 +3085,7 @@ void HunterMods(RCtx* ctx) {
         owner = hunter;
         sharp_mark = 0;
         sharp_low_mark = 0;
-        std::fill(std::begin(item_id), std::end(item_id), u16{0});
-        std::fill(std::begin(item_mark), std::end(item_mark), s16{0});
+        pouch_keeper.Forget();
     }
     if (options.invincible) {
         const u32 now = rd32(ctx, block + 0x35c);
@@ -3078,27 +3105,156 @@ void HunterMods(RCtx* ctx) {
         }
     }
     if (options.inf_items) {
-        for (u32 slot = 0; slot < 24; ++slot) {
-            const u32 at = block + 0x236 + 4 * slot;
-            const u16 id = rd16(ctx, at);
-            const s16 count = static_cast<s16>(rd16(ctx, at + 2));
-            if (id == 0 || id == 0x4d5) {  // (an empty slot)
-                item_id[slot] = 0;
-                item_mark[slot] = 0;
-            } else if (id != item_id[slot] || count > item_mark[slot]) {
-                item_id[slot] = id;
-                item_mark[slot] = count;
-            } else if (count < item_mark[slot]) {
-                wr16(ctx, at + 2, static_cast<u16>(item_mark[slot]));
-            }
+        InfItems::Pouch pouch;
+        for (u32 slot = 0; slot < InfItems::SLOTS; ++slot) {
+            pouch[slot] = {static_cast<u16>(rd16(ctx, block + 0x236 + 4 * slot)), static_cast<s16>(rd16(ctx, block + 0x238 + 4 * slot))};
+        }
+        u32 status = 0;
+        u8 hud = 0;
+        const char* why = PouchNotHunting(ctx, &status, &hud);
+        const InfItems::Change change = pouch_keeper.Step(pouch, why == nullptr);
+        if (change.verdict == InfItems::Verdict::Same) return;
+        if (change.verdict == InfItems::Verdict::PutBack) {
+            wr16(ctx, block + 0x236 + 4 * static_cast<u32>(change.slot), change.was.id);
+            wr16(ctx, block + 0x238 + 4 * static_cast<u32>(change.slot), static_cast<u16>(change.was.count));
+        }
+        if (pouch_lines < 600) {
+            ++pouch_lines;
+            const char* done = change.verdict == InfItems::Verdict::PutBack      ? "put back"
+                               : change.verdict == InfItems::Verdict::NotHunting ? why
+                               : change.verdict == InfItems::Verdict::JustResumed ? "just back to the hunt"
+                               : change.verdict == InfItems::Verdict::SeveralSlots ? "several slots at once"
+                                                                                   : "not one item used";
+            LogInfo("items: frame {} slot {} item {:X} x{} -> item {:X} x{} ({} slot(s); quest status {}, hud {}): {}{}", frames,
+                    change.slot, change.was.id, change.was.count, change.now.id, change.now.count, change.changed, status, hud,
+                    change.verdict == InfItems::Verdict::PutBack ? "" : "left as it is, ", done);
         }
     }
 }
 
-void MonsterLifeStep(RCtx* ctx) {
-    if (!MonsterHp::Enabled().load(std::memory_order_relaxed)) {
+// ── Giving the hunter items (a cheat of this program, asked for from its menu) ──
+//
+// To the item box, in a village or the Gathering Hall: the game's own calls, as the rewards screen's Send to Item Box makes
+// them (above), so the box stacks and stores them as it does its own. To the pouch, during a quest: the slot is written
+// (its item and count), no more of an item than the pile it has in the pouch (byte 3 of its row of the item table). Not
+// given: what is to appraise (bit 0x10 of byte 2: talismans, weapons, armour), and to the box a quest's supplies (bit 0x02
+// from item 768 on: the box never holds them; the quest takes them back from the pouch when it ends).
+constexpr int ITEM_NUMBERS = 1937;  // the item table's rows (USA v1.3.0): items 1..1936
+constexpr int ITEM_FIRST_SUPPLY = 768;
+std::mutex give_mutex;
+std::deque<GiveResult> give_asked, give_answers;
+
+/// How many of `item` the box's `room` slots hold (the slots at box + 0x1ba, {item, count}), for the log.
+int BoxHolds(RCtx* ctx, u32 box, u32 room, int item) {
+    int total = 0;
+    for (u32 i = 0; i < std::min<u32>(room, 2000); ++i) {
+        if (rd16(ctx, box + 0x1ba + 4 * i) == static_cast<u32>(item)) total += static_cast<s16>(rd16(ctx, box + 0x1ba + 4 * i + 2));
+    }
+    return total;
+}
+
+void GiveToBox(RCtx* ctx, GiveResult* r) {
+    const u32 areas = rd32(ctx, SAREA_INSTANCE);
+    const u32 count = HeapPointer(areas) ? rd32(ctx, areas + AREA_COUNT) : 0;
+    const u32 top = count >= 1 && count <= 8 ? rd32(ctx, areas + AREA_TABLE + 4 * (count - 1)) : 0;
+    const u32 box = rd32(ctx, ITEM_BOX_OWNER);
+    if (!HeapPointer(top) || UsaAddress(rd32(ctx, top)) != VT_AVILLAGE || box == 0) {
+        r->why = GiveResult::NOT_IN_TOWN;
         return;
     }
+    const u32 item = static_cast<u32>(r->item);
+    const u32 room = CallGame(ctx, FN_BOX_ROOM, {box, box + 0x5c});
+    if (CallGame(ctx, FN_BOX_FITS, {box, item, box + 0x1ba, room}) == 0) {
+        r->why = GiveResult::NO_ROOM;
+        return;
+    }
+    const int before = BoxHolds(ctx, box, room, r->item);
+    // 0x00c1ea00's out* is a place in its caller's frame: a block below the guest's stack, the pointer put back after
+    const u32 sp = ctx->r[13];
+    const u32 out = (sp - 0x200) & ~7u;
+    ctx->r[13] = out;
+    const u32 left = CallGame(ctx, FN_BOX_ADD, {box, item, static_cast<u32>(r->asked), out});
+    ctx->r[13] = sp;
+    r->added = std::clamp(r->asked - static_cast<int>(left), 0, r->asked);
+    if (r->added == 0) r->why = GiveResult::NO_ROOM;
+    LogInfo("give: item box {:08X} ({} slots): item {} was {}, is {}", box, room, r->item, before, BoxHolds(ctx, box, room, r->item));
+}
+
+void GiveToPouch(RCtx* ctx, GiveResult* r) {
+    int weapon = -1;
+    const u32 hunter = LocalHunter(ctx, &weapon);
+    u32 status = 0;
+    u8 hud = 0;
+    const char* not_hunting = hunter ? PouchNotHunting(ctx, &status, &hud) : "no hunter";
+    const u32 block = hunter ? rd32(ctx, hunter + 0xe30) : 0;
+    if (not_hunting != nullptr || !HeapPointer(block)) {
+        LogInfo("give: not to the pouch now ({}; quest status {}, hud {})", not_hunting ? not_hunting : "no data", status, hud);
+        r->why = GiveResult::NOT_IN_HUNT;
+        return;
+    }
+    const int pile = rd8(ctx, ITEM_TABLE + 20u * static_cast<u32>(r->item) + 3);
+    if (pile < 1 || pile > 99) {
+        r->why = GiveResult::NOT_ALLOWED;
+        return;
+    }
+    int free_slot = -1;
+    for (u32 slot = 0; slot < InfItems::SLOTS; ++slot) {
+        const InfItems::Slot now{static_cast<u16>(rd16(ctx, block + 0x236 + 4 * slot)), static_cast<s16>(rd16(ctx, block + 0x238 + 4 * slot))};
+        if (!InfItems::Empty(now) && now.id == r->item) {  // (one pile an item: it is topped up)
+            r->added = std::clamp(pile - now.count, 0, r->asked);
+            if (r->added == 0) {
+                r->why = GiveResult::NO_ROOM;
+            } else {
+                wr16(ctx, block + 0x238 + 4 * slot, static_cast<u16>(now.count + r->added));
+                LogInfo("give: pouch slot {}: item {} x{} -> x{}", slot, r->item, now.count, now.count + r->added);
+            }
+            return;
+        }
+        if (free_slot < 0 && InfItems::Empty(now)) free_slot = static_cast<int>(slot);
+    }
+    if (free_slot < 0) {
+        r->why = GiveResult::NO_ROOM;
+        return;
+    }
+    r->added = std::min(pile, r->asked);
+    wr16(ctx, block + 0x236 + 4 * static_cast<u32>(free_slot), static_cast<u16>(r->item));
+    wr16(ctx, block + 0x238 + 4 * static_cast<u32>(free_slot), static_cast<u16>(r->added));
+    LogInfo("give: pouch slot {} (empty): item {} x{}", free_slot, r->item, r->added);
+}
+
+/// Once a frame (Frame, after the game's): one request, if any.
+void GiveStep(RCtx* ctx) {
+    GiveResult r;
+    {
+        const std::lock_guard<std::mutex> lock(give_mutex);
+        if (give_asked.empty()) return;
+        r = give_asked.front();
+        give_asked.pop_front();
+    }
+    const u32 flags = r.item > 0 && r.item < ITEM_NUMBERS && GameFunctionsKnown()
+                          ? rd8(ctx, ITEM_TABLE + 20u * static_cast<u32>(r.item) + 2)
+                          : 0x10u;
+    if ((flags & 0x10) != 0 || (r.to_box && (flags & 0x02) != 0 && r.item >= ITEM_FIRST_SUPPLY)) {
+        r.why = GiveResult::NOT_ALLOWED;
+    } else if (r.to_box) {
+        GiveToBox(ctx, &r);
+    } else {
+        GiveToPouch(ctx, &r);
+    }
+    LogInfo("give: item {} x{} to the {}: answer {}, {} added", r.item, r.asked, r.to_box ? "item box" : "pouch",
+            static_cast<int>(r.why), r.added);
+    const std::lock_guard<std::mutex> lock(give_mutex);
+    give_answers.push_back(r);
+    while (give_answers.size() > 16) give_answers.pop_front();
+}
+
+void MonsterLifeStep(RCtx* ctx) {
+    if (!MonsterHp::Enabled().load(std::memory_order_relaxed) && options.damage_mult <= 1.0f) {
+        return;
+    }
+    // the damage multiplier: the lives as the last frame left them (after our own writes), to see what the game took this frame
+    static std::unordered_map<u32, std::int32_t> last_life;
+    if (options.damage_mult <= 1.0f) last_life.clear();  // (a multiplier switched on in mid-fight starts from the lives it finds)
     std::vector<MonsterHp::Sample> samples;
     const u32 enemies = rd32(ctx, SENEMY);
     if (HeapPointer(enemies)) {
@@ -3114,10 +3270,25 @@ void MonsterLifeStep(RCtx* ctx) {
             sample.kind = rd8(ctx, info + INFO_KIND);
             sample.hp = static_cast<std::int32_t>(rd32(ctx, info + INFO_HP));
             sample.max = static_cast<std::int32_t>(rd32(ctx, info + INFO_HP_MAX));
+            if (options.damage_mult > 1.0f && sample.max > 0 && sample.hp > 0 && sample.hp <= sample.max) {
+                const auto before = last_life.find(monster);
+                if (before != last_life.end() && sample.hp < before->second) {
+                    const std::int32_t taken = before->second - sample.hp;
+                    const std::int32_t extra = static_cast<std::int32_t>(std::lround(static_cast<double>(taken) * (options.damage_mult - 1.0f)));
+                    // (never to 0 by memory: the game's own hit does the killing, so its death sequence runs as always)
+                    const std::int32_t life = std::max<std::int32_t>(1, sample.hp - extra);
+                    if (life != sample.hp) {
+                        wr32(ctx, info + INFO_HP, static_cast<u32>(life));
+                        sample.hp = life;
+                    }
+                }
+                last_life[monster] = sample.hp;
+            }
             sample.dead = state == 0xb || state == 0xe || (state == 0xc && rd8(ctx, info + INFO_STATE + 1) == 0xff);
             samples.push_back(sample);
         }
     }
+    if (samples.empty()) last_life.clear();
     MonsterHp::Poll(samples);
 }
 
@@ -3751,6 +3922,23 @@ void ScrollItemBar(int steps) {
     item_steps_asked = std::clamp(now + steps, -4, 4);
 }
 
+void GiveItem(int item, int count, bool to_box) {
+    GiveResult r;
+    r.item = item;
+    r.asked = std::clamp(count, 1, 99);
+    r.to_box = to_box;
+    const std::lock_guard<std::mutex> lock(give_mutex);
+    if (give_asked.size() < 16) give_asked.push_back(r);
+}
+
+bool TakeGiveResult(GiveResult* out) {
+    const std::lock_guard<std::mutex> lock(give_mutex);
+    if (give_answers.empty()) return false;
+    *out = give_answers.front();
+    give_answers.pop_front();
+    return true;
+}
+
 bool SetOption(const std::string& key, const std::string& value) {
     if (key == "lock_on") {  // (the runner's --set, for tests: the app calls SetLockOn)
         SetLockOn(IsOn(value));
@@ -3758,6 +3946,12 @@ bool SetOption(const std::string& key, const std::string& value) {
     }
     if (key == "target_tap") {  // (tests: the app calls TapTargetCamera)
         TapTargetCamera();
+        return true;
+    }
+    if (key == "give_item") {  // (the runner's --set, for tests: "ITEM,COUNT,box" or "ITEM,COUNT,pouch")
+        const std::size_t a = value.find(','), b = a == std::string::npos ? a : value.find(',', a + 1);
+        if (b == std::string::npos) return false;
+        GiveItem(std::atoi(value.c_str()), std::atoi(value.c_str() + a + 1), value.compare(b + 1, std::string::npos, "box") == 0);
         return true;
     }
     if (key == "item_open") {  // (tests: the app calls HoldItemBarOpen)
@@ -3775,7 +3969,7 @@ bool SetOption(const std::string& key, const std::string& value) {
         "target", "skip", "skip_panel", "skip_panel_scene", "skip_anywhere", "skip_hint", "skip_end", "skip_end_hold", "touch_overlay",
         "quest_overlay", "target_overlay",
         "hud_edges", "trace_frames", "trace_layout", "trace_panels", "bloom", "motion_blur",
-        "depth_of_field", "radial_blur", "haze", "trace_filters", "trace_state", "item_bar", "hud_probe", "hud_scale", "probe_hunter", "hide_help", "invincible", "inf_items",
+        "depth_of_field", "radial_blur", "haze", "trace_filters", "trace_state", "item_bar", "hud_probe", "hud_scale", "probe_hunter", "hide_help", "invincible", "inf_items", "damage_mult",
         "qol_hold_gather", "qol_flex_cancel", "qol_sharpen_cancel", "qol_rewards_no_limit", "rewards_send_all",
         "single_screen", "effects"};
     if (std::find(std::begin(live), std::end(live), key) == std::end(live) && HudPartIndex(key) < 0 &&

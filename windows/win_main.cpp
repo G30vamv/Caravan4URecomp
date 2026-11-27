@@ -54,6 +54,7 @@
 #include "swkbd_bridge.h"
 
 #include <windows.h>
+#include <io.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -142,7 +143,7 @@ std::atomic<int> g_aspect{0};
 inline const char* GameOptionDefault(const std::string& key) {
     static const std::pair<const char*, const char*> kTable[] = {
         {"qol_hold_gather", "off"}, {"qol_flex_cancel", "off"}, {"qol_sharpen_cancel", "off"}, {"qol_rewards_no_limit", "off"},
-        {"rewards_send_all", "off"}, {"invincible", "off"}, {"inf_items", "off"}, {"hide_help", "off"},
+        {"rewards_send_all", "off"}, {"invincible", "off"}, {"inf_items", "off"}, {"damage_mult", "1"}, {"hide_help", "off"},
         {"antialiasing", "on"}, {"bloom", "on"}, {"motion_blur", "on"}, {"depth_of_field", "on"}, {"radial_blur", "on"},
         {"haze", "on"}, {"dither", "on"}, {"fov", "1.0"}, {"kick", "off"}, {"target", "off"},
         {"skip_end", "ZL+ZR"}, {"skip_end_hold", "1.0"}, {"hud_scale", "100"}, {"hud_scale_clock", "100"}, {"hud_scale_bars", "100"}, {"hud_scale_sharpness", "100"},
@@ -154,7 +155,7 @@ inline const char* GameOptionDefault(const std::string& key) {
 }
 inline std::vector<std::string> GameOptionKeys() {
     return {"qol_hold_gather", "qol_flex_cancel", "qol_sharpen_cancel", "qol_rewards_no_limit", "rewards_send_all", "invincible",
-            "inf_items", "hide_help", "antialiasing", "bloom", "motion_blur", "depth_of_field", "radial_blur", "haze", "dither", "fov",
+            "inf_items", "damage_mult", "hide_help", "antialiasing", "bloom", "motion_blur", "depth_of_field", "radial_blur", "haze", "dither", "fov",
             "kick", "target", "skip_end", "skip_end_hold", "hud_scale", "hud_scale_clock", "hud_scale_bars", "hud_scale_sharpness", "hud_scale_party", "hud_scale_map",
             "hud_scale_target", "hud_scale_items"};
 }
@@ -325,6 +326,10 @@ public:
     std::atomic<bool> show_fps{false};
     std::atomic<int> fps{-1};
     std::atomic<bool> show_monster_hp{false};  // the life of the monster being fought (monster_hp in the ini)
+    std::atomic<int> monster_hp_size{100};      // monster_hp_size: the plate's size, percent
+    std::atomic<int> monster_hp_pos{0};         // monster_hp_pos: 0 right, 1 left, 2 middle
+    std::atomic<bool> monster_hp_percent{false};  // monster_hp_percent: the percent of life left over the bar
+    std::atomic<bool> show_damage{false};       // damage_meter: what the monster has taken
     std::atomic<bool> hud_spanish{false};
     // the monsters' names of the user's own game (monster_names.txt, made by tools/monster_names.py): row of the monster table -> name,
     // set once before the game starts and then only read
@@ -373,12 +378,12 @@ private:
             const std::string north = kind == 2 ? std::string(1, char(1)) : std::string("Y");  // (character 1: the hint draws a triangle)
             view.map_hint = (es ? "Abrir con\n" : "Open with\n") + (kind == 0 ? std::string("N") : north + (es ? " o N" : " or N"));
         }
-        if (!view.bars.empty() || view.end_wait > 0.0f || view.end_asked || !view.map_hint.empty()) menu->DrawHud(recorder, width, height, view);
+        if (!view.bars.empty() || view.end_wait > 0.0f || view.end_asked || !view.map_hint.empty() || view.meter.show) menu->DrawHud(recorder, width, height, view);
     }
 
     // the monster the hunter hurt last (monster_hp.h), as the menu's drawing wants it
     ingame::HudView MonsterView() const {
-        if (!show_monster_hp.load()) return {};
+        if (!show_monster_hp.load() && !show_damage.load()) return {};
         if (std::getenv("MH4N_MONSTER_HP_DEMO")) {  // a check of the drawing without a hunt: a life that drops in steps and fills up again
             static const auto start = std::chrono::steady_clock::now();
             const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -398,6 +403,24 @@ private:
         ingame::HudView view;
         for (const Port::MonsterHp::Entry& e : snapshot.list) {
             if (e.actor != snapshot.focus) continue;
+            if (show_damage.load()) {  // the damage meter: the total, the damage a second over the last 10 s (or since the first hit, when that is shorter) and the last hit
+                const auto group = [](long long n) {  // 12345 -> "12 345"
+                    std::string digits = std::to_string(n), out;
+                    for (std::size_t i = 0; i < digits.size(); ++i) {
+                        if (i != 0 && (digits.size() - i) % 3 == 0) out += ' ';
+                        out += digits[i];
+                    }
+                    return out;
+                };
+                long long recent = 0;
+                for (const auto& hit : e.recent) recent += hit.second;
+                const double span = e.first_hit_at > 0.0 ? std::clamp(snapshot.now - e.first_hit_at, 1.0, 10.0) : 10.0;
+                view.meter.show = true;
+                view.meter.total = group(e.total_damage);
+                view.meter.dps = group(std::llround(static_cast<double>(recent) / span));
+                view.meter.last = group(e.last_hit);
+            }
+            if (!show_monster_hp.load()) continue;
             ingame::HudBar bar;
             bar.id = e.actor;
             const auto known = monster_names.find(e.kind);
@@ -409,6 +432,10 @@ private:
             bar.dead = e.dead;
             view.bars.push_back(std::move(bar));
         }
+        view.bar_scale = static_cast<float>(monster_hp_size.load()) / 100.0f;
+        view.bar_pos = monster_hp_pos.load();
+        view.bar_percent = monster_hp_percent.load();
+        view.spanish = hud_spanish.load();
         return view;
     }
 
@@ -766,26 +793,81 @@ struct Ini {
         t.erase(t.find_last_not_of(ws) + 1);
         return t;
     }
+    // The file is shared with the launcher (and the player's text editor), so what is in memory here goes old: only the keys set
+    // since the last save are written, over what the file holds at that moment (Save). The launcher does the same.
+    std::set<std::string> changed;
+    std::vector<std::string> repeated;  // keys that were in the file more than once (for the log)
+
+    // (paths are UTF-8, as SDL gives them: the wide functions, so that a folder with accents works)
+    static std::wstring Wide(const std::string& text) {
+        const int n = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+        std::wstring wide(static_cast<std::size_t>(std::max(n, 1)), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, wide.data(), n);
+        wide.resize(static_cast<std::size_t>(std::max(n - 1, 0)));
+        return wide;
+    }
+    struct FileLock {  // one writer at a time: the launcher takes the same named mutex
+        HANDLE handle = CreateMutexW(nullptr, FALSE, L"Local\\Caravan4URecomp.ini");
+        FileLock() { if (handle) WaitForSingleObject(handle, 3000); }
+        ~FileLock() { if (handle) { ReleaseMutex(handle); CloseHandle(handle); } }
+    };
+    enum class Read { Ok, Missing, Failed };
+    static Read ReadLines(const std::string& file, std::vector<std::string>* out) {
+        const std::wstring wide = Wide(file);
+        for (int attempt = 0; attempt < 10; ++attempt) {  // an editor or an antivirus can hold the file for a moment
+            if (FILE* f = _wfopen(wide.c_str(), L"rb")) {
+                std::string all;
+                char buf[4096];
+                std::size_t n;
+                while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) all.append(buf, n);
+                const bool failed = std::ferror(f) != 0;
+                std::fclose(f);
+                if (!failed) {
+                    if (all.compare(0, 3, "\xEF\xBB\xBF") == 0) all.erase(0, 3);  // a byte order mark
+                    std::size_t pos = 0;
+                    while (pos <= all.size()) {
+                        const std::size_t end = all.find('\n', pos);
+                        const std::string line = Trim(all.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+                        if (!line.empty() && line.rfind("# -- ", 0) != 0) out->push_back(line);
+                        if (end == std::string::npos) break;
+                        pos = end + 1;
+                    }
+                    return Read::Ok;
+                }
+            } else if (GetFileAttributesW(wide.c_str()) == INVALID_FILE_ATTRIBUTES &&
+                       (GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND)) {
+                return Read::Missing;
+            }
+            Sleep(50);
+        }
+        return Read::Failed;
+    }
+    // A key that is there twice (a line added by hand under an older one): the last one counts, and stays in the first one's place
+    void DropRepeats() {
+        std::map<std::string, std::size_t> first;
+        std::vector<std::string> kept;
+        repeated.clear();
+        for (const std::string& line : lines) {
+            std::string k, v;
+            if (KeyOf(line, &k, &v)) {
+                const auto [at, added] = first.emplace(k, kept.size());
+                if (!added) {
+                    kept[at->second] = line;
+                    repeated.push_back(k);
+                    continue;
+                }
+            }
+            kept.push_back(line);
+        }
+        lines = std::move(kept);
+    }
     void Load(const std::string& file) {
         path = file;
         const std::size_t slash = file.find_last_of("\\/");
         exedir = slash == std::string::npos ? std::string(".") : file.substr(0, slash);
-        if (FILE* f = std::fopen(file.c_str(), "rb")) {
-            std::string all;
-            char buf[4096];
-            std::size_t n;
-            while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) all.append(buf, n);
-            std::fclose(f);
-            if (all.compare(0, 3, "\xEF\xBB\xBF") == 0) all.erase(0, 3);  // a byte order mark
-            std::size_t pos = 0;
-            while (pos <= all.size()) {
-                const std::size_t end = all.find('\n', pos);
-                const std::string line = Trim(all.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
-                if (!line.empty() && line.rfind("# -- ", 0) != 0) lines.push_back(line);
-                if (end == std::string::npos) break;
-                pos = end + 1;
-            }
-        }
+        changed.clear();
+        if (ReadLines(file, &lines) == Read::Failed) std::fprintf(stderr, "mh4u-win: settings: the file could not be read\n");
+        DropRepeats();
     }
     static bool KeyOf(const std::string& line, std::string* key, std::string* value) {
         if (line.empty() || line[0] == '#') return false;
@@ -813,11 +895,14 @@ struct Ini {
         for (auto& line : lines) {
             std::string k, v;
             if (KeyOf(line, &k, &v) && k == key) {
+                if (v == value) return;  // nothing changed: what the file says now stays
                 line = key + " = " + value;
+                changed.insert(key);
                 return;
             }
         }
         lines.push_back(key + " = " + value);
+        changed.insert(key);
     }
     // The file as it is written: the header comment, then the settings in groups ("# -- Video --"...), one blank line between groups,
     // and whatever is not known (other keys, other comments) at the end in its own order.
@@ -826,11 +911,11 @@ struct Ini {
         static const Group kGroups[] = {
             {"Game", {"game", "code", "user", "options"}},
             {"Video", {"scale", "fullscreen", "width", "height", "display", "vsync", "fps", "steady", "effects", "aspect", "widescreen", "mode",
-                       "touch_show", "popup_size", "popup_corner", "hide_help", "antialiasing", "bloom", "motion_blur", "depth_of_field", "radial_blur", "haze", "dither", "fov", "fps_counter", "pace", "gpu_thread", "hd_textures", "hd_texture_max", "upscaler", "fsr_quality"}},
+                       "touch_show", "popup_size", "popup_corner", "hide_help", "antialiasing", "bloom", "motion_blur", "depth_of_field", "radial_blur", "haze", "dither", "fov", "fps_counter", "pace", "gpu_thread", "shader_fallback","hd_textures", "hd_texture_max", "upscaler", "fsr_quality"}},
             {"Audio", {"volume"}},
             {"Controls", {"kick", "target", "skip_end", "skip_end_hold", "skip_key", "skip_pad", "map_key", "map_pad", "circle_pad_pro", "mouse_camera", "hid_pads", "hidhide_ask"}},
             {"Online", {"nick", "join_address", "host_port", "lobby", "online_touch"}},
-            {"Mods", {"monster_hp", "qol_hold_gather", "qol_flex_cancel", "qol_sharpen_cancel", "qol_rewards_no_limit", "rewards_send_all", "invincible", "inf_items", "hud_scale", "hud_parts", "hud_scale_clock", "hud_scale_bars", "hud_scale_sharpness", "hud_scale_party", "hud_scale_map", "hud_scale_target", "hud_scale_items"}},
+            {"Mods", {"monster_hp", "qol_hold_gather", "qol_flex_cancel", "qol_sharpen_cancel", "qol_rewards_no_limit", "rewards_send_all", "invincible", "inf_items", "damage_mult", "damage_meter", "monster_hp_size", "monster_hp_pos", "monster_hp_percent", "hud_scale", "hud_parts", "hud_scale_clock", "hud_scale_bars", "hud_scale_sharpness", "hud_scale_party", "hud_scale_map", "hud_scale_target", "hud_scale_items"}},
             {"Other", {"language", "discord_presence", "auto_backup", "trace_panels"}},
         };
         std::vector<std::string> out;
@@ -869,16 +954,41 @@ struct Ini {
         }
         return out;
     }
-    void Save() const {
-        if (path.empty()) return;
-        const std::string temp = path + ".tmp";
-        if (FILE* f = std::fopen(temp.c_str(), "wb")) {
-            for (const auto& line : Tidy()) std::fprintf(f, "%s\r\n", line.c_str());
-            const bool ok = std::fflush(f) == 0;
-            std::fclose(f);
-            if (ok && MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return;
-            std::remove(temp.c_str());
+    // Reads the file again and writes it with only the keys changed here put over it; with nothing changed it is left alone.
+    // A failed save is said in the log and tried again with the next one.
+    void Save() {
+        if (path.empty() || changed.empty()) return;
+        const FileLock lock;
+        Ini merged;
+        const Read read = ReadLines(path, &merged.lines);
+        if (read == Read::Failed) {
+            std::fprintf(stderr, "mh4u-win: settings NOT saved: the file could not be read\n");
+            return;
         }
+        if (merged.lines.empty()) {
+            merged.lines = lines;  // no file yet (the first start), or an empty one: everything known here
+        } else {
+            merged.DropRepeats();
+            for (const std::string& line : lines) {
+                std::string k, v;
+                if (KeyOf(line, &k, &v) && changed.count(k)) merged.Set(k, v);
+            }
+        }
+        const std::wstring target = Wide(path), temp = Wide(path + ".tmp");
+        if (FILE* f = _wfopen(temp.c_str(), L"wb")) {
+            for (const auto& line : merged.Tidy()) std::fprintf(f, "%s\r\n", line.c_str());
+            const bool ok = std::fflush(f) == 0 && !std::ferror(f);
+            std::fclose(f);
+            for (int attempt = 0; ok && attempt < 10; ++attempt) {
+                if (MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                    changed.clear();
+                    return;
+                }
+                Sleep(50);
+            }
+            _wremove(temp.c_str());
+        }
+        std::fprintf(stderr, "mh4u-win: settings NOT saved: the file could not be written (read-only, or held by another program)\n");
     }
 };
 
@@ -914,8 +1024,9 @@ constexpr const char* kCreditsText =
 // Python and the compiler that come with the program, or download once) in a console window that shows its progress, and
 // goes on to the game when it is done.
 
+// (the wide function: the paths are UTF-8, and a folder with accents did "not exist": no first-start window there)
 bool PathExists(const std::string& path) {
-    return !path.empty() && GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    return !path.empty() && GetFileAttributesW(Ini::Wide(path).c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 struct PickState {
@@ -1003,6 +1114,40 @@ bool Has(const std::vector<std::string>& args, const char* name) {
     return false;
 }
 
+// The items' names of the player's own game in the menu's language ("spa" or "eng"), "number|name" a line: from the game
+// folder's item_names.txt, which the first start writes (tools/monster_names.py). A game set up by an older version has no
+// such file: it is made now, with the package's own Python, when it is there.
+std::string ItemNames(const std::string& exedir, const std::string& game, const std::string& lang) {
+    if (game.empty()) return {};
+    const std::filesystem::path file(Ini::Wide(game + "/item_names.txt"));
+    std::error_code ec;
+    if (!std::filesystem::exists(file, ec)) {
+        const std::wstring python = Ini::Wide(exedir + "\\game-tools\\python\\python.exe");
+        const std::wstring tool = Ini::Wide(exedir + "\\game-tools\\tools\\monster_names.py");
+        if (std::filesystem::exists(python, ec) && std::filesystem::exists(tool, ec)) {
+            std::wstring command = L"\"" + python + L"\" -B \"" + tool + L"\" \"" + Ini::Wide(game) + L"\"";
+            STARTUPINFOW startup{};
+            startup.cb = sizeof startup;
+            PROCESS_INFORMATION process{};
+            if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+                WaitForSingleObject(process.hProcess, 30000);
+                CloseHandle(process.hThread);
+                CloseHandle(process.hProcess);
+            }
+        }
+    }
+    std::ifstream names(file);
+    std::string out;
+    for (std::string line; std::getline(names, line);) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::size_t a = line.find('\t'), b = a == std::string::npos ? a : line.find('\t', a + 1);
+        if (b == std::string::npos || line.compare(0, a, lang) != 0) continue;
+        out += line.substr(a + 1, b - a - 1) + "|" + line.substr(b + 1) + "\n";
+    }
+    std::printf("mh4u-win: item names (%s): %zu bytes\n", lang.c_str(), out.size());
+    return out;
+}
+
 int Fail(const char* what, const std::string& why) {
     std::fprintf(stderr, "mh4u-win: %s: %s\n", what, why.c_str());
     return 3;
@@ -1022,16 +1167,22 @@ int main(int argc, char** argv) {
                 std::freopen("CONOUT$", "w", stderr);
             } else {
                 const char* base = SDL_GetBasePath();
-                const std::string log = std::string(base ? base : "") + "Caravan4URecomp.log";
+                // (wide paths: SDL gives UTF-8, and in a folder with accents there was no log at all)
+                const std::wstring log = Ini::Wide(std::string(base ? base : "") + "Caravan4URecomp.log");
                 // the log of the run before is kept as Caravan4URecomp.previous.log (only these two exist)
                 {
                     std::error_code rotate_ec;
-                    const std::filesystem::path previous = std::filesystem::path(log).replace_extension(".previous.log");
+                    const std::filesystem::path previous = std::filesystem::path(log).replace_extension(L".previous.log");
                     if (std::filesystem::exists(log, rotate_ec)) std::filesystem::rename(log, previous, rotate_ec);
                     if (rotate_ec) std::filesystem::remove(previous, rotate_ec), std::filesystem::rename(log, previous, rotate_ec);
                 }
-                std::freopen(log.c_str(), "w", stdout);
-                std::freopen(log.c_str(), "w", stderr);
+                // both streams write through one open file: two opens of it keep a write position each, and one's lines then
+                // overwrite the other's (the start of the log, with the GPU's data, was lost that way). stderr is opened first only
+                // to give it a descriptor (a windows-subsystem program starts without one), then it is made a copy of stdout's.
+                if (_wfreopen(log.c_str(), L"w", stdout) && _wfreopen(log.c_str(), L"a", stderr)) {
+                    _dup2(_fileno(stdout), _fileno(stderr));
+                    std::setvbuf(stdout, nullptr, _IONBF, 0);  // unbuffered like stderr: the lines stay in order, even in a crash
+                }
             }
         }
         std::setvbuf(stderr, nullptr, _IONBF, 0);
@@ -1040,6 +1191,18 @@ int main(int argc, char** argv) {
     {
         const char* base = SDL_GetBasePath();
         ini.Load(std::string(base ? base : "") + "Caravan4URecomp.ini");
+    }
+    // which file was read and what it says: the first thing to look at when a change "was not applied"
+    std::fprintf(stderr, "mh4u-win: settings file: %s\n", ini.path.c_str());
+    for (const std::string& key : ini.repeated) {
+        std::fprintf(stderr, "mh4u-win: settings: '%s' is there more than once; the last line counts\n", key.c_str());
+    }
+    {
+        std::string read;
+        for (const char* key : {"scale", "fullscreen", "vsync", "fps", "gpu_thread", "shader_fallback", "hd_textures", "mode", "widescreen"}) {
+            read += std::string(" ") + key + "=" + ini.Get(key, "(default)");
+        }
+        std::fprintf(stderr, "mh4u-win: settings read:%s\n", read.c_str());
     }
     const auto on = [](const std::string& v, bool fallback) {
         return v.empty() ? fallback : (v != "off" && v != "0" && v != "false");
@@ -1061,6 +1224,11 @@ int main(int argc, char** argv) {
 #endif
     bool show_fps = on(ini.Get("fps_counter"), false);  // the counter over the game: off unless the settings say so
     bool show_monster_hp = on(ini.Get("monster_hp"), false);  // the life of the monster being fought, over the game (read only)
+    bool show_damage = on(ini.Get("damage_meter"), false);    // what that monster has taken: total, damage a second, last hit (read only)
+    int monster_hp_size = std::clamp(std::atoi(ini.Get("monster_hp_size", "100").c_str()), 50, 200);
+    std::string monster_hp_pos = ini.Get("monster_hp_pos", "right");  // right | left | middle
+    bool monster_hp_percent = on(ini.Get("monster_hp_percent"), false);
+    const auto pos_index = [](const std::string& v) { return v == "left" ? 1 : v == "middle" ? 2 : 0; };
     std::string volume_value = ini.Get("volume", "50");  // percent, 0 to 100
     int display_index = std::atoi(ini.Get("display", "-1").c_str());  // -1: the first display that is not the primary
     bool force_setup = false;
@@ -1200,6 +1368,12 @@ int main(int argc, char** argv) {
         if (ini.Get("trace_panels") == "on" && !std::getenv("MH4U_TRACE_PANELS")) _putenv_s("MH4U_TRACE_PANELS", "1");
         // hd_textures = off: no texture pack is read (the folder stays as it is), to compare with and without
         if (!on(ini.Get("hd_textures"), true) && !std::getenv("MH4N_HD_TEXTURES")) _putenv_s("MH4N_HD_TEXTURES", "0");
+        // shader_fallback = on (off by default): while a new pipeline is being built, its draws take the general shader (when that
+        // one is ready) instead of being left out, which keeps the last whole picture on screen until the build ends
+        if (on(ini.Get("shader_fallback"), false) && !std::getenv("MH4N_PIPELINE_FALLBACK")) {
+            _putenv_s("MH4N_PIPELINE_FALLBACK", "1");
+            std::fprintf(stderr, "mh4u-win: shader fallback on (settings: shader_fallback)\n");
+        }
         // hd_texture_max = 512 | 1024 | 2048 | 4096 (off: none): a pack texture larger than that is reduced before it is uploaded (little GPU memory)
         if (const std::string cap = ini.Get("hd_texture_max"); !cap.empty() && cap != "off" && !std::getenv("MH4N_HD_MAX_SIZE")) _putenv_s("MH4N_HD_MAX_SIZE", cap.c_str());
         // widescreen = 16:9 | 16:10 | 21:9 | match (off: none): the top screen is drawn that much wider (more scene at the sides,
@@ -1235,6 +1409,59 @@ int main(int argc, char** argv) {
         const bool have_setup = PathExists(ini.exedir + "\\PrepareGame.ps1");
         const bool configured = PathExists(ini.Get("game")) && PathExists(ini.Get("code"));
         need_setup = !args_from_command_line && have_setup && (force_setup || !configured);
+    }
+    const auto user_folder = [&]() -> std::string {  // the --user of the game's arguments ("" when none)
+        for (std::size_t i = 0; i + 1 < game_args.size(); ++i) {
+            if (game_args[i] == "--user") return game_args[i + 1];
+        }
+        return {};
+    };
+    if (!ini.Get("backup_dir").empty()) savemgr::g_backup_dir = std::filesystem::path(WideFromUtf8(ini.Get("backup_dir")));
+    const auto not_started = [&](const std::string& english, const std::string& spanish) {
+        std::fprintf(stderr, "mh4u-win: not started: %s\n", english.c_str());
+        if (!std::getenv("MH4U_TEST_SCRIPT")) {
+            std::string lang = ini.Get("language", "auto");
+            if (lang != "es" && lang != "en") {
+                wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+                GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
+                lang = name[0] == L'e' && name[1] == L's' ? "es" : "en";
+            }
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Caravan4URecomp", (lang == "es" ? spanish : english).c_str(), nullptr);
+        }
+    };
+    // Before a game runs on a user folder (save_manager.h): one game at a time on it; then a restore that was asked for is
+    // done, and one that was cut short is undone. All before the window, and before the HID start guard goes up: a start that
+    // ends here says nothing about the HID reading. False: the game must not start.
+    savemgr::UserLock user_lock;
+    const auto claim_saves = [&]() -> bool {
+        const std::string folder = user_folder();
+        if (folder.empty()) return true;
+        const std::filesystem::path path(WideFromUtf8(folder));
+        if (!user_lock.Acquire(path, 10000)) {
+            not_started("A game is already open with these saves. Close it before opening another.\n\n"
+                        "If you cannot see its window, it may still be closing.",
+                        "Ya hay un juego abierto con estas partidas. Ciérralo antes de abrir otro.\n\n"
+                        "Si no ves su ventana, puede que todavía se esté cerrando.");
+            return false;
+        }
+        const std::string restored = savemgr::ApplyPendingRestore(path);
+        if (!restored.empty()) std::printf("mh4u-win: saves: %s\n", restored.c_str());
+        if (!savemgr::RestoreUnfinished(path)) return true;
+        const std::string where = "\n\n" + folder;
+        not_started("A restore of your saves could not be finished or undone yet, so the game was not started: nothing is lost "
+                    "this way.\n\nClose the programs that may be using your saves (file explorer, antivirus, cloud sync) and "
+                    "open the game again. If this goes on, delete nothing: the saves of before the restore are in the "
+                    "'before-restore' backup, and what was not put back yet is in the .restore-old folder here:" + where,
+                    "Todavía no se pudo terminar ni deshacer una restauración de tus partidas, así que el juego no "
+                    "se abrió: de esta forma no se pierde nada.\n\nCierra los programas que puedan estar usando tus partidas "
+                    "(explorador de archivos, antivirus, sincronización en la nube) y abre el juego otra vez. Si sigue igual, "
+                    "no borres nada: las partidas de antes de restaurar están en la copia 'before-restore', y lo que "
+                    "aún no volvió a su sitio está en la carpeta .restore-old de aquí:" + where);
+        return false;
+    };
+    if (!need_setup && !game_args.empty() && !claim_saves()) {
+        SDL_Quit();
+        return 4;
     }
     // The window opens on the primary display, centred there. A test run (MH4U_TEST_SCRIPT or MH4U_SECONDARY set) opens on the
     // first display that is not the primary instead; a machine with one display uses it. --display N picks display N (0 is the
@@ -1356,7 +1583,11 @@ int main(int argc, char** argv) {
     (*presenter)->SetUiLayer(&g_cursor);
     g_cursor.show_fps.store(show_fps);
     g_cursor.show_monster_hp.store(show_monster_hp);
-    Port::MonsterHp::Enabled().store(show_monster_hp);
+    g_cursor.show_damage.store(show_damage);
+    g_cursor.monster_hp_size.store(monster_hp_size);
+    g_cursor.monster_hp_pos.store(pos_index(monster_hp_pos));
+    g_cursor.monster_hp_percent.store(monster_hp_percent);
+    Port::MonsterHp::Enabled().store(show_monster_hp || show_damage);
     {
         std::string hud_lang = ini.Get("language", "auto");
         if (hud_lang != "es" && hud_lang != "en") {
@@ -1367,7 +1598,7 @@ int main(int argc, char** argv) {
         g_cursor.hud_spanish.store(hud_lang == "es");
         // the names of the monsters, in the language of the menu (spa or eng; the file is written from the user's own game)
         if (show_monster_hp && !ini.Get("game").empty()) {
-            std::ifstream names(ini.Get("game") + "/monster_names.txt");  // (a narrow path, as PathExists reads it: a u8string path throws "locale not supported" here)
+            std::ifstream names(std::filesystem::path(Ini::Wide(ini.Get("game") + "/monster_names.txt")));  // (the wide path: a u8string one throws "locale not supported" here)
             const std::string want = hud_lang == "es" ? "spa" : "eng";
             for (std::string line; std::getline(names, line);) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -1388,18 +1619,12 @@ int main(int argc, char** argv) {
     auto pads = std::make_unique<HidAugmentedPads>(mh4n::app::MakeSdlGamepads());
     const char* hid_env = std::getenv("MH4U_HID_PADS");
     bool hid_wanted = on(ini.Get("hid_pads"), true) && !(hid_env && std::string(hid_env) == "0");
-    if (hid_wanted && hidpads::GuardTripped()) {  // the last start died inside the HID reading: leave it off, the game opens anyway
-        std::fprintf(stderr, "mh4u-win: HID pads stay off: the last start ended inside their reading (MH4U_HID_FORCE=1 tries again)\n");
+    if (hid_wanted && hidpads::GuardTripped()) {  // a start ended inside the HID reading: leave it off, the game opens anyway
+        std::fprintf(stderr, "mh4u-win: HID pads off for this start: an earlier one ended inside their reading (after one such end the "
+                             "next start tries again; two in a row keep them off; MH4U_HID_FORCE=1 tries now)\n");
         hid_wanted = false;
     }
     const bool hid_on = hid_wanted;
-    const auto hid_started_at = std::chrono::steady_clock::now();
-    bool hid_guard_armed = false;
-    if (hid_on) {
-        hidpads::ArmGuard();
-        hid_guard_armed = true;
-        hidpads::Start();
-    }
     // HidHide (DSX's leftover) hides a PlayStation pad from every program not on its list: offer to add this one (once; "No" is kept)
     if (hid_on && game && !std::getenv("MH4U_TEST_SCRIPT") && on(ini.Get("hidhide_ask"), true)) {
         wchar_t exe_buffer[MAX_PATH] = {};
@@ -1440,6 +1665,15 @@ int main(int argc, char** argv) {
                 ini.Save();
             }
         }
+    }
+    // the start guard goes up only now: the HidHide question above (and its administrator prompt) can be left waiting or be closed
+    // by force, which says nothing about the HID reading
+    const auto hid_started_at = std::chrono::steady_clock::now();
+    bool hid_guard_armed = false;
+    if (hid_on) {
+        hidpads::ArmGuard();
+        hid_guard_armed = true;
+        hidpads::Start();
     }
     mh4n::app::InputMapper mapper(pads.get());
     // The mouse is the stylus (the touch screen) by default. The Azahar app's "auto" mode turns it into the camera as soon
@@ -1486,18 +1720,9 @@ int main(int argc, char** argv) {
     };
 
     std::thread game_thread;
-    const auto user_folder = [&]() -> std::string {  // the --user of the game's arguments ("" when none)
-        for (std::size_t i = 0; i + 1 < game_args.size(); ++i) {
-            if (game_args[i] == "--user") return game_args[i + 1];
-        }
-        return {};
-    };
     const auto user_path = [&] { return std::filesystem::path(WideFromUtf8(user_folder())); };
-    if (!ini.Get("backup_dir").empty()) savemgr::g_backup_dir = std::filesystem::path(WideFromUtf8(ini.Get("backup_dir")));
     const auto start_game = [&] {
-        if (!user_folder().empty()) {  // the saves: a restore that was asked for, then a backup of them as they are
-            const std::string restored = savemgr::ApplyPendingRestore(user_path());
-            if (!restored.empty()) std::printf("mh4u-win: saves: %s\n", restored.c_str());
+        if (!user_folder().empty()) {  // (claim_saves came first) a backup of the saves as they are
             for (const std::string& n : modmgr::DisableCodeMods(user_folder())) {
                 std::printf("mh4u-win: mods: %s changes the game's code, which this program can't use: turned off\n", n.c_str());
             }
@@ -1675,6 +1900,10 @@ int main(int argc, char** argv) {
         }
         if (key == "fps_counter") return show_fps ? "on" : "off";
         if (key == "monster_hp") return show_monster_hp ? "on" : "off";
+        if (key == "damage_meter") return show_damage ? "on" : "off";
+        if (key == "monster_hp_size") return std::to_string(monster_hp_size);
+        if (key == "monster_hp_pos") return monster_hp_pos;
+        if (key == "monster_hp_percent") return monster_hp_percent ? "on" : "off";
         if (key == "scale") return scale_value == "auto" ? scale_value : std::to_string(std::clamp(std::atoi(scale_value.c_str()), 1, 8));  // (9 and 10 of an older settings file read as 8)
         if (key == "volume") return volume_value;
         if (key == "system_language") {  // the language of Windows: "es" or "en"
@@ -1781,7 +2010,20 @@ int main(int argc, char** argv) {
         } else if (key == "monster_hp") {
             show_monster_hp = value == "on";
             g_cursor.show_monster_hp.store(show_monster_hp);
-            Port::MonsterHp::Enabled().store(show_monster_hp);
+            Port::MonsterHp::Enabled().store(show_monster_hp || show_damage);
+        } else if (key == "damage_meter") {
+            show_damage = value == "on";
+            g_cursor.show_damage.store(show_damage);
+            Port::MonsterHp::Enabled().store(show_monster_hp || show_damage);
+        } else if (key == "monster_hp_size") {
+            monster_hp_size = std::clamp(std::atoi(value.c_str()), 50, 200);
+            g_cursor.monster_hp_size.store(monster_hp_size);
+        } else if (key == "monster_hp_pos") {
+            monster_hp_pos = value;
+            g_cursor.monster_hp_pos.store(pos_index(value));
+        } else if (key == "monster_hp_percent") {
+            monster_hp_percent = value == "on";
+            g_cursor.monster_hp_percent.store(monster_hp_percent);
         } else if (key == "scale") {
             scale_value = value;  // read when the game starts
         } else if (key == "upscaler") {
@@ -1855,13 +2097,23 @@ int main(int argc, char** argv) {
             savemgr::CancelRestore(user_path());
             return "";
         }
+        if (name.rfind("item_names:", 0) == 0) {  // "number|name" a line, from the file made from the player's own game
+            return ItemNames(ini.exedir, ini.Get("game"), name.substr(11));
+        }
+        if (name.rfind("give:", 0) == 0) {  // "give:<item>:<count>:box|pouch" (the answer comes later: TakeGiveResult)
+            if (!game || g_game_done.load()) return "No game is running.";
+            const std::size_t a = name.find(':', 5), b = a == std::string::npos ? a : name.find(':', a + 1);
+            if (b == std::string::npos) return "";
+            Port::Hooks::GiveItem(std::atoi(name.c_str() + 5), std::atoi(name.c_str() + a + 1), name.compare(b + 1, std::string::npos, "box") == 0);
+            return "";
+        }
         if (name == "save_backup") {
             std::string error;
             const std::string made = savemgr::MakeBackup(user_path(), "", &error);
             return made.empty() ? error : "Backed up as " + made;
         }
         if (name.rfind("save_stage:", 0) == 0) {
-            return savemgr::StageRestore(user_path(), name.substr(11)) ? "It will be put back the next time the game starts." : "That backup is not there.";
+            return savemgr::StageRestore(user_path(), name.substr(11)) ? "It will be put back the next time the game starts." : "That backup cannot be restored: it is not there, it is empty or it is not whole.";
         }
         if (name.rfind("save_delete:", 0) == 0) {
             return savemgr::Delete(user_path(), name.substr(12)) ? "The backup was deleted." : "The backup could not be deleted.";
@@ -1938,7 +2190,7 @@ int main(int argc, char** argv) {
         ini.Load(ini.path);
         game_args = build_game_args();
         add_extras();
-        if (game_args.empty()) {
+        if (game_args.empty() || !claim_saves()) {
             running = false;
             return;
         }
@@ -1947,6 +2199,19 @@ int main(int argc, char** argv) {
         start_game();
     };
     bool size_dirty = false;  // the window was resized: its size is saved when it has been still for a second
+    // The window's size and mode go to the settings only when they change in this run: otherwise a value set in the launcher (or
+    // by hand) while the game was open would be put back when it closes. (The size to compare with is the one the window got,
+    // which can be smaller than the one asked for.)
+    const bool fullscreen_at_start = fullscreen;
+    int known_w = window_w, known_h = window_h;
+    if (!fullscreen && !(SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)) SDL_GetWindowSize(window, &known_w, &known_h);
+    const auto keep_window_size = [&](int w, int h) {
+        if (w < 320 || h < 240 || (w == known_w && h == known_h)) return;
+        known_w = w;
+        known_h = h;
+        ini.Set("width", std::to_string(w));
+        ini.Set("height", std::to_string(h));
+    };
     auto size_changed_at = std::chrono::steady_clock::now();
     bool touch_forced = false;  // F2: the popup shows whatever the game does
     auto touch_needed_at = std::chrono::steady_clock::now();
@@ -2404,12 +2669,12 @@ int main(int argc, char** argv) {
             if (!fullscreen && !(SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)) {
                 int w = 0, h = 0;
                 SDL_GetWindowSize(window, &w, &h);
-                if (w >= 320 && h >= 240) {
-                    ini.Set("width", std::to_string(w));
-                    ini.Set("height", std::to_string(h));
-                    ini.Save();
-                }
+                keep_window_size(w, h);
+                ini.Save();
             }
+        }
+        for (Port::Hooks::GiveResult given; Port::Hooks::TakeGiveResult(&given);) {
+            menu.ItemResult(static_cast<int>(given.why), given.item, given.asked, given.added, given.to_box);
         }
         if (menu.Update()) (*presenter)->RequestRedraw();
         if (g_popup.load()) {
@@ -2574,14 +2839,11 @@ int main(int argc, char** argv) {
     backend->reset();
     shutdown_step("the graphics device let go");
     if (!ini.path.empty()) {
-        ini.Set("fullscreen", fullscreen ? "on" : "off");
+        if (fullscreen != fullscreen_at_start) ini.Set("fullscreen", fullscreen ? "on" : "off");
         if (!fullscreen && !(SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)) {
             int w = 0, h = 0;
             SDL_GetWindowSize(window, &w, &h);
-            if (w >= 320 && h >= 240) {
-                ini.Set("width", std::to_string(w));
-                ini.Set("height", std::to_string(h));
-            }
+            keep_window_size(w, h);
         }
         ini.Save();
     }
