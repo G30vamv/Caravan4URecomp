@@ -427,4 +427,86 @@ Result ReadFormatInfo(const Archive& archive, FormatInfo& info) {
     return kResultSuccess;
 }
 
+Result WriteFormatInfo(const Archive& archive, const FormatInfo& info) {
+    std::array<u8, 16> bytes{};
+    Store32(bytes, 0, info.size);
+    Store32(bytes, 4, info.directories);
+    Store32(bytes, 8, info.files);
+    bytes[12] = info.duplicate ? 1 : 0;
+    std::error_code ec;
+    fs::create_directories(archive.metadata.parent_path(), ec);
+    if (ec)
+        return HostError(ec, MissingParent);
+    auto* stream = OpenStream(archive.metadata, "wb");
+    if (!stream)
+        return IoError;
+    const bool written = std::fwrite(bytes.data(), 1, bytes.size(), stream) == bytes.size();
+    return std::fclose(stream) == 0 && written ? kResultSuccess : IoError;
+}
+
+Result FormatSave(const Archive& archive, const FormatInfo& info) {
+    std::error_code ec;
+    fs::create_directories(archive.root, ec);
+    if (ec)
+        return HostError(ec, MissingParent);
+    for (fs::directory_iterator item(archive.root, ec), end; !ec && item != end; item.increment(ec)) {
+        std::error_code removed;
+        fs::remove_all(item->path(), removed);
+        if (removed)
+            return HostError(removed);
+    }
+    return ec ? HostError(ec) : WriteFormatInfo(archive, info);
+}
+
+Result CreateExtData(const Archive& archive, const FormatInfo& info, std::span<const u8> icon) {
+    std::error_code ec;
+    fs::create_directories(archive.root, ec);
+    if (ec)
+        return HostError(ec, MissingParent);
+    if (!icon.empty()) {
+        auto* stream = OpenStream(archive.metadata.parent_path() / "icon", "wb");
+        if (!stream)
+            return IoError;
+        const bool written = std::fwrite(icon.data(), 1, icon.size(), stream) == icon.size();
+        if (std::fclose(stream) != 0 || !written)
+            return IoError;
+    }
+    return WriteFormatInfo(archive, info);
+}
+
+Result MakePlayCoins(const fs::path& user) {
+    if (user.empty())
+        return Permission;
+    const auto container = user / "nand" / "data" / ConsoleId / "extdata" / "00048000" / "F000000B";
+    Archive archive;
+    archive.id = ArchiveId::SharedExt;
+    archive.root = container / "user";
+    archive.metadata = container / "metadata";
+    if (!Confined(user, archive.root) || !Confined(user, archive.metadata))
+        return Permission;
+    const auto file = archive.root / "gamecoin.dat";
+    std::error_code ec;
+    if (fs::exists(file, ec) && fs::exists(archive.metadata, ec))
+        return kResultSuccess;  // (what is there is the player's)
+    fs::create_directories(archive.root, ec);
+    if (ec)
+        return HostError(ec, MissingParent);
+    if (!fs::exists(file, ec)) {
+        // the console's defaults: magic, 42 coins (u16), 0 of today's, two step counts of 0, the date 2014-12-29
+        std::array<u8, 20> coins{};
+        Store32(coins, 0, 0x4F00u | (42u << 16));
+        coins[16] = 2014 & 0xFF;
+        coins[17] = 2014 >> 8;
+        coins[18] = 12;
+        coins[19] = 29;
+        auto* stream = OpenStream(file, "wb");
+        if (!stream)
+            return IoError;
+        const bool written = std::fwrite(coins.data(), 1, coins.size(), stream) == coins.size();
+        if (std::fclose(stream) != 0 || !written)
+            return IoError;
+    }
+    return fs::exists(archive.metadata, ec) ? kResultSuccess : WriteFormatInfo(archive, FormatInfo{});
+}
+
 }  // namespace mh4n::wp30

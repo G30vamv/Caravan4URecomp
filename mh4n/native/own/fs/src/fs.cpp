@@ -6,6 +6,7 @@
 #include "storage.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 
 #include "mh4n/registry.h"
@@ -264,8 +265,8 @@ public:
         Register(0x0812, "GetFreeBytes", &FsUser::GetFreeBytes);     // seq=35456, 35614
         Register(0x0817, "IsSdmcDetected", &FsUser::IsSdmcDetected); // seq=57
         Register(0x0845, "GetFormatInfo", &FsUser::GetFormatInfo);   // 3dbrew FS:GetFormatInfo
-        Register(0x084C, "FormatSaveData");
-        Register(0x0851, "CreateExtSaveData");
+        Register(0x084C, "FormatSaveData", &FsUser::FormatSaveData);
+        Register(0x0851, "CreateExtSaveData", &FsUser::CreateExtSaveData);
         Register(0x0861, "InitializeWithSdkVersion", &FsUser::InitializeVersion); // seq=21
         Register(0x0862, "SetPriority", &FsUser::SetPriority);      // seq=22
         Register(0x0863, "GetPriority", &FsUser::GetPriority);      // seq=33, 44, 266
@@ -315,12 +316,79 @@ private:
         request.MakeReply(2, 0).Push(kResultSuccess, !UserFolder().empty());
     }
 
+    // MODIFIED for the Windows port: the play coins are the console's to make (see MakePlayCoins).
+    void MakeConsoleData(ArchiveId id, const LowPath& path) const {
+        if (id == ArchiveId::SharedExt && path.IsBinary(12) && Load32(path.bytes, 4) == 0xF000000Bu && MakePlayCoins(UserFolder()) != kResultSuccess)
+            std::fprintf(stderr, "mh4n: the play coin data could not be made in the user folder\n");
+    }
+
+    // 3dbrew FS:FormatSaveData: archive id, path type and size, block size, directories, files, two bucket counts, duplicate.
+    void FormatSaveData(Request& request) {
+        const auto id = request.Pop<ArchiveId>();
+        const auto type = request.Pop<PathType>();
+        const auto size = request.Pop<u32>();
+        const auto blocks = request.Pop<u32>();
+        FormatInfo info{};
+        const auto directories = request.Pop<u32>();
+        const auto files = request.Pop<u32>();
+        request.Pop<u32>();
+        request.Pop<u32>();
+        const bool duplicate = request.Pop<u32>() != 0;
+        info = {blocks * 512, directories, files, duplicate};
+        Archive archive;
+        auto result = id == ArchiveId::Save ? Describe(id, PopPath(request, type, size), archive) : InvalidPath;
+        // (a save that is there is put aside first: until the game commits, a cut brings it back)
+        if (result == kResultSuccess && CheckArchive(archive) == kResultSuccess)
+            result = SaveGuard::For(UserFolder(), &archive).Prepare();
+        if (result == kResultSuccess)
+            result = FormatSave(archive, info);
+        std::fprintf(stderr, "mh4n: format save data: result %08X\n", static_cast<unsigned>(result));
+        ReplyResult(request, result);
+    }
+
+    // 3dbrew FS:CreateExtSaveData: media type, the id's low and high words, a reserved word, directories, files, a 64-bit
+    // size limit, the icon's size and its buffer.
+    void CreateExtSaveData(Request& request) {
+        const u32 media = request.Pop<u32>() & 0xFF;
+        const u32 low = request.Pop<u32>();
+        const u32 high = request.Pop<u32>();
+        request.Pop<u32>();
+        const u32 directories = request.Pop<u32>();
+        const u32 files = request.Pop<u32>();
+        const u64 limit = request.Pop<u64>();
+        const u32 icon_size = request.Pop<u32>();
+        const auto* buffer = request.PopMappedBuffer();
+        if (!buffer || !buffer->Readable()) {
+            ReplyResult(request, InvalidArgument);
+            return;
+        }
+        std::vector<u8> icon(std::min<std::size_t>({icon_size, buffer->Size(), 0x10000}));
+        if (!icon.empty() && !buffer->Read(icon.data(), 0, static_cast<u32>(icon.size())))
+            icon.clear();
+        std::array<u8, 12> id_bytes{};
+        Store32(id_bytes, 0, media == 0 ? 0u : 1u);
+        Store32(id_bytes, 4, low);
+        Store32(id_bytes, 8, high);
+        const LowPath path{PathType::Binary, id_bytes};
+        Archive archive;
+        auto result = Describe(media == 0 ? ArchiveId::SharedExt : ArchiveId::Ext, path, archive);
+        if (result == kResultSuccess)
+            result = CreateExtData(archive, {static_cast<u32>(limit), directories, files, false}, icon);
+        std::fprintf(stderr, "mh4n: create extra data %08X%08X on media %u: result %08X\n", static_cast<unsigned>(high),
+                     static_cast<unsigned>(low), static_cast<unsigned>(media), static_cast<unsigned>(result));
+        auto& reply = request.MakeReply(1, 2);
+        reply.Push(result);
+        reply.PushMappedBuffer(*buffer);
+    }
+
     void OpenArchive(Request& request) {
         const auto id = request.Pop<ArchiveId>();
         const auto type = request.Pop<PathType>();
         const auto size = request.Pop<u32>();
         Archive archive;
-        auto result = Describe(id, PopPath(request, type, size), archive);
+        const LowPath low = PopPath(request, type, size);
+        MakeConsoleData(id, low);
+        auto result = Describe(id, low, archive);
         if (result == kResultSuccess)
             result = CheckArchive(archive);
         u64 handle = 0;
@@ -388,6 +456,7 @@ private:
         const auto archive_path = PopPath(request, archive_type, archive_size);
         const auto file_path = PopPath(request, file_type, file_size);
         Archive archive;
+        MakeConsoleData(id, archive_path);
         auto result = Describe(id, archive_path, archive);
         if (result == kResultSuccess)
             result = CheckArchive(archive);

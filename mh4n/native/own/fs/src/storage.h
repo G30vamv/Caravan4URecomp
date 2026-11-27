@@ -109,6 +109,16 @@ Result OpenSaveFile(const fs::path& target, u32 flags, FileData& data);
 Result ReadDirectory(const fs::path& target, std::vector<DirEntry>& entries);
 Result CreateSaveDirectory(const fs::path& target);
 Result DeleteSaveFile(const fs::path& target);
+// MODIFIED for the Windows port: what makes the saves of a player who has none yet.
+// The format information of an archive, as ReadFormatInfo reads it back.
+Result WriteFormatInfo(const Archive& archive, const FormatInfo& info);
+// FS:FormatSaveData: the save folder emptied (made when it is not there) and its format information written.
+Result FormatSave(const Archive& archive, const FormatInfo& info);
+// FS:CreateExtSaveData: the extra data's folder, format information and icon. Files that are there are never removed.
+Result CreateExtData(const Archive& archive, const FormatInfo& info, std::span<const u8> icon);
+// The shared extra data 0xF000000B with its play coin file: the console makes it when it starts (its PTM module), and the
+// game ends at once without it.
+Result MakePlayCoins(const fs::path& user);
 Result ReadFormatInfo(const Archive& archive, FormatInfo& info);
 
 }  // namespace mh4n::wp30
