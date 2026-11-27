@@ -9,6 +9,7 @@
 #include <map>
 
 #include "mh4n/registry.h"
+#include "mh4n/save_journal.h"
 #include "mh4n/service.h"
 
 namespace mh4n {
@@ -52,10 +53,28 @@ u64 TransferTicks(u32 bytes, bool romfs) {
     return romfs ? 180000 + 26ull * bytes : 10500 + 12ull * bytes;
 }
 
+// MODIFIED for the Windows port: what keeps the game's save data as last committed until the next commit (mh4n/save_journal.h).
+// Only the save data (ArchiveId::Save) has a commit; the extra data is written as before.
+struct SaveGuard {
+    fs::path user, root;  // `root` empty: nothing to keep (not the save data)
+
+    static SaveGuard For(const fs::path& user, const Archive* archive) {
+        return archive && archive->id == ArchiveId::Save ? SaveGuard{user, archive->root} : SaveGuard{};
+    }
+    // Before a change. When the way back cannot be kept, the change is refused: the save stays as it is.
+    Result Prepare() const {
+        if (root.empty()) return kResultSuccess;
+        const auto error = save_journal::Begin(user, root);
+        if (!error) return kResultSuccess;
+        std::fprintf(stderr, "mh4n: the save data was not changed: it could not be put aside first (%s)\n", error.message().c_str());
+        return IoError;
+    }
+};
+
 class FileSession final : public Service {
 public:
-    FileSession(ServiceContext& context, FileData data, u32 flags)
-        : Service(context, ServiceName), data_(std::move(data)), flags_(flags) {
+    FileSession(ServiceContext& context, FileData data, u32 flags, SaveGuard guard)
+        : Service(context, ServiceName), data_(std::move(data)), flags_(flags), guard_(std::move(guard)) {
         Register(0x0401, "Control");
         Register(0x0801, "OpenSubFile");
         Register(0x0802, "Read", &FileSession::Read);       // seq=24, 308
@@ -129,10 +148,11 @@ private:
             return Handled::Done;
         }
         return DeferIo(request, TransferTicks(size, false),
-                       [file = data_.file, offset, bytes = std::move(bytes), buffer, options]
+                       [file = data_.file, offset, bytes = std::move(bytes), buffer, options, guard = guard_]
                        (Request& pending) {
             u32 written = 0;
-            const auto result = file->Write(offset, bytes, written, (options & 1) != 0);
+            Result result = guard.Prepare();
+            if (result == kResultSuccess) result = file->Write(offset, bytes, written, (options & 1) != 0);
             auto reply = pending.NewReply(2, 2);
             reply.Push(result, written);
             reply.PushMappedBuffer(*buffer);
@@ -147,7 +167,9 @@ private:
 
     void SetSize(Request& request) {
         const auto size = request.Pop<u64>();
-        ReplyResult(request, data_ && (flags_ & WriteFlag) ? data_.file->Resize(size) : Permission);
+        Result result = data_ && (flags_ & WriteFlag) ? guard_.Prepare() : Permission;
+        if (result == kResultSuccess) result = data_.file->Resize(size);
+        ReplyResult(request, result);
     }
 
     void Close(Request& request) {
@@ -163,6 +185,7 @@ private:
 
     FileData data_;
     u32 flags_;
+    SaveGuard guard_;
 };
 
 class DirectorySession final : public Service {
@@ -388,6 +411,9 @@ private:
             } else {
                 fs::path target;
                 result = ResolvePath(UserFolder(), archive, path, target);
+                std::error_code ignored;
+                if (result == kResultSuccess && (flags & CreateFlag) && !fs::exists(target, ignored))
+                    result = SaveGuard::For(UserFolder(), &archive).Prepare();  // (opening it makes the file)
                 if (result == kResultSuccess)
                     result = OpenSaveFile(target, flags, data);
             }
@@ -401,7 +427,7 @@ private:
             state_->writers.emplace(archive.root, data.file);
         }
         ReplyObject(request, kResultSuccess, Context().CreateSession(
-            std::make_unique<FileSession>(Context(), std::move(data), flags)));
+            std::make_unique<FileSession>(Context(), std::move(data), flags, SaveGuard::For(UserFolder(), &archive))));
     }
 
     void OpenDir(Request& request) {
@@ -429,7 +455,8 @@ private:
         request.Pop<u32>(); // Attributes.
         const auto file_size = request.Pop<u64>();
         fs::path path;
-        const auto result = Target(handle, PopPath(request, type, size), path);
+        auto result = Target(handle, PopPath(request, type, size), path);
+        if (result == kResultSuccess) result = SaveGuard::For(UserFolder(), Find(handle)).Prepare();
         ReplyResult(request, result == kResultSuccess ? HostFile::Create(path, file_size) : result);
     }
 
@@ -440,7 +467,8 @@ private:
         const auto size = request.Pop<u32>();
         request.Pop<u32>(); // Attributes.
         fs::path path;
-        const auto result = Target(handle, PopPath(request, type, size), path);
+        auto result = Target(handle, PopPath(request, type, size), path);
+        if (result == kResultSuccess) result = SaveGuard::For(UserFolder(), Find(handle)).Prepare();
         ReplyResult(request, result == kResultSuccess ? CreateSaveDirectory(path) : result);
     }
 
@@ -450,7 +478,8 @@ private:
         const auto type = request.Pop<PathType>();
         const auto size = request.Pop<u32>();
         fs::path path;
-        const auto result = Target(handle, PopPath(request, type, size), path);
+        auto result = Target(handle, PopPath(request, type, size), path);
+        if (result == kResultSuccess) result = SaveGuard::For(UserFolder(), Find(handle)).Prepare();
         ReplyResult(request, result == kResultSuccess ? DeleteSaveFile(path) : result);
     }
 
@@ -471,6 +500,16 @@ private:
                     return;
                 }
             }
+        }
+        std::error_code ignored;
+        if (archive->id == ArchiveId::Save && fs::exists(save_journal::Journal(UserFolder()), ignored)) {  // MODIFIED: from here the changes count
+            if (const auto error = save_journal::Commit(UserFolder())) {
+                // (the game is told: the next start would put the save back as before this commit)
+                std::fprintf(stderr, "mh4n: the save data's commit failed (%s)\n", error.message().c_str());
+                ReplyResult(request, IoError);
+                return;
+            }
+            std::fprintf(stderr, "mh4n: save data committed\n");
         }
         ReplyResult(request, kResultSuccess);
     }

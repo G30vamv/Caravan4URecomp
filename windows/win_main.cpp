@@ -37,6 +37,7 @@
 #include "discord_presence.h"
 #include "mod_manager.h"
 #include "save_manager.h"
+#include "mh4n/save_journal.h"
 #include "hid_pads.h"
 #include "hidhide.h"
 #include "input/azahar_rules.h"
@@ -1442,6 +1443,22 @@ int main(int argc, char** argv) {
                         "If you cannot see its window, it may still be closing.",
                         "Ya hay un juego abierto con estas partidas. Ciérralo antes de abrir otro.\n\n"
                         "Si no ves su ventana, puede que todavía se esté cerrando.");
+            return false;
+        }
+        // first, a save the game was cut off while writing goes back as the game last finished it: before a restore, and
+        // before the automatic backup, which would copy the damaged one
+        const mh4n::save_journal::Recovery recovery = mh4n::save_journal::Recover(path);
+        if (!recovery.message.empty()) std::printf("mh4u-win: saves: %s\n", recovery.message.c_str());
+        if (recovery.stuck) {
+            not_started("A save of your game that was cut short could not be put back yet, so the game was not started: nothing is "
+                        "lost this way.\n\nClose the programs that may be using your saves (file explorer, antivirus, cloud sync) "
+                        "and open the game again. If this goes on, delete nothing: the save as the game last finished it is in the "
+                        ".save-journal folder here:\n\n" + folder,
+                        "Todav\u00eda no se pudo reponer una partida que se cort\u00f3 al guardar, as\u00ed que el juego no se "
+                        "abri\u00f3: de esta forma no se pierde nada.\n\nCierra los programas que puedan estar usando tus partidas "
+                        "(explorador de archivos, antivirus, sincronizaci\u00f3n en la nube) y abre el juego otra vez. Si sigue "
+                        "igual, no borres nada: la partida tal como el juego la termin\u00f3 por \u00faltima vez est\u00e1 en la "
+                        "carpeta .save-journal de aqu\u00ed:\n\n" + folder);
             return false;
         }
         const std::string restored = savemgr::ApplyPendingRestore(path);
