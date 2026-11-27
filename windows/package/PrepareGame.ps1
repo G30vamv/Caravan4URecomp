@@ -85,11 +85,11 @@ try {
     $lines = @()
     if (Test-Path -LiteralPath $ini) { $lines = @(Get-Content -LiteralPath $ini -Encoding UTF8) }
     function SetKey($key, $value) {
-        $found = $false
-        $script:lines = $script:lines | ForEach-Object {
-            if ($_ -match "^\s*#?\s*$key\s*=") { $found = $true; "$key = $value" } else { $_ }
-        }
-        if (-not $found) { $script:lines += "$key = $value" }
+        # (@( ) at each step: with no line or one, PowerShell hands back a plain text, and += would glue the keys into one line)
+        $script:lines = @($script:lines | ForEach-Object {
+            if ($_ -match "^\s*#?\s*$key\s*=") { "$key = $value" } else { $_ }
+        })
+        if (-not @($script:lines | Where-Object { $_ -match "^\s*$key\s*=" }).Count) { $script:lines = @($script:lines) + "$key = $value" }
     }
     SetKey "game" (Join-Path $out "folder")
     SetKey "code" $dll.FullName
