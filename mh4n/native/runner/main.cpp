@@ -132,7 +132,17 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (const auto dump = options.Get("--from-dump")) {
-        const auto comma = dump->find(',');
+        // MODIFIED for the Windows port: a file name may hold commas ("... (En,Fr,Es).3ds"), so the comma that separates the
+        // two is the one with a file on each side (the first one when none has: the message below then says what is wrong)
+        auto comma = dump->find(',');
+        for (auto at = comma; at != std::string::npos; at = dump->find(',', at + 1)) {
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(mh4n::utf8::PathFromUtf8(dump->substr(0, at)), ec) &&
+                std::filesystem::is_regular_file(mh4n::utf8::PathFromUtf8(dump->substr(at + 1)), ec)) {
+                comma = at;
+                break;
+            }
+        }
         std::string error;
         if (comma == std::string::npos ||
             !mh4n::fs::dump::PrepareGameFolder(dump->substr(0, comma), dump->substr(comma + 1),

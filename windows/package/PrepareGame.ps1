@@ -31,12 +31,13 @@ try {
     }
     $Base = Ask "Path of the decrypted BASE game (USA, .cia, .3ds or .cci)" $Base
     $Update = Ask "Path of the decrypted v1.3.0 UPDATE (USA, .cia)" $Update
-    if (-not (Test-Path $Base)) { throw "not found: $Base" }
-    if (-not (Test-Path $Update)) { throw "not found: $Update" }
+    # (-LiteralPath everywhere in this script: to PowerShell, [ ] in a path are wildcards, and dumps are often named "... [USA].cia")
+    if (-not (Test-Path -LiteralPath $Base -PathType Leaf)) { throw "not found: $Base" }
+    if (-not (Test-Path -LiteralPath $Update -PathType Leaf)) { throw "not found: $Update" }
 
     # the Python: the one in the package, else one on the PATH
     $python = Join-Path $tools "python\python.exe"
-    if (-not (Test-Path $python)) {
+    if (-not (Test-Path -LiteralPath $python)) {
         $found = Get-Command python -ErrorAction SilentlyContinue
         if (-not $found) { throw "no Python found (game-tools\python is missing from this package, and none is installed)." }
         $python = $found.Source
@@ -49,7 +50,7 @@ try {
     if (-not (Get-Command x86_64-w64-mingw32-clang -ErrorAction SilentlyContinue)) {
         Write-Host "No C compiler found: the first time, the part of llvm-mingw that building needs is downloaded (about 50 MB; needs Internet)."
         $fetchTool = Join-Path $root "fetch_toolchain.py"
-        if (Test-Path $fetchTool) {
+        if (Test-Path -LiteralPath $fetchTool) {
             & $python $fetchTool --dest (Join-Path $out "toolchain")
             if ($LASTEXITCODE -ne 0) { Write-Host "The small download did not work: the whole compiler is downloaded instead (about 190 MB)." }
         }
@@ -61,12 +62,12 @@ try {
     & $python (Join-Path $tools "tools\build_game.py") --dump $Update --romfs $Base --native --opt O1 --out $out @fetch
     if ($LASTEXITCODE -ne 0) { throw "the code library could not be built: read the messages above (a file that is encrypted, or that is not the USA v1.3.0 update, stops it here)." }
 
-    $dll = Get-ChildItem (Join-Path $out "recomp") -Filter "*_native.dll" | Select-Object -First 1
+    $dll = Get-ChildItem -LiteralPath (Join-Path $out "recomp") -Filter "*_native.dll" | Select-Object -First 1
     if (-not $dll) { throw "the code library was not made" }
 
     # the C and the objects the library was made from are only a cache for making it again: the game runs from the library
     # alone, and they take more than 500 MB
-    Remove-Item (Join-Path $out "recomp\src"), (Join-Path $out "recomp\obj") -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $out "recomp\src"), (Join-Path $out "recomp\obj") -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Host "Preparing the game folder..."
     $runner = Join-Path $tools "bin\mh4u_native_runner.exe"
@@ -77,12 +78,12 @@ try {
     & $python (Join-Path $tools "tools\monster_names.py") (Join-Path $out "folder") | Out-Null
 
     $user = Join-Path $out "user"
-    New-Item -ItemType Directory -Force $user | Out-Null
+    [void][IO.Directory]::CreateDirectory($user)
 
     # the settings file: the three paths, the rest as it is
     $ini = Join-Path $root "Caravan4URecomp.ini"
     $lines = @()
-    if (Test-Path $ini) { $lines = Get-Content $ini }
+    if (Test-Path -LiteralPath $ini) { $lines = @(Get-Content -LiteralPath $ini -Encoding UTF8) }
     function SetKey($key, $value) {
         $found = $false
         $script:lines = $script:lines | ForEach-Object {
@@ -93,7 +94,8 @@ try {
     SetKey "game" (Join-Path $out "folder")
     SetKey "code" $dll.FullName
     SetKey "user" $user
-    $lines | Set-Content $ini -Encoding ascii
+    # UTF-8 without a byte order mark, as the game and the launcher write it: a folder or a nickname with accents stays as it is
+    [IO.File]::WriteAllLines($ini, [string[]]@($lines), (New-Object Text.UTF8Encoding $false))
     Write-Host "Done."
     exit 0
 }
