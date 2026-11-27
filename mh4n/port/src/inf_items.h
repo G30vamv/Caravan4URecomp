@@ -40,16 +40,13 @@ inline bool OneUsed(const Slot& was, const Slot& now) {
     return now.id == was.id && now.count == was.count - 1;
 }
 
-// What the game puts in the gunner's pouch: ammunition and coatings (byte 0 of the item's row of the item table is 1 or 4).
-// Anything else left there is not taken out again when it is put in the item box, which copies it.
+// What the game puts in the gunner's pouch, whatever weapon the hunter carries: ammunition and coatings (byte 0 of the item's
+// row of the item table is 1 or 4). Anything else left there is not taken out again when it is put in the item box, which
+// copies it.
 inline bool IsAmmunition(std::uint8_t category) { return category == 1 || category == 4; }
-// The weapon classes the game calls a gunner's (0x00d04d84 with 1; the class is the byte at +0x31 of the hunter's data).
-inline bool IsGunner(std::uint8_t weapon_class) {
-    return weapon_class == 4 || weapon_class == 5 || weapon_class == 6 || weapon_class == 10 || weapon_class == 15;
-}
 
 // The slot an item handed to the hunter goes to: its own pile if there is one, else the first empty slot; -1 none. Only with
-// `gunner_pouch` (ammunition for a gunner) are the gunner's slots looked at, and they come first.
+// `gunner_pouch` (ammunition and coatings) are the gunner's slots looked at, and they come first.
 inline int SlotFor(const Pouch& pouch, std::uint16_t item, bool gunner_pouch) {
     const std::size_t first = gunner_pouch ? 0 : FIRST_ITEM_SLOT;
     for (std::size_t i = first; i < SLOTS; ++i) {

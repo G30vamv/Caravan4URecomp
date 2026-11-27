@@ -3204,11 +3204,9 @@ void GiveToPouch(RCtx* ctx, GiveResult* r) {
         r->why = GiveResult::NOT_ALLOWED;
         return;
     }
-    // where the game itself would put it: the gunner's pouch only for ammunition, and only for a gunner (it is not on the
-    // screen with other weapons)
+    // where the game itself would put it (0x006b5e..): ammunition and coatings in the gunner's pouch, whatever the weapon
     const u8 category = rd8(ctx, ITEM_TABLE + 20u * static_cast<u32>(r->item));
-    const u8 weapon_class = rd8(ctx, block + 0x31);
-    const bool gunner_pouch = InfItems::IsAmmunition(category) && InfItems::IsGunner(weapon_class);
+    const bool gunner_pouch = InfItems::IsAmmunition(category);
     const InfItems::Pouch pouch = ReadPouch(ctx, block);
     const int slot = InfItems::SlotFor(pouch, static_cast<u16>(r->item), gunner_pouch);
     const int held = slot < 0 || InfItems::Empty(pouch[slot]) ? 0 : pouch[slot].count;
@@ -3219,9 +3217,8 @@ void GiveToPouch(RCtx* ctx, GiveResult* r) {
     }
     wr16(ctx, block + 0x236 + 4 * static_cast<u32>(slot), static_cast<u16>(r->item));
     wr16(ctx, block + 0x238 + 4 * static_cast<u32>(slot), static_cast<u16>(held + r->added));
-    LogInfo("give: pouch slot {} ({} pouch; item category {}, weapon class {}): item {} x{} -> x{}", slot,
-            slot < static_cast<int>(InfItems::FIRST_ITEM_SLOT) ? "gunner's" : "item", category, weapon_class, r->item, held,
-            held + r->added);
+    LogInfo("give: pouch slot {} ({} pouch; item category {}): item {} x{} -> x{}", slot,
+            slot < static_cast<int>(InfItems::FIRST_ITEM_SLOT) ? "gunner's" : "item", category, r->item, held, held + r->added);
 }
 
 /// Once a frame (Frame, after the game's): one request, if any.
