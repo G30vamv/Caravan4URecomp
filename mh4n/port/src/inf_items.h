@@ -17,7 +17,10 @@
 
 namespace Port::InfItems {
 
-constexpr std::size_t SLOTS = 24;
+// The pouch's 32 slots, as the game's own code walks them (the item bar's next item, 0x00b31fa4, and the code that hands the
+// hunter items, 0x006b5e..): first the gunner's pouch, for ammunition and coatings, then the item pouch.
+constexpr std::size_t SLOTS = 32;
+constexpr std::size_t FIRST_ITEM_SLOT = 8;  // 0..7 the gunner's pouch, 8..31 the item pouch
 constexpr std::uint16_t NO_ITEM = 0x4d5;  // (an empty slot, as 0 is)
 constexpr std::uint32_t SETTLE_FRAMES = 30;  // of hunting, after anything else, before a drop is taken for a use
 
@@ -35,6 +38,27 @@ inline bool OneUsed(const Slot& was, const Slot& now) {
     if (Empty(was) || was.count < 1) return false;
     if (Empty(now)) return was.count == 1;
     return now.id == was.id && now.count == was.count - 1;
+}
+
+// What the game puts in the gunner's pouch: ammunition and coatings (byte 0 of the item's row of the item table is 1 or 4).
+// Anything else left there is not taken out again when it is put in the item box, which copies it.
+inline bool IsAmmunition(std::uint8_t category) { return category == 1 || category == 4; }
+// The weapon classes the game calls a gunner's (0x00d04d84 with 1; the class is the byte at +0x31 of the hunter's data).
+inline bool IsGunner(std::uint8_t weapon_class) {
+    return weapon_class == 4 || weapon_class == 5 || weapon_class == 6 || weapon_class == 10 || weapon_class == 15;
+}
+
+// The slot an item handed to the hunter goes to: its own pile if there is one, else the first empty slot; -1 none. Only with
+// `gunner_pouch` (ammunition for a gunner) are the gunner's slots looked at, and they come first.
+inline int SlotFor(const Pouch& pouch, std::uint16_t item, bool gunner_pouch) {
+    const std::size_t first = gunner_pouch ? 0 : FIRST_ITEM_SLOT;
+    for (std::size_t i = first; i < SLOTS; ++i) {
+        if (!Empty(pouch[i]) && pouch[i].id == item) return static_cast<int>(i);
+    }
+    for (std::size_t i = first; i < SLOTS; ++i) {
+        if (Empty(pouch[i])) return static_cast<int>(i);
+    }
+    return -1;
 }
 
 enum class Verdict {

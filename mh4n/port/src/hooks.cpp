@@ -3041,6 +3041,16 @@ void HunterProbe(RCtx* ctx) {
     }
 }
 
+/// The hunter's pouch as it is now (`block`: the hunter's data, [hunter + 0xe30]): slot n's item at +0x236 + 4n, its count
+/// at +0x238 + 4n.
+InfItems::Pouch ReadPouch(RCtx* ctx, u32 block) {
+    InfItems::Pouch pouch;
+    for (u32 slot = 0; slot < InfItems::SLOTS; ++slot) {
+        pouch[slot] = {static_cast<u16>(rd16(ctx, block + 0x236 + 4 * slot)), static_cast<s16>(rd16(ctx, block + 0x238 + 4 * slot))};
+    }
+    return pouch;
+}
+
 /// inf_items: why a drop in the pouch now cannot be the hunter using an item (nullptr when it can). It can only in a quest
 /// that is still on (not complete, failed or abandoned: the quest takes its supplies back a few seconds after, with the hunt's
 /// own screen still up), with that screen up (not the supply or item box, nor the screens between areas) and no menu.
@@ -3060,8 +3070,8 @@ const char* PouchNotHunting(RCtx* ctx, u32* status, u8* hud) {
 
 /// invincible and inf_items: found with probe_hunter on a real hunt (2026-11-23). The hunter's data block is the one at
 /// [hunter + 0xe30]: the hunter's HEALTH (it was taken for the sharpness at first) is the number at +0x35c (110, 107, 102... with each
-/// hit taken; +0x34c holds the maximum in its upper half) and the pouch's slot n (0-23 items) holds its item at +0x236 + 4n and the
-/// count at +0x238 + 4n (a potion used: 7 -> 6; the quest taking its supplies back writes 0 in both). The health is kept at the
+/// hit taken; +0x34c holds the maximum in its upper half) and the pouch is there too (ReadPouch; 32 slots, inf_items.h: a potion
+/// used: 7 -> 6; the quest taking its supplies back writes 0 in both). The health is kept at the
 /// highest it has been in this hunt. For the pouch, only what looks like a use is put back (inf_items.h says which: anything
 /// else put back could copy items into the save), and each change of it is logged with what was done.
 void HunterMods(RCtx* ctx) {
@@ -3105,10 +3115,7 @@ void HunterMods(RCtx* ctx) {
         }
     }
     if (options.inf_items) {
-        InfItems::Pouch pouch;
-        for (u32 slot = 0; slot < InfItems::SLOTS; ++slot) {
-            pouch[slot] = {static_cast<u16>(rd16(ctx, block + 0x236 + 4 * slot)), static_cast<s16>(rd16(ctx, block + 0x238 + 4 * slot))};
-        }
+        InfItems::Pouch pouch = ReadPouch(ctx, block);
         u32 status = 0;
         u8 hud = 0;
         const char* why = PouchNotHunting(ctx, &status, &hud);
@@ -3197,29 +3204,24 @@ void GiveToPouch(RCtx* ctx, GiveResult* r) {
         r->why = GiveResult::NOT_ALLOWED;
         return;
     }
-    int free_slot = -1;
-    for (u32 slot = 0; slot < InfItems::SLOTS; ++slot) {
-        const InfItems::Slot now{static_cast<u16>(rd16(ctx, block + 0x236 + 4 * slot)), static_cast<s16>(rd16(ctx, block + 0x238 + 4 * slot))};
-        if (!InfItems::Empty(now) && now.id == r->item) {  // (one pile an item: it is topped up)
-            r->added = std::clamp(pile - now.count, 0, r->asked);
-            if (r->added == 0) {
-                r->why = GiveResult::NO_ROOM;
-            } else {
-                wr16(ctx, block + 0x238 + 4 * slot, static_cast<u16>(now.count + r->added));
-                LogInfo("give: pouch slot {}: item {} x{} -> x{}", slot, r->item, now.count, now.count + r->added);
-            }
-            return;
-        }
-        if (free_slot < 0 && InfItems::Empty(now)) free_slot = static_cast<int>(slot);
-    }
-    if (free_slot < 0) {
+    // where the game itself would put it: the gunner's pouch only for ammunition, and only for a gunner (it is not on the
+    // screen with other weapons)
+    const u8 category = rd8(ctx, ITEM_TABLE + 20u * static_cast<u32>(r->item));
+    const u8 weapon_class = rd8(ctx, block + 0x31);
+    const bool gunner_pouch = InfItems::IsAmmunition(category) && InfItems::IsGunner(weapon_class);
+    const InfItems::Pouch pouch = ReadPouch(ctx, block);
+    const int slot = InfItems::SlotFor(pouch, static_cast<u16>(r->item), gunner_pouch);
+    const int held = slot < 0 || InfItems::Empty(pouch[slot]) ? 0 : pouch[slot].count;
+    r->added = slot < 0 ? 0 : std::clamp(pile - held, 0, r->asked);
+    if (r->added == 0) {
         r->why = GiveResult::NO_ROOM;
         return;
     }
-    r->added = std::min(pile, r->asked);
-    wr16(ctx, block + 0x236 + 4 * static_cast<u32>(free_slot), static_cast<u16>(r->item));
-    wr16(ctx, block + 0x238 + 4 * static_cast<u32>(free_slot), static_cast<u16>(r->added));
-    LogInfo("give: pouch slot {} (empty): item {} x{}", free_slot, r->item, r->added);
+    wr16(ctx, block + 0x236 + 4 * static_cast<u32>(slot), static_cast<u16>(r->item));
+    wr16(ctx, block + 0x238 + 4 * static_cast<u32>(slot), static_cast<u16>(held + r->added));
+    LogInfo("give: pouch slot {} ({} pouch; item category {}, weapon class {}): item {} x{} -> x{}", slot,
+            slot < static_cast<int>(InfItems::FIRST_ITEM_SLOT) ? "gunner's" : "item", category, weapon_class, r->item, held,
+            held + r->added);
 }
 
 /// Once a frame (Frame, after the game's): one request, if any.
