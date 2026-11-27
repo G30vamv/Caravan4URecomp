@@ -249,6 +249,42 @@ ConvertResult Convert(const ConvertOptions& options) {
         work.assign(used.begin(), used.end());
     }
 
+    // MODIFIED for the Windows port: never put an archive with less in it where one already is. Checked here, before hours of
+    // work, and again below with what was really converted. (An empty folder is refused even with nothing to lose.)
+    std::error_code ec;
+    if (work.empty()) {
+        return fail(ConvertResult::Status::Refused,
+                    "there is no texture to convert in " + options.pack_dir + ": nothing was written, an archive already there stays as it is");
+    }
+    std::vector<std::pair<u64, MapType>> kept; // what the archive at out_path holds now: none of it may be lost
+    if (!options.replace) {
+        const bool there = fs::exists(options.out_path, ec);
+        if (ec) {
+            return fail(ConvertResult::Status::Refused, options.out_path + ": cannot be looked at (" + ec.message() + "): nothing was written");
+        }
+        if (there) {
+            ArchiveReader old;
+            std::string why;
+            if (!old.Open(options.out_path, why)) {
+                return fail(ConvertResult::Status::Refused,
+                            why + ": the file there was not replaced (move it somewhere else, or use --replace)");
+            }
+            std::size_t lost = 0;
+            for (const ArchiveEntry& entry : old.entries()) {
+                kept.emplace_back(entry.hash, entry.type);
+                const auto found = pack.materials.find(entry.hash);
+                lost += old.use_new_hash() != pack.options.use_new_hash || found == pack.materials.end() ||
+                        found->second.file[static_cast<std::size_t>(entry.type)] < 0;
+            }
+            if (lost != 0) {
+                return fail(ConvertResult::Status::Refused,
+                            fmt::format("{} has {} textures that this folder does not have: it was not replaced (to make a new one from "
+                                        "only these files, move it somewhere else first, or use --replace)",
+                                        options.out_path, lost));
+            }
+        }
+    }
+
     const std::string part_path = options.out_path + ".part";
     const std::string journal_path = options.out_path + ".journal";
     const u32 fingerprint = Fingerprint(pack.options, options.quality, options.max_size);
@@ -257,7 +293,6 @@ ConvertResult Convert(const ConvertOptions& options) {
     std::map<std::string, Record> records;
     u64 resume_size = 0;
     u64 journal_valid = 0;
-    std::error_code ec;
     if (!options.restart && fs::exists(part_path, ec)) {
         journal_valid = ReadJournal(journal_path, fingerprint, records);
         for (const auto& [path, r] : records) {
@@ -482,14 +517,32 @@ ConvertResult Convert(const ConvertOptions& options) {
         }
     }
     result.textures = static_cast<u32>(entries.size());
+    // MODIFIED for the Windows port: the same check with what was really converted (a file that failed leaves its texture out).
+    // The finished work stays in the partial file, so a later run does not start again.
+    if (entries.empty()) {
+        return fail(ConvertResult::Status::Refused, "no texture could be converted: an archive already there stays as it is");
+    }
+    if (!kept.empty()) {
+        std::set<std::pair<u64, MapType>> made;
+        for (const ArchiveEntry& entry : entries) {
+            made.emplace(entry.hash, entry.type);
+        }
+        const auto lost = std::ranges::count_if(kept, [&](const auto& texture) { return !made.contains(texture); });
+        if (lost != 0) {
+            return fail(ConvertResult::Status::Refused,
+                        fmt::format("{} textures of the archive there could not be converted again: it was not replaced", lost));
+        }
+    }
     if (!writer.Finish(std::move(entries), error)) {
         return fail(ConvertResult::Status::IoError, error);
     }
     journal.close();
-    fs::remove(options.out_path, ec); // rename does not replace a file on Windows
+    // MODIFIED for the Windows port: the old archive is not removed first. rename puts the new one in its place in one step
+    // (it replaces a file), and when that fails (the game has it open) the old one is still there.
     fs::rename(part_path, options.out_path, ec);
     if (ec) {
-        return fail(ConvertResult::Status::IoError, options.out_path + ": " + ec.message());
+        return fail(ConvertResult::Status::IoError, options.out_path + ": " + ec.message() +
+                                                        " (is the game open?): the file there is as it was, the finished work is in " + part_path);
     }
     fs::remove(journal_path, ec);
     result.archive_bytes = fs::file_size(options.out_path, ec);

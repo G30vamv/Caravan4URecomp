@@ -34,6 +34,10 @@ struct ConvertOptions {
     u32 threads = 0; // 0: the number of hardware threads
     Bc7Quality quality;
     bool restart = false; // ignore the partial work of an earlier run
+    // MODIFIED for the Windows port: an archive already at `out_path` is replaced only when the new one has every texture it
+    // has (the launcher's button, pressed with the PNG files already deleted, used to leave an empty archive in its place).
+    // true replaces it whatever it holds.
+    bool replace = false;
     // MODIFIED for the Windows port: a texture whose longer side is above this is halved (the levels of its mip chain) until it is not;
     // 0: every texture keeps its size. Only RGBA8 sources (PNG) are reduced.
     u32 max_size = 0;
@@ -45,7 +49,8 @@ struct ConvertOptions {
 };
 
 struct ConvertResult {
-    enum class Status { Ok, Cancelled, BadPack, IoError };
+    // Refused: nothing was written over the archive at `out_path` (see ConvertOptions::replace), or there was nothing to convert.
+    enum class Status { Ok, Cancelled, BadPack, IoError, Refused };
     Status status = Status::Ok;
     std::string error;
     ConvertProgress progress;

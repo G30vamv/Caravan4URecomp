@@ -19,6 +19,7 @@ MH4N_OPTION("hdpack", "--quality", "Q", "BC7 effort: fast, normal (default) or h
 MH4N_OPTION("hdpack", "--restart", "", "ignore the partial work of an interrupted run");
 MH4N_OPTION("hdpack", "--max-size", "PX", "halve a texture until its longer side is at most PX (default: keep every size)");
 MH4N_OPTION("hdpack", "--verify", "", "after writing, check every blob against its CRC");
+MH4N_OPTION("hdpack", "--replace", "", "replace the archive at OUT even if the new one has fewer textures than it");
 
 namespace {
 
@@ -64,6 +65,7 @@ int RunHdPack(const std::vector<std::string>& args, std::ostream& out, std::ostr
         return 2;
     }
     convert.restart = options.Has("--restart");
+    convert.replace = options.Has("--replace");
     try {
         convert.max_size = static_cast<u32>(options.GetUInt("--max-size", 0));
     } catch (const OptionError& e) {
@@ -97,6 +99,9 @@ int RunHdPack(const std::vector<std::string>& args, std::ostream& out, std::ostr
     case ConvertResult::Status::Cancelled:
         out << "hdpack: interrupted; run the same command again to continue\n";
         return 4;
+    case ConvertResult::Status::Refused:
+        err << "mh4n_hdpack: " << result.error << "\n";
+        return 5;
     case ConvertResult::Status::Ok:
         break;
     }
