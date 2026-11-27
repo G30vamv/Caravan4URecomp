@@ -186,11 +186,17 @@ def install(user_dir, dropped):
     while os.path.exists(os.path.join(folder, unique)) and n < 100:
         unique = f"{name} ({n})"
         n += 1
+    # copied under a name the game skips (it starts with a dot) and renamed when whole: a copy that fails or is cut short must
+    # not stay behind as a mod that is on, with some of its files
+    copying = os.path.join(folder, ".copying")
     try:
-        shutil.copytree(root, os.path.join(folder, unique))
+        shutil.rmtree(copying, ignore_errors=True)
+        shutil.copytree(root, copying)
+        os.rename(copying, os.path.join(folder, unique))
     except OSError as e:
         return False, f"copy_failed: {e}", False
     finally:
+        shutil.rmtree(copying, ignore_errors=True)
         if temp:
             shutil.rmtree(temp, ignore_errors=True)
     _romfs, code = _info(os.path.join(folder, unique))

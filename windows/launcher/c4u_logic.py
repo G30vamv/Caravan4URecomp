@@ -15,6 +15,8 @@ import sys
 import threading
 import time
 
+import c4u_ini
+
 APP_NAME = "Caravan4URecomp"
 GAME_EXE = "Caravan4URecomp.exe"
 INI_NAME = "Caravan4URecomp.ini"
@@ -122,14 +124,9 @@ class C4ULogic:
     # ---- the code library: is it the one these tools would make? ---------------------------------------------------------
     def _read_ini_key(self, key):
         try:
-            with open(self.ini_path, encoding="utf-8-sig") as f:
-                for line in f:
-                    k, _, v = line.partition("=")
-                    if k.strip() == key:
-                        return v.strip()
+            return c4u_ini.load(self.ini_path).get(key, "")
         except OSError:
-            pass
-        return ""
+            return ""
 
     @staticmethod
     def library_embedded_id(dll):
@@ -312,7 +309,7 @@ class C4ULogic:
         out = []
         try:
             for e in os.scandir(root):
-                if e.is_dir():
+                if e.is_dir() and not e.name.startswith("."):  # (".partial-...": a copy not finished)
                     out.append((e.name, e.stat().st_mtime))
         except OSError:
             pass

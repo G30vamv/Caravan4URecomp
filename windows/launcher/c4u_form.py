@@ -384,6 +384,14 @@ class OptionsForm:
         self.on_changed("")
 
     def reload_all(self):
+        # only the controls that show something else than the file: rewriting every one made the whole page flicker each time the
+        # launcher refreshed (when the game closes, for one)
         for key in self.widgets:
-            self.write(key, self.store.get(key))
+            wanted = self.store.get(key)
+            try:
+                if self.read(key) == wanted:
+                    continue
+            except Exception:
+                pass
+            self.write(key, wanted)
         self.refresh_dependencies()

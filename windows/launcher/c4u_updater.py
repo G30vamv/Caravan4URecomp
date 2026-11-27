@@ -149,6 +149,60 @@ def owned_path(root, relative):
     return target
 
 
+GAME_PROGRAMS = ("caravan4urecomp.exe", "mh4u_native_runner.exe")
+
+
+def running_games(base_dir) -> list:
+    """The names of the game programs of THIS installation that are running, however they were started (found by the full path
+    of each process: a copy of the game in another folder is not ours). Nothing is ever closed by the updater."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class Entry(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("pid", wintypes.DWORD),
+                    ("heap", ctypes.c_size_t), ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+                    ("parent", wintypes.DWORD), ("priority", wintypes.LONG), ("flags", wintypes.DWORD),
+                    ("name", wintypes.WCHAR * 260)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+    kernel.Process32FirstW.argtypes = kernel.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(Entry))
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    own = os.path.normcase(os.path.realpath(base_dir)).rstrip("\\") + "\\"
+    found = []
+    snapshot = kernel.CreateToolhelp32Snapshot(0x2, 0)  # the processes
+    if snapshot in (None, wintypes.HANDLE(-1).value):
+        return found
+    try:
+        entry = Entry(size=ctypes.sizeof(Entry))
+        more = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            if entry.name.casefold() in GAME_PROGRAMS:
+                process = kernel.OpenProcess(0x1000, False, entry.pid)  # only to ask where it runs from
+                if process:
+                    buffer = ctypes.create_unicode_buffer(32768)
+                    length = wintypes.DWORD(len(buffer))
+                    if (kernel.QueryFullProcessImageNameW(process, 0, buffer, ctypes.byref(length))
+                            and os.path.normcase(os.path.realpath(buffer.value)).startswith(own)):
+                        found.append(entry.name)
+                    kernel.CloseHandle(process)
+            more = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    return found
+
+
+def _game_open_error():
+    return UpdateError("running", "The game is open. Close it and update again.",
+                       "El juego está abierto. Ciérralo y vuelve a actualizar.")
+
+
 def sha256_file(path):
     with open(path, "rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
@@ -394,14 +448,17 @@ function Wait-Launcher([int] $launcherPid) {
     }
 }
 
-function Close-Games {
-    foreach ($game in @(Get-Process -Name 'Caravan4URecomp', 'mh4u_native_runner' -ErrorAction SilentlyContinue)) {
-        try { $game.Kill() }
-        catch { if (-not $game.HasExited) { throw } }
-        if (-not $game.WaitForExit(15000)) {
-            throw "Game did not close / El juego no se cerro: $($game.ProcessName)"
-        }
+# A game is never closed by force: it may be writing a save. The launcher asks the player to close it before it gets here;
+# one opened since then is waited for a moment, and if it stays open nothing is changed. Only the games of this folder count.
+function Wait-GameClosed {
+    $own = $base.TrimEnd('\') + '\'
+    for ($try = 0; $try -lt 20; $try++) {
+        $open = @(Get-Process -Name 'Caravan4URecomp', 'mh4u_native_runner' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path.StartsWith($own, [StringComparison]::OrdinalIgnoreCase) })
+        if ($open.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 500
     }
+    throw 'The game is open: close it and update again / El juego esta abierto: cierralo y vuelve a actualizar.'
 }
 
 function Remove-EmptyDirectories($directories) {
@@ -440,7 +497,7 @@ try {
         $snapshotCreated = $true
     }
 
-    if ($plan.live) { Close-Games }
+    if ($plan.live) { Wait-GameClosed }
     foreach ($entry in $plan.entries) {
         $path = Get-OwnedPath $base $entry.path
         $backup = Get-OwnedPath $snapshot ('files/' + $entry.path)
@@ -459,11 +516,26 @@ try {
             throw "File changed / El archivo cambio: $($entry.path)"
         }
         $journal.Add(@{ path = $path; source = $source; hold = $hold; saved = $false;
-                         installed = $false; replace = ($null -ne $newDigest);
+                         installed = $false; readonly = $false; replace = ($null -ne $newDigest);
                          existed = ($null -ne $oldDigest) })
     }
 
     foreach ($change in $journal) {
+        if ($change.existed -and $change.replace) {
+            # one step (ReplaceFile): the new file takes the old one's place and the old one goes to the backup. There is no
+            # moment without a file there, so a power cut cannot leave the folder without its launcher.
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($change.hold))
+            try {
+                # Replace refuses a read-only file (a zip tool or a copy from a disc can leave one)
+                $info = [IO.FileInfo]::new($change.path)
+                if ($info.IsReadOnly) { $info.IsReadOnly = $false; $change.readonly = $true }
+                [IO.File]::Replace($change.source, $change.path, $change.hold)
+            }
+            catch { throw "Replace failed / Fallo al reemplazar $($change.path): $($_.Exception.Message)" }
+            $change.saved = $true
+            $change.installed = $true
+            continue
+        }
         if ($change.existed) {
             Move-File $change.path $change.hold
             $change.saved = $true
@@ -499,6 +571,7 @@ try {
         try {
             if ($change.installed) { Move-File $change.path $change.source }
             if ($change.saved) { Move-File $change.hold $change.path }
+            if ($change.readonly) { [IO.FileInfo]::new($change.path).IsReadOnly = $true }
         } catch {
             $restoreFailed = $true
             [Console]::Error.WriteLine("Restore failed / Fallo al restaurar: " + $_.Exception.Message)
@@ -575,12 +648,15 @@ def apply(info, base_dir, relaunch=True) -> str:
             raise UpdateError("staging", "Download the update before applying it.",
                               "Descarga la actualización antes de aplicarla.")
         _validate_files(info.files, testing=bool(os.environ.get(MANIFEST_ENV)))
+        if relaunch and running_games(base):  # (opened while the update was downloading)
+            raise _game_open_error()
         entries = []
         for entry in info.files:
             relative = entry["path"]
             before = (info._previous[relative] if relative in info._previous
                       else _inspect(base, relative))
             entries.append({"path": relative, "sha256": entry["sha256"], "before": before})
+        entries.sort(key=lambda e: e["path"].casefold() == LAUNCHER_EXE.casefold())  # (the launcher last: it is what recovers)
         batch = _write_transaction(stage, {"launcher_pid": os.getpid(), "live": relaunch,
                                             "undo": False, "snapshot": stage.name, "entries": entries},
                                    "apply_update.bat")
@@ -590,6 +666,115 @@ def apply(info, base_dir, relaunch=True) -> str:
     except OSError as error:
         raise UpdateError("apply", f"Could not prepare the update: {error}",
                           f"No se pudo preparar la actualización: {error}") from error
+
+
+def _digest_of(path):
+    return sha256_file(path).lower() if path.is_file() else None
+
+
+def _put_back(source, target, aside):
+    """`source` takes `target`'s place; a program that is running (the launcher itself) can be moved away but not written over."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.replace(source, target)
+    except PermissionError:
+        aside.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(target, aside)
+        os.replace(source, target)
+
+
+def _recover_one(base, updates, snapshot):
+    """One update that never finished. Returns (what happened, how many files were put back):
+    "undone": the files from before it are back;  "complete": every new file was in place, so it is kept and marked finished;
+    "stale": the folder has changed since (something else was installed over it), so nothing is touched;
+    "lost": it cannot be undone (a file from before it is gone or damaged), so nothing is touched."""
+    stage = owned_path(updates, snapshot.name)
+    try:
+        plan = json.loads((stage / "plan.json").read_text(encoding="utf-8"))
+        entries = [(safe_path(e["path"]), e["sha256"].lower(), (e["before"] or "").lower() or None) for e in plan["entries"]]
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, UpdateError):
+        if not any(p.is_file() for p in snapshot.rglob("*")):  # (nothing had been moved into it)
+            shutil.rmtree(snapshot, ignore_errors=True)
+            return "stale", 0
+        return "lost", 0
+    changes = []
+    states = []
+    for path, new, old in entries:
+        target = owned_path(base, path)
+        backup = owned_path(snapshot, "files/" + path)
+        now, saved = _digest_of(target), _digest_of(backup)
+        states.append((now, new))
+        if saved is not None:  # the old file had been moved out
+            if saved != old:
+                changes.append(("lost", path, target, backup))
+            elif now not in (None, new):
+                changes.append(("stale", path, target, backup))
+            else:
+                changes.append(("restore", path, target, backup))
+        elif now == old:
+            continue  # not reached
+        elif now == new:
+            changes.append(("remove" if old is None else "lost", path, target, backup))
+        else:
+            changes.append(("stale", path, target, backup))
+    if states and all(now == new for now, new in states):  # cut between the last file and the note that it had finished
+        plan.setdefault("created_dirs", [])
+        pending = snapshot / (BACKUP_MARKER + ".tmp")
+        pending.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        os.replace(pending, snapshot / BACKUP_MARKER)
+        return "complete", 0
+    kinds = {kind for kind, *_ in changes}
+    if "stale" in kinds:
+        os.replace(snapshot, snapshot.with_name("stale-" + snapshot.name))  # (kept, and not looked at again)
+        return "stale", 0
+    if "lost" in kinds:
+        return "lost", 0
+    for kind, path, target, backup in reversed(changes):
+        aside = stage / "discarded" / path
+        if kind == "restore":
+            _put_back(backup, target, aside)
+        else:
+            try:
+                target.unlink()
+            except PermissionError:
+                aside.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(target, aside)
+    shutil.rmtree(snapshot, ignore_errors=True)
+    shutil.rmtree(stage / "files", ignore_errors=True)
+    return "undone", len(changes)
+
+
+def recover_interrupted(base_dir):
+    """An update cut short (a power cut, the PC turned off) leaves a backup without the note that says it finished. Called when
+    the launcher opens: the installation ends up whole, in one version. Returns None when there was nothing to do, else
+    {"restored": files put back, "problem": None, "game_open" or "lost"}."""
+    base = Path(base_dir).resolve()
+    root = owned_path(base, BACKUP_DIR)
+    if not root.is_dir():
+        return None
+    unfinished = [s for s in sorted(root.glob("apply-*"), reverse=True)
+                  if s.is_dir() and not _reparse(s.lstat()) and not (s / BACKUP_MARKER).is_file()]
+    if not unfinished:
+        return None
+    updates = owned_path(base, UPDATE_DIR)
+    updates.mkdir(exist_ok=True)
+    try:  # a transaction at work holds this file with no sharing
+        lock = owned_path(updates, "transaction.lock").open("a+b")
+    except OSError:
+        return None
+    result = {"restored": 0, "problem": None}
+    with lock:
+        if running_games(base):
+            return {"restored": 0, "problem": "game_open"}
+        for snapshot in unfinished:
+            try:
+                what, count = _recover_one(base, updates, snapshot)
+            except (OSError, UpdateError):
+                what, count = "lost", 0
+            result["restored"] += count
+            if what == "lost":
+                result["problem"] = "lost"
+    return result if result["restored"] or result["problem"] else None
 
 
 def _backups(base):

@@ -24,6 +24,7 @@ import qtmenu
 import qtshim
 import qttitle
 import winfx
+import c4u_logic
 from c4u_form import OptionsForm
 from c4u_logic import APP_NAME, C4ULogic, get_assets_dir
 from qtglass import BackdropWidget, GlassPanel
@@ -108,6 +109,8 @@ class Window(QWidget):
 
     def changeEvent(self, event):
         super().changeEvent(event)
+        if event.type() == QEvent.Type.ActivationChange and self.isActiveWindow() and hasattr(self._app, "reload_settings"):
+            self._app.reload_settings()
         if event.type() == QEvent.Type.WindowStateChange and bool(event.oldState() & Qt.WindowState.WindowMinimized) and not self.isMinimized():
             qtanim.fade_window_in(self, 170)
         if hasattr(self._app, "titlebar"):
@@ -183,15 +186,37 @@ class ArtPanel(GlassPanel):
         p.restore()
 
 
+def has_textures_to_convert(folder):
+    """Whether the folder (or a folder inside it) holds a texture file the converter reads; the converted archive is not one."""
+    for _root, _dirs, files in os.walk(folder):
+        if any(name.lower().endswith((".png", ".dds", ".ktx")) for name in files):
+            return True
+    return False
+
+
 class IniStore:
     """The values of the ini: what the file says plus the game's defaults. Every `set` is written at once."""
 
     def __init__(self, path):
         self.path = path
-        self.values = c4u_ini.load(path) if c4u_ini else {}
+        self.values = {}
+        self.on_error = None  # told (the exception) when a change could not be saved
+        self.reload()
 
     def reload(self):
-        self.values = c4u_ini.load(self.path) if c4u_ini else {}
+        """Reads the file again; True when something is different. A file that cannot be read now (or is empty for a moment
+        while another program writes it) leaves the values as they were."""
+        if not c4u_ini:
+            return False
+        try:
+            values = c4u_ini.load(self.path)
+        except OSError:
+            return False
+        if not values and self.values and os.path.exists(self.path):
+            return False
+        different = values != self.values
+        self.values = values
+        return different
 
     def get(self, key):
         if key in self.values:
@@ -202,17 +227,28 @@ class IniStore:
             return ""
 
     def set(self, key, value):
-        self.values[key] = value
-        if c4u_ini:
-            c4u_ini.save(self.path, self.values)
+        """Writes this one key over what the file says now (not over what was read before)."""
+        if not c4u_ini:
+            self.values[key] = value
+            return
+        try:
+            self.values = c4u_ini.update(self.path, {key: value}, self.values)
+        except OSError as e:
+            if self.on_error is None:
+                raise
+            self.on_error(e)
 
 
 class C4ULauncherApp(C4ULogic):
     def __init__(self, qapp):
+        recovered = self._recover_update()  # (before anything is read: the version and the program's files may change back)
         super().__init__()
         self.qapp = qapp
+        if recovered:
+            QTimer.singleShot(900, lambda: self._tell_recovered(recovered))
         self.assets_dir = get_assets_dir()
         self.store = IniStore(self.ini_path)
+        self.store.on_error = self._settings_not_saved
         self.ui_queue = queue.Queue()
         qtanim.set_user_choice(self.config.get("animations", True))
         self.update_info = None
@@ -293,8 +329,9 @@ class C4ULauncherApp(C4ULogic):
                 elif kind == "game_exit":
                     self._game_exited(data)
                 elif kind == "library_status":
-                    self._library_state = data
-                    self.refresh_status()
+                    if data != self._library_state:  # (a second refresh with nothing new made the page flicker)
+                        self._library_state = data
+                        self.refresh_status()
                 elif kind == "info":
                     qtshim.messagebox.showinfo(*data)
                 elif kind == "error":
@@ -811,6 +848,47 @@ class C4ULauncherApp(C4ULogic):
     def _option_changed(self, key):
         self.lbl_summary.setText(self.summary())
 
+    @staticmethod
+    def _recover_update():
+        """An update that was cut short is undone (c4u_updater.recover_interrupted)."""
+        if not c4u_updater:
+            return None
+        try:
+            return c4u_updater.recover_interrupted(c4u_logic.get_base_dir())
+        except Exception:
+            return {"restored": 0, "problem": "lost"}
+
+    def _tell_recovered(self, result):
+        if result["problem"] == "game_open":
+            text = self.tr("An update was interrupted before it finished. Close the game and open the launcher again to put it right.",
+                           "Una actualización se interrumpió antes de terminar. Cierra el juego y vuelve a abrir el launcher para arreglarlo.")
+        elif result["problem"]:
+            text = self.tr("An update was interrupted and could not be undone. Download the latest version's zip and unzip it over this "
+                           "folder, keeping your Caravan4URecomp.ini and your game folder.",
+                           "Una actualización se interrumpió y no se pudo deshacer. Descarga el zip de la última versión y descomprímelo "
+                           "encima de esta carpeta, conservando tu Caravan4URecomp.ini y tu carpeta game.")
+        else:
+            text = self.tr("An update was interrupted before it finished: the files from before it were put back. You can update again.",
+                           "Una actualización se interrumpió antes de terminar: se repusieron los archivos de antes. Puedes volver a actualizar.")
+        qtshim.messagebox.showinfo("Caravan4URecomp", text)
+
+    def reload_settings(self):
+        """Back in the launcher's window: shows what the file says now (the game or an editor may have changed it)."""
+        if getattr(self, "form", None) is None or not hasattr(self, "lbl_summary"):
+            return
+        if self.store.reload():
+            self.form.reload_all()
+            self.lbl_summary.setText(self.summary())
+
+    def _settings_not_saved(self, error):
+        def show():
+            qtshim.messagebox.showerror("Caravan4URecomp", self.tr(
+                f"The change could not be saved in Caravan4URecomp.ini: {error}",
+                f"No se pudo guardar el cambio en Caravan4URecomp.ini: {error}"))
+            if self.form is not None:
+                self.form.reload_all()  # the controls show what the file really says
+        QTimer.singleShot(0, show)
+
     # ---- actions -----------------------------------------------------------------------------------------------------------
     def on_play(self):
         err = self.launch_game(on_exit=lambda code: self.ui_queue.put(("game_exit", code)))
@@ -897,6 +975,11 @@ class C4ULauncherApp(C4ULogic):
             qtshim.messagebox.showinfo("Caravan4URecomp", self.tr(f"There is no texture pack yet. Put it in:\n{folder}",
                                                                   f"Todavía no hay un pack de texturas. Ponlo en:\n{folder}"))
             return
+        if not has_textures_to_convert(folder):
+            qtshim.messagebox.showinfo("Caravan4URecomp", self.tr(
+                f"There are no PNG textures to convert in:\n{folder}\n\nA converted pack that is already there stays as it is.",
+                f"No hay texturas PNG para convertir en:\n{folder}\n\nSi ya tienes un pack convertido ahí, se queda como está."))
+            return
         sizes = [(self.tr("No limit: every texture keeps its size", "Sin límite: cada textura conserva su tamaño"), 0),
                  (self.tr("4096 px at most", "4096 px como máximo"), 4096),
                  (self.tr("2048 px at most (about half the disk space)", "2048 px como máximo (la mitad de espacio en disco, aprox.)"), 2048),
@@ -909,9 +992,11 @@ class C4ULauncherApp(C4ULogic):
             return
         limit = dict(sizes)[choice]
         text = self.tr("The conversion makes one new file in the textures folder (it can take as much disk space as the PNG pack, or more with no limit) "
-                       "and keeps working in the background; your PNG files are not changed or deleted. Start?",
+                       "and keeps working in the background; your PNG files are not changed or deleted. A converted pack that is already there "
+                       "is replaced only if the new one has all its textures. Start?",
                        "La conversión crea un archivo nuevo en la carpeta de texturas (puede ocupar tanto como el pack de PNG, o más sin límite) "
-                       "y trabaja en segundo plano; tus PNG no se cambian ni se borran. ¿Empezar?")
+                       "y trabaja en segundo plano; tus PNG no se cambian ni se borran. Un pack convertido que ya exista solo se reemplaza "
+                       "si el nuevo tiene todas sus texturas. ¿Empezar?")
         if not qtshim.messagebox.askyesno("Caravan4URecomp", text):
             return
         out = os.path.join(folder, "MH4U-BC7.mh4hdpk")
@@ -954,6 +1039,12 @@ class C4ULauncherApp(C4ULogic):
                 elif code == 4:
                     self.ui_queue.put(("info", ("Caravan4URecomp", self.tr("The conversion was interrupted. Start it again to continue where it stopped.",
                                                                            "La conversión se interrumpió. Empiézala de nuevo para seguir donde se quedó."))))
+                elif code == 5:  # the converter would have lost textures: it left the pack there as it was
+                    self.ui_queue.put(("info", ("Caravan4URecomp", self.tr(
+                        "Nothing was replaced: your converted pack has textures that the new one would not have. It stays as it is. To make "
+                        "a new one from only the files now in the folder, move MH4U-BC7.mh4hdpk somewhere else first.\n\n" + error,
+                        "No se reemplazó nada: tu pack convertido tiene texturas que el nuevo no tendría. Se queda como está. Para crear uno "
+                        "nuevo solo con los archivos que hay ahora en la carpeta, primero mueve MH4U-BC7.mh4hdpk a otro sitio.\n\n" + error))))
                 else:
                     self.ui_queue.put(("error", ("Caravan4URecomp", self.tr(f"The conversion failed: {error}", f"La conversión falló: {error}"))))
             except Exception as e:
@@ -1032,7 +1123,7 @@ class C4ULauncherApp(C4ULogic):
         info = self.update_info
         if info is None or self._busy_update:
             return
-        if self.is_running():
+        if self.is_running() or c4u_updater.running_games(self.base_dir):  # (also one not opened from this launcher)
             qtshim.messagebox.showinfo("Caravan4URecomp", self.tr("Close the game before updating.", "Cierra el juego antes de actualizar."))
             return
         notes = (getattr(info, "notes_es", "") if self.language() == "es" else getattr(info, "notes_en", "")) or ""
