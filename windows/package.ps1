@@ -6,6 +6,9 @@
 # OWN code library from their OWN copy of the game with nothing to install (a portable Python; the compiler is downloaded
 # once, checked against a SHA-256, on the first start), the licenses, the instructions and the complete corresponding source
 # code the GPL requires. It never contains anything of the game: it is checked at the end.
+# What is copied from the source tree (the source, the recompiler's files, the instructions) is what git tracks: a file that
+# only lies in the folder (a private note, a log, something of the game) cannot get in. A release is made from a tree with
+# nothing left to commit, so that the source is the one the programs were built from.
 #
 #   powershell -ExecutionPolicy Bypass -File windows\package.ps1 [-Mode release|test] [-OutDir <dir>] [-BuildDir <dir>]
 #
@@ -24,6 +27,34 @@ $parent = Split-Path $repo -Parent
 if (-not $OutDir) { $OutDir = Join-Path $parent "dist\package" }
 if (-not $BuildDir) { $BuildDir = Join-Path $parent "build\release" }   # its own build folder: the release build rewrites the source paths, the test build (build\win) does not
 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+
+# the tree, as git sees it
+$changes = @(& git -C $repo status --porcelain --untracked-files=all)
+if ($LASTEXITCODE -ne 0) { throw "git status failed: package.ps1 needs the source tree to be a git repository" }
+if ($changes.Count -gt 0) {
+    $list = "`n  " + ($changes -join "`n  ")
+    if ($Mode -eq "release") { throw "a release is made from a tree with nothing left to commit:$list" }
+    Write-Warning "test package from a tree with changes (a tracked file goes in as it is on disk; a file git does not track stays out):$list"
+}
+function Get-TrackedFiles([string]$under) {
+    $files = @(& git -C $repo -c core.quotepath=off ls-files -- $under)
+    if ($LASTEXITCODE -ne 0 -or $files.Count -eq 0) { throw "git lists no file under $under" }
+    return $files
+}
+# copies those files into $to, each at its path without the first $skip characters
+function Copy-TrackedFiles($files, [string]$to, [int]$skip = 0) {
+    foreach ($file in $files) {
+        $target = Join-Path $to $file.Substring($skip)
+        New-Item -ItemType Directory -Force (Split-Path $target -Parent) | Out-Null
+        Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $target -Force
+    }
+}
+# what is of the game, or made from it on a player's PC, by its name (the same list for the package and for its source zip)
+function Test-GameFile([string]$name) {
+    return ([IO.Path]::GetExtension($name) -in ".cia", ".3ds", ".cci", ".cxi", ".3dsx", ".romfs", ".mh4hdpk") -or
+        ($name -in "code.bin", "exefs.bin", "exheader.bin", "romfs.bin", "icon.bin", "monster_names.txt", "item_names.txt", "source.txt") -or
+        ($name -like "*_native.dll") -or ($name -like "*_native.so")
+}
 
 # the portable Python (the embeddable package of python.org; PSF license): downloaded once into deps\, kept by its SHA-256
 $pythonVersion = "3.12.8"
@@ -72,17 +103,14 @@ Expand-Archive $pythonZip $py -Force
 Copy-Item (Join-Path $py "LICENSE.txt") (Join-Path $pkg "LICENSES\PYTHON-LICENSE.txt") -Force
 
 # 4. the recompiler and its tables (python, no game data: "They hold addresses, not game code")
+# (only the top-level tools/android, the Android player's scripts, stays out: the recompiler's runtime folder has an android
+# folder with headers the compiler needs)
 foreach ($d in "tools", "config") {
-    $from = Join-Path $repo "mh4n/$d"
-    $to = Join-Path $tools $d
-    # (not "android" by name: the recompiler's runtime folder has an android folder with headers the compiler needs;
-    # only the top-level tools/android, the Android player's scripts, stays out)
-    $androidScripts = Join-Path $repo "mh4n/tools/android"
-    & robocopy $from $to /E /XD __pycache__ $androidScripts /NFL /NDL /NJH /NJS /NP | Out-Null
+    Copy-TrackedFiles @(Get-TrackedFiles "mh4n/$d" | Where-Object { $_ -notlike "mh4n/tools/android/*" }) $tools "mh4n/".Length
 }
 
 # 5. the instructions, the setup script and the source offer (and, in a test package, the helper files)
-Copy-Item (Join-Path $source "package\*") $pkg -Force -Recurse
+Copy-TrackedFiles (Get-TrackedFiles "windows/package") $pkg "windows/package/".Length
 Remove-Item (Join-Path $pkg "1-PrepareGame.bat") -Force -ErrorAction SilentlyContinue  # the program asks for the files itself
 Set-Content -Path (Join-Path $pkg "VERSION.txt") -Value ("Caravan4URecomp " + $Version) -Encoding ascii
 # 5b. the launcher (Caravan4URecomp-Launcher.exe: edits the settings, starts the program and updates the package's files)
@@ -90,6 +118,8 @@ Set-Content -Path (Join-Path $pkg "VERSION.txt") -Value ("Caravan4URecomp " + $V
 if ($LASTEXITCODE -ne 0) { throw "build_launcher.ps1 failed" }
 if ($Mode -eq "release") {
     foreach ($f in "2-GpuCheck.bat", "perf_summary.py", "LEEME-PRUEBA.txt") { Remove-Item (Join-Path $pkg $f) -Force -ErrorAction SilentlyContinue }
+    # no settings file: whoever unzips a newer version over an older one keeps theirs (the program works without one)
+    Remove-Item (Join-Path $pkg "Caravan4URecomp.ini") -Force -ErrorAction SilentlyContinue
 } else {
     $ini = Join-Path $pkg "Caravan4URecomp.ini"
     $lines = Get-Content $ini | Where-Object { $_ -notmatch '^\s*(fps_counter|options)\s*=' }
@@ -102,18 +132,17 @@ if ($Mode -eq "release") {
 $src = Join-Path $pkg "SOURCE"
 New-Item -ItemType Directory -Force $src | Out-Null
 $tmp = Join-Path $env:TEMP ("c4u-source-" + [guid]::NewGuid().ToString("N"))
-& robocopy $repo (Join-Path $tmp "Caravan4URecomp") /E /XD .git __pycache__ build .gradle /NFL /NDL /NJH /NJS /NP | Out-Null
+Copy-TrackedFiles (Get-TrackedFiles ".") (Join-Path $tmp "Caravan4URecomp")
 Compress-Archive -Path (Join-Path $tmp "Caravan4URecomp") -DestinationPath (Join-Path $src "Caravan4URecomp-source.zip") -Force
 Remove-Item $tmp -Recurse -Force
 
 # 7. nothing of the game: the checks that must never fail
-$bad = Get-ChildItem $pkg -Recurse -File | Where-Object {
-    $_.Extension -in ".cia", ".3ds", ".cci", ".cxi", ".3dsx", ".romfs" -or
-    $_.Name -in "code.bin", "exefs.bin", "exheader.bin", "romfs.bin", "icon.bin" -or
-    $_.Name -like "*_native.dll" -or $_.Name -like "*_native.so"
-}
+$bad = @(Get-ChildItem $pkg -Recurse -File -Force | Where-Object { Test-GameFile $_.Name })
 if ($bad) { Remove-Item $pkg -Recurse -Force; throw ("game files found in the package: " + ($bad.FullName -join ", ")) }
-$zipBad = & powershell -NoProfile -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::OpenRead('$((Join-Path $src 'Caravan4URecomp-source.zip'))').Entries | Where-Object { `$_.Name -match '\.(cia|3ds|cci|cxi)$' -or `$_.Name -in 'code.bin','exefs.bin','exheader.bin','romfs.bin' -or `$_.Name -like '*_native.dll' } | ForEach-Object { `$_.FullName }"
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$sourceZip = [IO.Compression.ZipFile]::OpenRead((Join-Path $src "Caravan4URecomp-source.zip"))
+try { $zipBad = @($sourceZip.Entries | Where-Object { $_.Name -and (Test-GameFile $_.Name) } | ForEach-Object { $_.FullName }) }
+finally { $sourceZip.Dispose() }
 if ($zipBad) { Remove-Item $pkg -Recurse -Force; throw ("game files found in the source zip: " + ($zipBad -join ", ")) }
 
 # 8. one zip to send

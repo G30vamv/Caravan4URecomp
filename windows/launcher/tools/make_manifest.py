@@ -46,6 +46,9 @@ def _check_size(path):
 
 
 USER_FILES = {"Caravan4URecomp.ini", "launcher_config.json"}  # the player's own settings (the updater protects them)
+# made from the player's own game by the first start: a package folder the program was run in has them. (The game's other
+# files do not pass asset_name: their kinds are not among those an update may bring.)
+GAME_TEXT_FILES = {"monster_names.txt", "item_names.txt", "source.txt"}
 
 
 def _collect(package):
@@ -62,13 +65,14 @@ def _collect(package):
             if _reparse(data) or not path.resolve().is_relative_to(package):
                 raise _release_error(f"Linked package path: {relative}",
                                      f"Ruta enlazada en el paquete: {relative}")
-            if name.casefold() == "build" or name.casefold().endswith("_native.dll"):
+            if (name.casefold() == "build" or name.casefold().endswith("_native.dll")
+                    or name.casefold() in GAME_TEXT_FILES):
                 raise _release_error(f"Private package path: {relative}",
                                      f"Ruta privada en el paquete: {relative}")
             if stat.S_ISDIR(data.st_mode):
                 safe_path(f"{relative}/placeholder.txt")
             elif stat.S_ISREG(data.st_mode):
-                if relative in USER_FILES:  # shipped in the zip for new players, never replaced by an update
+                if relative in USER_FILES:  # neither in the published zip nor in an update: both keep the player's own
                     continue
                 asset_name(relative)
                 _check_size(path)
