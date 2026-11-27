@@ -406,6 +406,9 @@ inline const char* const kRestoreNew = ".restore-new";
 inline const char* const kRestoreOld = ".restore-old";
 inline const char* const kRestoreTrash = ".restore-trash";
 inline const char* const kRestorePlan = "plan.txt";
+// What an undo takes out of a save folder's place is moved here, never removed: it is normally the backup's copy, but after an
+// older version of the program (an update undone) it can be what the player has saved since.
+inline const char* const kRestoreAside = ".restore-discarded";
 
 // True while .restore-old still says how to put the saves back: they may then be part one thing and part another. The game must
 // not run on them: it would write over them, and the undo still to come removes what is in the old ones' place.
@@ -435,18 +438,29 @@ inline std::string RecoverRestore(const fs::path& user) {
                 if (fs::exists(Long(old / f), ec)) return stuck;
             }
         } else {
+            // moves what is in a save folder's place aside (the one of an earlier undo goes). False: it is held.
+            const auto put_aside = [&](const char* f) {
+                std::error_code ae;
+                if (!fs::exists(Long(user / f), ae)) return true;
+                const fs::path aside = user / kRestoreAside / f;
+                fs::remove_all(Long(aside), ae);
+                if (ae) return false;
+                fs::create_directories(Long(aside.parent_path()), ae);
+                if (ae) return false;
+                fs::rename(Long(user / f), Long(aside), ae);
+                return !ae;
+            };
             std::vector<std::string> had;
             for (std::string line; std::getline(plan, line);) had.push_back(line);
             plan.close();
             for (const char* f : kFolders) {
                 if (std::find(had.begin(), had.end(), f) != had.end()) {
                     if (!fs::exists(Long(old / f), ec)) continue;  // not moved yet: the one in place is the old one
-                    fs::remove_all(Long(user / f), ec);            // the new one (the backup still has it)
+                    if (!put_aside(f)) return stuck;               // the new one
                     fs::rename(Long(old / f), Long(user / f), ec);
                     if (ec) return stuck;
-                } else {
-                    fs::remove_all(Long(user / f), ec);  // there was none before: what is there came from the backup
-                    if (ec) return stuck;
+                } else if (!put_aside(f)) {  // there was none before: what is there came from the backup
+                    return stuck;
                 }
             }
             fs::remove(Long(old / kRestorePlan), ec);  // the undo counts from here: no later start goes through it again

@@ -11,6 +11,7 @@
 // for itself and before any backup is made), keeping what it takes out in <user>\.save-discarded: nothing is destroyed.
 #pragma once
 
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -103,7 +104,11 @@ inline std::error_code Begin(const fs::path& user, const fs::path& root) {
         if (ec) break;
     }
     if (ec) return ec;
-    const fs::path relative = fs::absolute(root).lexically_normal().lexically_relative(fs::absolute(user).lexically_normal());
+    const fs::path from_root = fs::absolute(root, ec);
+    if (ec) return ec;
+    const fs::path from_user = fs::absolute(user, ec);
+    if (ec) return ec;
+    const fs::path relative = from_root.lexically_normal().lexically_relative(from_user.lexically_normal());
     const std::u8string name = relative.generic_u8string();
     {
         std::ofstream note(Long(partial / "root.txt"), std::ios::binary);
@@ -145,6 +150,28 @@ inline bool SameFolder(const fs::path& a, const fs::path& b) {
     return inside(a, b) && inside(b, a);
 }
 
+// A journal can outlive its cut: an older version of the program (an update undone) knows nothing of it, and the player goes
+// on playing and saving. Whether the save in `root` is such later progress: every file the committed save has is there and
+// none is empty, and one was written long after the journal was made (`note`). A save cut short is written within moments.
+inline bool WrittenLongAfter(const fs::path& root, const fs::path& committed, const fs::path& note) {
+    constexpr auto kLong = std::chrono::minutes(5);
+    std::error_code ec;
+    const auto made = fs::last_write_time(Long(note), ec);
+    if (ec) return false;
+    bool later = false;
+    const fs::path from = Long(committed);
+    for (fs::recursive_directory_iterator it(from, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->is_directory(ec)) continue;
+        const fs::path live = Long(root / it->path().lexically_relative(from));
+        std::error_code fe;
+        if (!fs::is_regular_file(live, fe) || fs::file_size(live, fe) == 0 || fe) return false;
+        const auto written = fs::last_write_time(live, fe);
+        if (fe) return false;
+        if (written - made > kLong) later = true;
+    }
+    return !ec && later;
+}
+
 struct Recovery {
     std::string message;  // for the log; "" when there was nothing to say
     bool stuck = false;   // the committed save could not be put back: the game must not run on what is there
@@ -170,14 +197,27 @@ inline Recovery Recover(const fs::path& user) {
         if (!note) return stuck("its note cannot be read");
         name.assign(std::istreambuf_iterator<char>(note), {});
     }
-    const fs::path relative(std::u8string(name.begin(), name.end()));
-    if (relative.empty() || relative.is_absolute()) return stuck("its note names no folder");
+    fs::path relative;
+    try {  // (a damaged note must not end the program: it is not acted on)
+        relative = fs::path(std::u8string(name.begin(), name.end()));
+    } catch (const std::exception&) {
+        return stuck("its note is damaged");
+    }
+    if (name.find('\0') != std::string::npos || relative.empty() || relative.is_absolute()) return stuck("its note names no folder");
     for (const fs::path& part : relative) {
         if (part == "..") return stuck("its note names a folder outside the user folder");
     }
     const fs::path root = user / relative, data = journal / "data";
     std::string result;
-    if (fs::is_directory(Long(data), ec)) {
+    if (fs::is_directory(Long(data), ec) && WrittenLongAfter(root, data, journal / "root.txt")) {
+        // later progress: the save stays as it is, the older copy is kept aside
+        fs::remove_all(Long(Discarded(user)), ec);
+        if (ec) return stuck("an older discarded save cannot be removed: " + ec.message());
+        if (const std::error_code moved = Move(data, Discarded(user))) return stuck(moved.message());
+        const std::u8string at = Discarded(user).u8string();
+        result = "a copy left by an old cut was found, but the save was written long after it: the save stays as it is (the old copy is in " +
+                 std::string(at.begin(), at.end()) + ")";
+    } else if (fs::is_directory(Long(data), ec)) {
         const bool there = fs::exists(Long(root), ec);
         if (!there || !SameFolder(root, data)) {
             if (there) {
