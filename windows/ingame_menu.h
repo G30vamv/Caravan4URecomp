@@ -286,10 +286,11 @@ struct Host {
 };
 
 // The pages: five tabs, and two that belong to the Online tab (the public rooms and a room's password).
-enum class Page { Graphics, Game, Controls, Audio, Online, Saves, Mods, System, Rooms, Password, Items, Count };
+enum class Page { Graphics, Game, Controls, Audio, Online, Saves, Mods, System, Rooms, Password, Items, Import, Count };
 constexpr int kTabCount = 8;
 inline int TabOf(Page page) {
     if (page == Page::Items) return static_cast<int>(Page::Mods);
+    if (page == Page::Import) return static_cast<int>(Page::Saves);
     return page == Page::Rooms || page == Page::Password ? static_cast<int>(Page::Online) : static_cast<int>(page);
 }
 inline const char* const kTabNames[kTabCount] = {"Graphics", "Game", "Controls", "Audio", "Online", "Saves", "Mods", "System"};
@@ -384,6 +385,14 @@ public:
         } else {
             Say(box ? "There is no room for it in the item box." : "There is no room for it in the pouch.");
         }
+    }
+
+    // A folder to import saves from was chosen and searched: its page.
+    void ShowImport(SDL_Window* window) {
+        window_ = window;
+        open = true;
+        confirm_.clear();
+        SetPage(Page::Import);
     }
 
     // Opens the menu on the Mods page with a line (a mod was dropped on the window).
@@ -767,7 +776,9 @@ private:
             }
         }
         if (a.back) {
-            if (page_ == Page::Items) {
+            if (page_ == Page::Import) {
+                SetPage(Page::Saves);
+            } else if (page_ == Page::Items) {
                 SetPage(Page::Mods);
             } else if (page_ == Page::Rooms || page_ == Page::Password) {
                 SetPage(Page::Online);
@@ -1074,6 +1085,9 @@ private:
         case Page::Items:
             BuildItems(items);
             break;
+        case Page::Import:
+            BuildImport(items);
+            break;
         case Page::System:
             items.push_back(Choice("Language", "language", {"auto", "en", "es"}));
             items.push_back(Action("Resume the game", [this] { open = false; }, "Resume"));
@@ -1199,6 +1213,15 @@ private:
         }
         items.push_back(Choice("Back up automatically at start", "auto_backup", {"on", "off"}));
         items.push_back(Action("Open the saves folder", [this] { if (host_.action) Say(host_.action("open_saves")); }, "Open"));
+        items.push_back(Action("Open the guild cards and quests folder", [this] { if (host_.action) Say(host_.action("open_extra")); }, "Open"));
+        items.push_back(Action("Import saves from a folder...", [this] { if (host_.action) Say(host_.action("import_pick")); }, "Choose"));
+        if (host_.action && !host_.action("import_pending").empty()) {
+            items.push_back(Info("An import waits: it goes in at the next start.", 1));
+            items.push_back(Action("Cancel the import", [this] {
+                if (host_.action) host_.action("import_cancel");
+                Say("The import was cancelled.");
+            }, "Cancel"));
+        }
         items.push_back(Action("Open the backups folder", [this] { if (host_.action) Say(host_.action("open_backups")); }, "Open"));
         const std::vector<std::string> backups = SplitLines(host_.action ? host_.action("save_list") : "");
         items.push_back(Info(backups.empty() ? "No backups yet."
@@ -1235,6 +1258,54 @@ private:
             item.help = Tr("A copy of your saves. Enter twice puts it back the next time the game starts (the saves now are backed up first). Backspace twice deletes it.");
             items.push_back(std::move(item));
         }
+    }
+
+    // ---- the import page: what was found in the chosen folder -----------------------------------------------------------
+    void BuildImport(std::vector<Item>& items) {
+        const std::vector<std::string> lines = SplitLines(host_.action ? host_.action("import_list") : "");
+        // the first line: "odd|cut|folder"; then "index|kind|why|date|files|folder"
+        const std::vector<std::string> head = lines.empty() ? std::vector<std::string>() : SplitLines(lines[0], '|');
+        items.push_back(Info("It goes in at the next start, after a backup.", 2));
+        for (std::size_t i = 1; i < lines.size(); ++i) {
+            std::vector<std::string> f;
+            for (std::size_t from = 0;;) {  // (an empty "why" is a field too)
+                const std::size_t to = lines[i].find('|', from);
+                f.push_back(lines[i].substr(from, to == std::string::npos ? std::string::npos : to - from));
+                if (to == std::string::npos) break;
+                from = to + 1;
+            }
+            if (f.size() < 6) continue;
+            const std::string index = f[0], why = f[2];
+            const bool hunter = f[1] == "hunter";
+            // (short: the day tells one copy from another; the whole time and the folder are in the row's help)
+            std::string label = Tr(hunter ? "Hunter" : "Cards and quests");
+            label += hunter ? ": " + f[4] : " (" + f[4] + ")";
+            label += "  " + (f[3].size() >= 10 ? f[3].substr(5, 5) : f[3]);
+            Item row = Action(label, [this, index, why, hunter] {
+                if (why == "no-system") {
+                    Say("It can't be imported: the \"system\" file is not beside it.");
+                } else if (why == "incomplete") {
+                    Say("It can't be imported: you have no cards or quests yet, so all 10 files are needed.");
+                } else if (confirm_ != "import:" + index) {
+                    confirm_ = "import:" + index;
+                    Say(hunter ? "This replaces your hunter saves. Press Enter again to confirm."
+                               : "Files with the same name are replaced. Press Enter again to confirm.");
+                } else {
+                    confirm_.clear();
+                    SayHost(host_.action ? host_.action("import_apply:" + index) : "");
+                }
+            }, "Import");
+            row.id = "import_" + index;
+            row.color = confirm_ == "import:" + index ? 1 : 0;
+            row.help = f[3] + "   " + Plain(f[5]);
+            items.push_back(std::move(row));
+        }
+        if (lines.size() < 2) items.push_back(Info("No saves of this game were found in that folder.", 1));
+        if (head.size() >= 2 && head[0] != "0") {
+            items.push_back(Info(head[0] + " " + Tr("file(s) named like a save have another size."), 2));
+        }
+        if (head.size() >= 2 && head[1] == "1") items.push_back(Info("The folder is too big: choose a smaller one.", 1));
+        items.push_back(Action("Choose another folder", [this] { if (host_.action) Say(host_.action("import_pick")); }, "Choose"));
     }
 
     // ---- the give-items page (a cheat): a name or a number typed, how many, where to --------------------------------------
@@ -1735,7 +1806,7 @@ private:
     // ---- the picture -----------------------------------------------------------------------------------------------------
     // The page as the look draws it (a View) and, for when that can't be drawn, as plain lines of text.
     void Render(std::vector<Line>* out_lines, View* out_view) {
-        static const char* const kTitles[] = {"Graphics", "Game", "Controls", "Audio", "Online", "Saves", "Mods", "System", "Public rooms", "Room password", "Give items (cheat)"};
+        static const char* const kTitles[] = {"Graphics", "Game", "Controls", "Audio", "Online", "Saves", "Mods", "System", "Public rooms", "Room password", "Give items (cheat)", "Import saves"};
         RefreshLanguage();
         std::vector<Item> items = Build();
         SyncSelection(items);

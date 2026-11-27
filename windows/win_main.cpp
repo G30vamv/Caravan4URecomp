@@ -37,6 +37,7 @@
 #include "discord_presence.h"
 #include "mod_manager.h"
 #include "save_manager.h"
+#include "save_import.h"
 #include "mh4n/save_journal.h"
 #include "hid_pads.h"
 #include "hidhide.h"
@@ -1149,6 +1150,97 @@ std::string ItemNames(const std::string& exedir, const std::string& game, const 
     return out;
 }
 
+// No hunter save where the game reads it, but one lies elsewhere inside the user folder (copied to the wrong place): the
+// player is asked whether to bring it in. Never done unasked: it could be an old one. The files found stay where they are.
+void OfferMisplacedSaves(const std::filesystem::path& user, const std::string& setting) {
+    if (saveimport::HasHunter(user)) return;
+    const std::filesystem::path backups = savemgr::BackupsFolder(user);
+    const saveimport::Found found = saveimport::Scan(
+        user,
+        [&](const std::filesystem::path& folder) {
+            const std::string name = u8p::Utf8(folder.filename());
+            for (const char* other : {"backups", "load", "log", "cache", "shaders", "sysdata", "config", "screenshots"}) {
+                if (name == other) return true;
+            }
+            return name.empty() || name[0] == '.' || folder == backups;
+        },
+        20000, 10);
+    const saveimport::Set* hunter = nullptr;
+    const saveimport::Set* extra = nullptr;
+    for (const saveimport::Set& set : found.sets) {
+        if (set.hunter && set.Complete() && !hunter) hunter = &set;
+        if (!set.hunter && set.Complete() && !extra && !saveimport::HasExtra(user)) extra = &set;
+    }
+    if (!hunter) return;
+    const std::string where = u8p::Utf8(hunter->dir);
+    std::printf("mh4u-win: saves: no hunter save in its place, but there is one in %s\n", where.c_str());
+    bool yes = false;
+    if (std::getenv("MH4U_TEST_SCRIPT")) {
+        const char* answer = std::getenv("MH4U_TEST_IMPORT_ANSWER");
+        yes = answer != nullptr && std::string(answer) == "yes";
+    } else {
+        std::string lang = setting;
+        if (lang != "es" && lang != "en") {
+            wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+            GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH);
+            lang = name[0] == L'e' && name[1] == L's' ? "es" : "en";
+        }
+        const bool es = lang == "es";
+        const std::string message =
+            (es ? "No hay ninguna partida de cazador en su carpeta, pero he encontrado una aqu\u00ed:\n\n"
+                : "There is no hunter save in its folder, but I found one here:\n\n") +
+            where +
+            (es ? "\n\n\u00bfQuieres usarla? Se copia a su sitio; los archivos encontrados no se mueven."
+                : "\n\nDo you want to use it? It is copied into place; the files found stay where they are.");
+        const SDL_MessageBoxButtonData buttons[2] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, es ? "Usarla" : "Use it"},
+                                                     {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "No"}};
+        SDL_MessageBoxData box{};
+        box.flags = SDL_MESSAGEBOX_INFORMATION;
+        box.title = "Caravan4URecomp";
+        box.message = message.c_str();
+        box.numbuttons = 2;
+        box.buttons = buttons;
+        int chosen = 0;
+        yes = SDL_ShowMessageBox(&box, &chosen) && chosen == 1;
+    }
+    if (!yes) return;
+    std::string error;
+    if (!saveimport::Stage(user, *hunter, &error) || (extra && !saveimport::Stage(user, *extra, &error))) {
+        saveimport::Cancel(user);
+        std::printf("mh4u-win: saves: they could not be copied (%s)\n", error.c_str());
+        return;
+    }
+    const std::string done = saveimport::ApplyPending(user);
+    std::printf("mh4u-win: saves: %s\n", done.c_str());
+}
+
+// The folder the system's dialog gives back (on a thread of its own); the main loop takes it.
+struct ImportChoice {
+    std::mutex mutex;
+    std::string folder;
+    bool ready = false, asking = false;
+};
+ImportChoice g_import_choice;
+void SDLCALL ImportFolderChosen(void*, const char* const* list, int) {
+    const std::lock_guard<std::mutex> lock(g_import_choice.mutex);
+    g_import_choice.asking = false;
+    if (list != nullptr && list[0] != nullptr) {
+        g_import_choice.folder = list[0];
+        g_import_choice.ready = true;
+    }
+}
+// "yyyy-mm-dd hh:mm" of a file's time.
+std::string FileDay(std::filesystem::file_time_type time) {
+    const auto system = std::chrono::system_clock::now() +
+                        std::chrono::duration_cast<std::chrono::system_clock::duration>(time - std::filesystem::file_time_type::clock::now());
+    const std::time_t seconds = std::chrono::system_clock::to_time_t(system);
+    std::tm tm{};
+    localtime_s(&tm, &seconds);
+    char text[24] = {};
+    std::strftime(text, sizeof text, "%Y-%m-%d %H:%M", &tm);
+    return text;
+}
+
 int Fail(const char* what, const std::string& why) {
     std::fprintf(stderr, "mh4u-win: %s: %s\n", what, why.c_str());
     return 3;
@@ -1463,7 +1555,14 @@ int main(int argc, char** argv) {
         }
         const std::string restored = savemgr::ApplyPendingRestore(path);
         if (!restored.empty()) std::printf("mh4u-win: saves: %s\n", restored.c_str());
-        if (!savemgr::RestoreUnfinished(path)) return true;
+        if (!savemgr::RestoreUnfinished(path)) {
+            const std::string imported = saveimport::ApplyPending(path);
+            if (!imported.empty()) std::printf("mh4u-win: saves: %s\n", imported.c_str());
+        }
+        if (!savemgr::RestoreUnfinished(path)) {
+            OfferMisplacedSaves(path, ini.Get("language", "auto"));
+            if (!savemgr::RestoreUnfinished(path)) return true;
+        }
         const std::string where = "\n\n" + folder;
         not_started("A restore of your saves could not be finished or undone yet, so the game was not started: nothing is lost "
                     "this way.\n\nClose the programs that may be using your saves (file explorer, antivirus, cloud sync) and "
@@ -2077,6 +2176,7 @@ int main(int argc, char** argv) {
         ini.Save();
     };
     menu_host.quit = [&] { running = false; };
+    saveimport::Found import_found;  // what the last folder chosen to import from holds
     menu_host.action = [&](const std::string& name) -> std::string {
         if (name == "addresses") {  // the addresses a friend can use: "ip|where|vpn" a line, the virtual networks first
             std::string out;
@@ -2135,10 +2235,68 @@ int main(int argc, char** argv) {
         if (name.rfind("save_delete:", 0) == 0) {
             return savemgr::Delete(user_path(), name.substr(12)) ? "The backup was deleted." : "The backup could not be deleted.";
         }
-        if (name == "open_saves" || name == "open_backups" || name == "open_mods") {
+        if (name == "import_pick") {  // the system's folder dialog (a test run names the folder instead)
+            if (user_folder().empty()) return "No user folder is set";
+            if (const char* test = std::getenv("MH4U_TEST_IMPORT_DIR")) {
+                ImportFolderChosen(nullptr, std::array<const char*, 2>{test, nullptr}.data(), 0);
+                return "";
+            }
+            if (std::getenv("MH4U_TEST_SCRIPT")) return "";
+            {
+                const std::lock_guard<std::mutex> lock(g_import_choice.mutex);
+                if (g_import_choice.asking) return "";
+                g_import_choice.asking = true;
+            }
+            SDL_ShowOpenFolderDialog(ImportFolderChosen, nullptr, window, nullptr, false);
+            return "Choose the folder with the saves.";
+        }
+        if (name == "import_list") {
+            std::string out = std::to_string(import_found.odd) + "|" + (import_found.cut ? "1" : "0") + "|\n";
+            for (std::size_t i = 0; i < import_found.sets.size(); ++i) {
+                const saveimport::Set& set = import_found.sets[i];
+                std::string files;
+                if (set.hunter) {
+                    for (const std::string& file : set.files) {
+                        if (file != "system") files += (files.empty() ? "" : ", ") + file;
+                    }
+                } else {
+                    files = std::to_string(set.files.size());
+                }
+                out += std::to_string(i) + "|" + (set.hunter ? "hunter" : "extra") + "|" + saveimport::WhyNot(user_path(), set) + "|" +
+                       FileDay(set.newest) + "|" + files + "|" + u8p::Utf8(set.dir) + "\n";
+            }
+            return out;
+        }
+        if (name.rfind("import_apply:", 0) == 0) {
+            const std::size_t index = static_cast<std::size_t>(std::atoi(name.c_str() + 13));
+            if (index >= import_found.sets.size()) return "";
+            std::string error;
+            if (!saveimport::Stage(user_path(), import_found.sets[index], &error)) {
+                std::printf("mh4u-win: saves: nothing staged to import (%s)\n", error.c_str());
+                return "The files could not be copied: nothing changes.";
+            }
+            std::printf("mh4u-win: saves: waiting to be imported at the next start: %s\n", u8p::Utf8(import_found.sets[index].dir).c_str());
+            return "It will be imported the next time you start the game (your saves are backed up first).";
+        }
+        if (name == "import_pending") return saveimport::Pending(user_path()).empty() ? "" : "1";
+        if (name == "import_cancel") {
+            saveimport::Cancel(user_path());
+            return "";
+        }
+        if (name == "open_saves" || name == "open_extra" || name == "open_backups" || name == "open_mods") {
             if (user_folder().empty()) return "No user folder is set";
             std::filesystem::path dir = user_path();
-            if (name == "open_backups") dir = savemgr::BackupsFolder(dir); else dir /= name == "open_saves" ? "sdmc" : "load\\mods";
+            if (name == "open_backups") {
+                dir = savemgr::BackupsFolder(dir);
+            } else if (name == "open_saves") {  // straight to the hunter's saves (the SD card's top before they exist)
+                std::error_code ec;
+                dir = std::filesystem::is_directory(saveimport::HunterDir(dir), ec) ? saveimport::HunterDir(dir) : dir / "sdmc";
+            } else if (name == "open_extra") {
+                if (!saveimport::HasExtra(dir)) return "There are no guild cards or quests yet.";
+                dir = saveimport::ExtraDir(dir);
+            } else {
+                dir /= "load\\mods";
+            }
             std::error_code ec;
             std::filesystem::create_directories(dir, ec);
             if (!std::getenv("MH4U_TEST_SCRIPT")) ShellExecuteW(nullptr, L"open", dir.wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -2688,6 +2846,21 @@ int main(int argc, char** argv) {
                 SDL_GetWindowSize(window, &w, &h);
                 keep_window_size(w, h);
                 ini.Save();
+            }
+        }
+        {  // a folder to import from was chosen: searched here, and its page shown
+            std::string chosen;
+            {
+                const std::lock_guard<std::mutex> lock(g_import_choice.mutex);
+                if (g_import_choice.ready) {
+                    chosen = g_import_choice.folder;
+                    g_import_choice.ready = false;
+                }
+            }
+            if (!chosen.empty()) {
+                import_found = saveimport::Scan(std::filesystem::path(WideFromUtf8(chosen)));
+                std::printf("mh4u-win: saves: %zu set(s) found to import in %s\n", import_found.sets.size(), chosen.c_str());
+                menu.ShowImport(window);
             }
         }
         for (Port::Hooks::GiveResult given; Port::Hooks::TakeGiveResult(&given);) {

@@ -16,6 +16,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -121,7 +122,7 @@ inline void SplitName(const std::string& name, std::string* stamp, std::string* 
                  name.substr(11, 2) + ":" + name.substr(13, 2);
         if (name.size() > 16) *label = name.substr(16);
         // "-2", "-3"... only tell two backups of one second apart: "auto-2" is an automatic one like any other
-        for (const char* own : {"auto", "before-restore", ""}) {
+        for (const char* own : {"auto", "before-restore", "imported", ""}) {
             const std::string prefix = *own ? std::string(own) + "-" : std::string();
             if (label->rfind(prefix, 0) != 0) continue;
             const std::string number = label->substr(prefix.size());
@@ -169,15 +170,12 @@ inline bool CopyFolder(const fs::path& from, const fs::path& to, std::string* er
 // A copy holds the saves when it has as many files, with as many bytes, as what it was made from.
 inline bool SameSaves(const Tree& a, const Tree& b) { return a.files == b.files && a.bytes == b.bytes; }
 
-// Makes a backup of the saves now. Returns its name, or "" (and *error): nothing to back up, or a copy failed. The copy is
-// made in a folder the list does not show (".partial-<name>") and gets its name only when it is whole, so a copy cut short
-// (the program closed, a power cut) is never offered as a backup. A finished one says in ".complete" what it holds.
-inline std::string MakeBackup(const fs::path& user, const std::string& label, std::string* error) {
-    const Tree now = MeasureSaves(user);
-    if (now.files == 0) {
-        if (error) *error = "There are no saves yet.";
-        return {};
-    }
+// Makes a new folder in the backups, filled by `fill(folder, &why)`, which also gives the signature to note with it. Returns
+// its name, or "" (and *error). It is made in a folder the list does not show (".partial-<name>") and gets its name only when
+// it is whole, so one cut short (the program closed, a power cut) is never offered. A finished one says in ".complete" what
+// it holds.
+inline std::string NewBackup(const fs::path& user, const std::string& label,
+                             const std::function<bool(const fs::path&, std::uint64_t*, std::string*)>& fill, std::string* error) {
     const fs::path dir = BackupsFolder(user);
     std::error_code ec;
     fs::create_directories(Long(dir), ec);
@@ -209,16 +207,15 @@ inline std::string MakeBackup(const fs::path& user, const std::string& label, st
         return std::string{};
     };
     fs::create_directories(Long(partial), ec);
-    for (const char* f : kFolders) {
-        if (!fs::is_directory(Long(user / f), ec)) continue;
+    std::uint64_t noted = 0;
+    {
         std::string why;
-        if (!CopyFolder(user / f, partial / f, &why)) return give_up(why);
+        if (!fill(partial, &noted, &why)) return give_up(why);
     }
     const Tree copied = MeasureSaves(partial);
-    if (!SameSaves(copied, now)) return give_up("The saves changed while they were being copied. Try again.");
     {
         std::ofstream signature(Long(partial / ".signature"));
-        signature << now.signature << "\n";
+        signature << noted << "\n";
         std::ofstream complete(Long(partial / ".complete"));
         complete << copied.files << " " << copied.bytes << "\n";
         signature.flush();
@@ -228,6 +225,37 @@ inline std::string MakeBackup(const fs::path& user, const std::string& label, st
     fs::rename(Long(partial), Long(dir / name), ec);
     if (ec) return give_up(ec.message());
     return name;
+}
+
+// A copy of the save folders there are in `from` into `to`.
+inline bool CopySaves(const fs::path& from, const fs::path& to, std::string* error) {
+    std::error_code ec;
+    for (const char* f : kFolders) {
+        if (!fs::is_directory(Long(from / f), ec)) continue;
+        if (!CopyFolder(from / f, to / f, error)) return false;
+    }
+    return true;
+}
+
+// Makes a backup of the saves now. Returns its name, or "" (and *error): nothing to back up, or a copy failed.
+inline std::string MakeBackup(const fs::path& user, const std::string& label, std::string* error) {
+    const Tree now = MeasureSaves(user);
+    if (now.files == 0) {
+        if (error) *error = "There are no saves yet.";
+        return {};
+    }
+    return NewBackup(
+        user, label,
+        [&](const fs::path& to, std::uint64_t* signature, std::string* why) {
+            if (!CopySaves(user, to, why)) return false;
+            if (!SameSaves(MeasureSaves(to), now)) {
+                *why = "The saves changed while they were being copied. Try again.";
+                return false;
+            }
+            *signature = now.signature;
+            return true;
+        },
+        error);
 }
 
 inline std::uint64_t LastSignature(const fs::path& user, const std::string& label_filter) {
