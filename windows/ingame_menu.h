@@ -986,7 +986,7 @@ private:
             {"hd_texture_max", "A texture of an HD pack larger than this (on its longer side) is reduced before it is loaded: it takes less video memory and loads faster, with less detail. Off: no limit. Needs a restart."},
             {"scale", "How sharp the 3D scene, the HUD and the text are drawn: a multiple of the 3DS top screen's 400 x 240. Auto picks the one closest to your window."},
             {"fps_counter", "Shows the game's frame rate in the top-left corner."},
-            {"hud_parts", "Shows a size for each part of the hunting HUD (clock, bars, sharpness, party, map, target camera, item bar), on top of the general one. Press it again to hide them."},
+            {"hud_parts", "A size of its own for each part of the hunting HUD (clock, bars, sharpness, party, map, target camera, item bar), on top of the general one. Off: only the general size is used."},
             {"hud_scale", "A mod of this program: draws the hunting HUD smaller, from 100% (the game's own size) down to 40%. Each part keeps to its corner, so the smaller it is the closer to the edges. It only changes how the HUD is drawn, so it is fine online."},
             {"qol_hold_gather", "Hold A to carve, gather, mine and catch bugs again and again until you let go, instead of pressing it each time. It only changes the controls, so it is fine online."},
             {"invincible", "A cheat: your hunter takes no damage (the health bar does not go down). It changes the game's memory: it can break an online hunt or a save. Use it at your own risk."},

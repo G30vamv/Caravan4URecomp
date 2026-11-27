@@ -30,7 +30,7 @@ inline std::string Tr(const std::string& en) {
         {"Damage multiplier (cheat)", "Multiplicador de daño (truco)"},
         {"A mod of this program: draws the hunting HUD smaller, from 100% (the game's own size) down to 40%. Each part keeps to its corner, so the smaller it is the closer to the edges. It only changes how the HUD is drawn, so it is fine online.", "Un mod de este programa: dibuja el HUD de caza más pequeño, del 100% (el tamaño del juego) al 40%. Cada parte se queda en su esquina, así que cuanto más pequeño, más cerca de los bordes. Solo cambia cómo se dibuja el HUD, así que es seguro en línea."},
         {"Adjust each HUD part", "Ajustar cada parte del HUD"},
-        {"Shows a size for each part of the hunting HUD (clock, bars, sharpness, party, map, target camera, item bar), on top of the general one. Press it again to hide them.", "Muestra un tamaño para cada parte del HUD de caza (reloj, barras, filo, grupo, mapa, cámara de objetivo, barra de objetos), además del general. Púlsalo otra vez para esconderlas."},
+        {"A size of its own for each part of the hunting HUD (clock, bars, sharpness, party, map, target camera, item bar), on top of the general one. Off: only the general size is used.", "Un tamaño propio para cada parte del HUD de caza (reloj, barras, filo, grupo, mapa, cámara de objetivo, barra de objetos), además del general. Apagado: solo se usa el tamaño general."},
         {"   Clock", "   Reloj"},
         {"   Health and stamina bars", "   Barras de vida y aguante"},
         {"   Sharpness and weapon gauge", "   Filo y medidor del arma"},

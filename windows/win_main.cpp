@@ -148,7 +148,7 @@ inline const char* GameOptionDefault(const std::string& key) {
         {"rewards_send_all", "off"}, {"invincible", "off"}, {"inf_items", "off"}, {"damage_mult", "1"}, {"hide_help", "off"},
         {"antialiasing", "on"}, {"bloom", "on"}, {"motion_blur", "on"}, {"depth_of_field", "on"}, {"radial_blur", "on"},
         {"haze", "on"}, {"dither", "on"}, {"fov", "1.0"}, {"kick", "off"}, {"target", "off"},
-        {"skip_end", "ZL+ZR"}, {"skip_end_hold", "1.0"}, {"hud_scale", "100"}, {"hud_scale_clock", "100"}, {"hud_scale_bars", "100"}, {"hud_scale_sharpness", "100"},
+        {"skip_end", "ZL+ZR"}, {"skip_end_hold", "1.0"}, {"hud_scale", "100"}, {"hud_parts", "off"}, {"hud_scale_clock", "100"}, {"hud_scale_bars", "100"}, {"hud_scale_sharpness", "100"},
         {"hud_scale_party", "100"}, {"hud_scale_map", "100"}, {"hud_scale_target", "100"}, {"hud_scale_items", "100"}};
     for (const auto& [name, value] : kTable) {
         if (key == name) return value;
@@ -158,7 +158,7 @@ inline const char* GameOptionDefault(const std::string& key) {
 inline std::vector<std::string> GameOptionKeys() {
     return {"qol_hold_gather", "qol_flex_cancel", "qol_sharpen_cancel", "qol_rewards_no_limit", "rewards_send_all", "invincible",
             "inf_items", "damage_mult", "hide_help", "antialiasing", "bloom", "motion_blur", "depth_of_field", "radial_blur", "haze", "dither", "fov",
-            "kick", "target", "skip_end", "skip_end_hold", "hud_scale", "hud_scale_clock", "hud_scale_bars", "hud_scale_sharpness", "hud_scale_party", "hud_scale_map",
+            "kick", "target", "skip_end", "skip_end_hold", "hud_scale", "hud_parts", "hud_scale_clock", "hud_scale_bars", "hud_scale_sharpness", "hud_scale_party", "hud_scale_map",
             "hud_scale_target", "hud_scale_items"};
 }
 std::atomic<std::uint32_t> g_top_width{0};  // widescreen on: the top screen's width at its 240 rows (the hooks' own: 424 for 16:9), else 0
@@ -1241,6 +1241,24 @@ std::string FileDay(std::filesystem::file_time_type time) {
     return text;
 }
 
+// MODIFIED: until 0.5.0 hud_parts = off only hid the parts' sizes, which stayed in use. Now off leaves them unused, so a
+// settings file with sizes of its own gets it on, once: the picture stays as it was. hud_parts_version notes it was seen.
+void MigrateHudParts(Ini& ini) {
+    if (!ini.Get("hud_parts_version").empty()) return;
+    bool own = false;
+    for (const char* part : {"clock", "bars", "sharpness", "party", "map", "target", "items"}) {
+        const std::string size = ini.Get(std::string("hud_scale_") + part);
+        if (!size.empty() && std::atoi(size.c_str()) != 100) own = true;
+    }
+    if (!own) return;  // (nothing to keep: nothing is written; a later size comes with the switch on)
+    if (ini.Get("hud_parts") != "on") {
+        ini.Set("hud_parts", "on");
+        std::fprintf(stderr, "mh4u-win: settings: hud_parts turned on, once: your sizes for the HUD's parts stay in use\n");
+    }
+    ini.Set("hud_parts_version", "2");
+    ini.Save();
+}
+
 int Fail(const char* what, const std::string& why) {
     std::fprintf(stderr, "mh4u-win: %s: %s\n", what, why.c_str());
     return 3;
@@ -1285,6 +1303,7 @@ int main(int argc, char** argv) {
         const char* base = SDL_GetBasePath();
         ini.Load(std::string(base ? base : "") + "Caravan4URecomp.ini");
     }
+    MigrateHudParts(ini);
     // which file was read and what it says: the first thing to look at when a change "was not applied"
     std::fprintf(stderr, "mh4u-win: settings file: %s\n", ini.path.c_str());
     for (const std::string& key : ini.repeated) {

@@ -5,6 +5,7 @@
 // Nothing else of the file changes.
 #include "hooks.h"
 
+#include "cheat_rules.h"
 #include "game_addr.h"
 #include "inf_items.h"
 #include "monster_hp.h"
@@ -232,6 +233,7 @@ struct Options {
     float damage_mult = 1.0f;
     float hud_scale = 100.0f;
     float hud_part_scale[HUD_PART_COUNT] = {100, 100, 100, 100, 100, 100, 100};
+    bool hud_parts = false;  // hud_parts: off, the parts' own sizes are kept but not used
 };
 
 // The screen filters an option can turn off (see SCREEN_FILTERS below), by option name.
@@ -466,6 +468,8 @@ void Set(Options& o, const std::string& key, const std::string& value) {
         o.probe_hunter = IsOn(value);
     } else if (key == "hud_scale") {
         o.hud_scale = std::clamp(std::strtof(value.c_str(), nullptr), 40.0f, 100.0f);
+    } else if (key == "hud_parts") {
+        o.hud_parts = IsOn(value);
     } else if (const int scaled = HudScalePartIndex(key); scaled >= 0) {
         o.hud_part_scale[scaled] = std::clamp(std::strtof(value.c_str(), nullptr), 40.0f, 100.0f);
     } else if (key == "hud_probe") {
@@ -1245,7 +1249,7 @@ void LayoutObjectConstants(RCtx* ctx, RFunc original) {
         const int index = HudObjectOf(hash);
         if (index >= 0) {
             const int part = HUD_OBJECTS[index].part;
-            const float s = std::clamp(options.hud_scale * options.hud_part_scale[part] / 10000.0f, 0.4f, 1.0f);
+            const float s = std::clamp(options.hud_scale * (options.hud_parts ? options.hud_part_scale[part] : 100.0f) / 10000.0f, 0.4f, 1.0f);
             if (s < 0.999f) {
                 const float width = rows != 0 ? static_cast<float>(rows) : static_cast<float>(TOP_ROWS);
                 const float half = (options.hud_edges ? width : static_cast<float>(TOP_ROWS)) / 2.0f;
@@ -3076,8 +3080,7 @@ const char* PouchNotHunting(RCtx* ctx, u32* status, u8* hud) {
 /// else put back could copy items into the save), and each change of it is logged with what was done.
 void HunterMods(RCtx* ctx) {
     static u32 owner = 0;
-    static u32 sharp_mark = 0;
-    static u32 sharp_low_mark = 0;
+    static Cheats::KeptHealth health, recoverable;
     static InfItems::Keeper pouch_keeper;
     static int pouch_lines = 0;
     int weapon = -1;
@@ -3093,25 +3096,17 @@ void HunterMods(RCtx* ctx) {
     }
     if (owner != hunter) {
         owner = hunter;
-        sharp_mark = 0;
-        sharp_low_mark = 0;
+        health.Forget();
+        recoverable.Forget();
         pouch_keeper.Forget();
     }
     if (options.invincible) {
-        const u32 now = rd32(ctx, block + 0x35c);
-        const u32 level = rd32(ctx, block + 0x34c) >> 16;  // (its upper half: what the sharpness began at)
-        const u32 low = rd16(ctx, block + 0x34c);          // (its lower half: the sharpness that wears with each hit)
-        if (level >= 1 && level <= 0x400 && now <= 0x400 && low <= 0x400) {
-            if (low > sharp_low_mark) {
-                sharp_low_mark = low;
-            } else if (low < sharp_low_mark) {
-                wr16(ctx, block + 0x34c, static_cast<u16>(sharp_low_mark));
-            }
-            if (now > sharp_mark) {
-                sharp_mark = now;
-            } else if (now < sharp_mark) {
-                wr32(ctx, block + 0x35c, sharp_mark);
-            }
+        const u32 now = rd32(ctx, block + 0x35c);              // the health
+        const u32 largest = rd32(ctx, block + 0x34c) >> 16;    // (its upper half: the largest health, 100 -> 150 with a meal)
+        const u32 low = rd16(ctx, block + 0x34c);              // (its lower half: it goes down with a hit and partly comes back)
+        if (largest >= 1 && largest <= 0x400 && now <= 0x400 && low <= 0x400) {
+            if (const u32 kept = recoverable.Step(low, largest); kept != low) wr16(ctx, block + 0x34c, static_cast<u16>(kept));
+            if (const u32 kept = health.Step(now, largest); kept != now) wr32(ctx, block + 0x35c, kept);
         }
     }
     if (options.inf_items) {
@@ -3251,10 +3246,10 @@ void MonsterLifeStep(RCtx* ctx) {
     if (!MonsterHp::Enabled().load(std::memory_order_relaxed) && options.damage_mult <= 1.0f) {
         return;
     }
-    // the damage multiplier: the lives as the last frame left them (after our own writes), to see what the game took this frame
-    static std::unordered_map<u32, std::int32_t> last_life;
-    if (options.damage_mult <= 1.0f) last_life.clear();  // (a multiplier switched on in mid-fight starts from the lives it finds)
+    static Cheats::DamageMultiplier multiplier;  // (cheat_rules.h)
     std::vector<MonsterHp::Sample> samples;
+    std::vector<Cheats::Monster> monsters;
+    std::vector<u32> infos;  // each sample's status block
     const u32 enemies = rd32(ctx, SENEMY);
     if (HeapPointer(enemies)) {
         for (u32 i = 0; i < ENEMY_SLOT_COUNT; ++i) {
@@ -3269,25 +3264,19 @@ void MonsterLifeStep(RCtx* ctx) {
             sample.kind = rd8(ctx, info + INFO_KIND);
             sample.hp = static_cast<std::int32_t>(rd32(ctx, info + INFO_HP));
             sample.max = static_cast<std::int32_t>(rd32(ctx, info + INFO_HP_MAX));
-            if (options.damage_mult > 1.0f && sample.max > 0 && sample.hp > 0 && sample.hp <= sample.max) {
-                const auto before = last_life.find(monster);
-                if (before != last_life.end() && sample.hp < before->second) {
-                    const std::int32_t taken = before->second - sample.hp;
-                    const std::int32_t extra = static_cast<std::int32_t>(std::lround(static_cast<double>(taken) * (options.damage_mult - 1.0f)));
-                    // (never to 0 by memory: the game's own hit does the killing, so its death sequence runs as always)
-                    const std::int32_t life = std::max<std::int32_t>(1, sample.hp - extra);
-                    if (life != sample.hp) {
-                        wr32(ctx, info + INFO_HP, static_cast<u32>(life));
-                        sample.hp = life;
-                    }
-                }
-                last_life[monster] = sample.hp;
-            }
             sample.dead = state == 0xb || state == 0xe || (state == 0xc && rd8(ctx, info + INFO_STATE + 1) == 0xff);
             samples.push_back(sample);
+            monsters.push_back({monster, sample.kind, sample.hp, sample.max});
+            infos.push_back(info);
         }
     }
-    if (samples.empty()) last_life.clear();
+    multiplier.Step(monsters, options.damage_mult);
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        if (monsters[i].life != samples[i].hp) {
+            wr32(ctx, infos[i] + INFO_HP, static_cast<u32>(monsters[i].life));
+            samples[i].hp = monsters[i].life;
+        }
+    }
     MonsterHp::Poll(samples);
 }
 
@@ -3968,7 +3957,7 @@ bool SetOption(const std::string& key, const std::string& value) {
         "target", "skip", "skip_panel", "skip_panel_scene", "skip_anywhere", "skip_hint", "skip_end", "skip_end_hold", "touch_overlay",
         "quest_overlay", "target_overlay",
         "hud_edges", "trace_frames", "trace_layout", "trace_panels", "bloom", "motion_blur",
-        "depth_of_field", "radial_blur", "haze", "trace_filters", "trace_state", "item_bar", "hud_probe", "hud_scale", "probe_hunter", "hide_help", "invincible", "inf_items", "damage_mult",
+        "depth_of_field", "radial_blur", "haze", "trace_filters", "trace_state", "item_bar", "hud_probe", "hud_scale", "hud_parts", "probe_hunter", "hide_help", "invincible", "inf_items", "damage_mult",
         "qol_hold_gather", "qol_flex_cancel", "qol_sharpen_cancel", "qol_rewards_no_limit", "rewards_send_all",
         "single_screen", "effects"};
     if (std::find(std::begin(live), std::end(live), key) == std::end(live) && HudPartIndex(key) < 0 &&
